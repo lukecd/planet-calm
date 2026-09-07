@@ -1,0 +1,14 @@
+{
+  "count": 6,
+  "assetIDs": ["leaf-maple-red", "leaf-maple-orange", "leaf-maple-yellow", "leaf-maple-olive"],
+  "linearScale": { "minimum": 0.70, "maximum": 1.25 },
+  "arealDensityScale": { "minimum": 0.72, "maximum": 1.28 },
+  "pressureX": { "minimum": -0.05, "maximum": 0.12 },
+  "pressureY": { "minimum": 0.10, "maximum": 0.20 },
+  "releaseX": { "minimum": 0.12, "maximum": 0.86 },
+  "releaseY": { "minimum": 0.77, "maximum": 0.88 },
+  "releaseSeconds": { "minimum": 0.0, "maximum": 0.65 },
+  "initialTiltRadians": { "minimum": -0.60, "maximum": 0.60 },
+  "initialVelocityX": { "minimum": -0.04, "maximum": 0.04 },
+  "initialVelocityY": { "minimum": -0.02, "maximum": 0.02 }
+}

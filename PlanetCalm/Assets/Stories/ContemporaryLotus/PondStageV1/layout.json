@@ -1,0 +1,19 @@
+{
+  "id": "standard-ipad-landscape",
+  "width": 1448,
+  "height": 1006,
+  "background": {
+    "assetID": "pond-backing",
+    "x": 0,
+    "y": -40,
+    "width": 1448,
+    "height": 1086
+  },
+  "mainPadStem": {
+    "assetID": "main-pad-stem",
+    "x": 300,
+    "y": 246,
+    "width": 1180,
+    "height": 786.6666666667
+  }
+}

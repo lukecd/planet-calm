@@ -1,0 +1,35 @@
+{
+  "gravity": { "x": 0, "y": -1.2 },
+  "mass": 0.002,
+  "assetID": "leaf-maple-red",
+  "leafWidthFraction": 0.13,
+  "releasePoint": { "x": 0.5, "y": 0.82 },
+  "collisionHull": [
+    { "x": -0.30, "y": -0.30 },
+    { "x": 0.04, "y": -0.46 },
+    { "x": 0.34, "y": -0.18 },
+    { "x": 0.40, "y": 0.20 },
+    { "x": 0.08, "y": 0.48 },
+    { "x": -0.24, "y": 0.36 },
+    { "x": -0.42, "y": 0.02 }
+  ],
+  "offscreenMarginFraction": 0.12,
+  "diagnosticsUpdateInterval": 0.1,
+  "stillAirDrag": {
+    "airDensityKilogramsPerCubicMeter": 1.225,
+    "dragCoefficient": 1.1,
+    "referenceAreaSquareMeters": 0.004,
+    "projectedAreaFraction": 1.0,
+    "scenePointsPerMeter": 150.0,
+    "debugVelocityVectorSeconds": 0.32,
+    "debugForceVectorPointsPerNewton": 24000.0
+  },
+  "passiveFlutter": {
+    "maximumLiftCoefficient": 0.45,
+    "liftResponse": "sinTwoAlpha",
+    "chordAngleRadians": 0.0,
+    "edgeOnAreaFraction": 0.18,
+    "centerOfPressure": { "x": 0.08, "y": 0.16 },
+    "angularResistanceCoefficient": 0.2
+  }
+}

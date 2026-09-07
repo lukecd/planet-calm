@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "assets": [
+    {
+      "id": "pond-backing",
+      "sha256": "e033575b591c2b17dcf32ce4830441fab640047f04116771c5fd5c9b5af47dd2",
+      "reviewStatus": "user-accepted"
+    },
+    {
+      "id": "main-pad-stem",
+      "sha256": "dc47fbb35cbd6af363aa05d575b736f32b86250ac07c9d55a2fb6bb2ba35f618",
+      "reviewStatus": "provisional-native-review"
+    }
+  ]
+}

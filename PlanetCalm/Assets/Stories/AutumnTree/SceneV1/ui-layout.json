@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "startControlHorizontalAlignment": "screen-center",
+  "showCompletionSprout": false,
+  "reflowCompletionMessageIntoControlPosition": true
+}
