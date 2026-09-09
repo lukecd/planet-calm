@@ -162,120 +162,6 @@ struct SplashWaveVoice: Equatable {
     let noteName: String
 }
 
-enum SplashPerformanceRole: String, CaseIterable, Equatable, Sendable {
-    case drone
-    case pad
-    case chime
-    case melody
-}
-
-enum SplashEnvelopeStage: Equatable, Sendable {
-    case attack
-    case decay
-    case sustain
-    case release
-}
-
-struct SplashEnvelopeSample: Equatable, Sendable {
-    let value: Double
-    let lifecycleProgress: Double
-    let localBeat: Double
-    let stage: SplashEnvelopeStage
-}
-
-struct SplashADSREnvelope: Equatable, Sendable {
-    let attackBeats: Double
-    let decayBeats: Double
-    let sustainLevel: Double
-    let releaseBeats: Double
-
-    func sample(
-        localBeat: Double,
-        gateBeats: Double
-    ) -> SplashEnvelopeSample? {
-        let totalBeats = gateBeats + releaseBeats
-        guard localBeat >= 0, localBeat < totalBeats else { return nil }
-
-        let value: Double
-        let stage: SplashEnvelopeStage
-        if localBeat < attackBeats {
-            value = SplashMotionTiming.smootherStep(localBeat / attackBeats)
-            stage = .attack
-        } else if localBeat < attackBeats + decayBeats {
-            let decayProgress = SplashMotionTiming.smootherStep(
-                (localBeat - attackBeats) / decayBeats
-            )
-            value = 1 - (1 - sustainLevel) * decayProgress
-            stage = .decay
-        } else if localBeat < gateBeats {
-            value = sustainLevel
-            stage = .sustain
-        } else {
-            let releaseProgress = SplashMotionTiming.smootherStep(
-                (localBeat - gateBeats) / releaseBeats
-            )
-            value = sustainLevel * (1 - releaseProgress)
-            stage = .release
-        }
-
-        return SplashEnvelopeSample(
-            value: value,
-            lifecycleProgress: localBeat / totalBeats,
-            localBeat: localBeat,
-            stage: stage
-        )
-    }
-}
-
-struct SplashWaveNoteEvent: Equatable, Sendable {
-    let id: String
-    let tonalSlot: Int
-    let startBeat: Double
-    let gateBeats: Double
-    let envelope: SplashADSREnvelope
-    let role: SplashPerformanceRole
-    let intensity: Double
-    let isRepeating: Bool
-    let octaveOffset: Int
-
-    init(
-        id: String? = nil,
-        tonalSlot: Int,
-        startBeat: Double,
-        gateBeats: Double,
-        envelope: SplashADSREnvelope,
-        role: SplashPerformanceRole = .pad,
-        intensity: Double = 1,
-        isRepeating: Bool = true,
-        octaveOffset: Int = 0
-    ) {
-        self.id = id ?? "slot-\(tonalSlot)-beat-\(startBeat)"
-        self.tonalSlot = tonalSlot
-        self.startBeat = startBeat
-        self.gateBeats = gateBeats
-        self.envelope = envelope
-        self.role = role
-        self.intensity = intensity
-        self.isRepeating = isRepeating
-        self.octaveOffset = octaveOffset
-    }
-
-    var endBeat: Double {
-        startBeat + gateBeats + envelope.releaseBeats
-    }
-
-    var totalBeats: Double {
-        gateBeats + envelope.releaseBeats
-    }
-
-    func sample(at scoreBeat: Double) -> SplashEnvelopeSample? {
-        envelope.sample(
-            localBeat: scoreBeat - startBeat,
-            gateBeats: gateBeats
-        )
-    }
-}
-
 struct SplashScheduledPerformanceEvent: Identifiable, Equatable {
     let event: SplashWaveNoteEvent
     let scheduledStartBeat: Double
@@ -1381,6 +1267,9 @@ struct SplashScreenView: View {
     @Binding var selectedStory: Story
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("splash.performance.session.v1") private var persistedPerformance = Data()
+    @AppStorage("performance.activeStory.v1") private var persistedStory = ""
+    @AppStorage("autumn.branch.record.v1") private var persistedAutumn = Data()
+    @State private var autumnRecord = AutumnBranchRecord()
     @State private var synthesizer = PerformanceSynthesizer()
     @State private var auditionEnabled = true
     @State private var runnerDuration: FocusDuration = .fiveMinutes
@@ -1410,7 +1299,7 @@ struct SplashScreenView: View {
 #if DEBUG
         let initialStage: SplashScreenStage = ProcessInfo.processInfo.arguments.contains(
             "--story-chooser-review"
-        ) ? .chooser : .opening
+        ) ? .chooser : ProcessInfo.processInfo.arguments.contains("--autumn-checkpoint") || ProcessInfo.processInfo.arguments.contains("--autumn-light-audit") ? .story(.autumnTree) : .opening
 #else
         let initialStage: SplashScreenStage = .opening
 #endif
@@ -1636,7 +1525,14 @@ struct SplashScreenView: View {
             case .story(let story):
                 StorySceneLaunchView(
                     story: story,
-                    session: activePerformanceSession?.focusSession(for: story)
+                    session: activePerformanceSession,
+                    autumnRecord: autumnRecord,
+                    onStart: { duration in
+                        autumnRecord.manualGusts = []
+                        activeSplashScoreEvents = nil
+                        activePerformanceSession = PerformanceSession(duration: duration, randomSeed: UInt64(max(scoreSeed, 0)))
+                    },
+                    onPauseResume: togglePerformancePause
                 ) {
                     activePerformanceSession = nil
                     stage = .chooser
@@ -1664,6 +1560,11 @@ struct SplashScreenView: View {
                 PerformanceDesk(
                     expandedSections: $expandedPerformanceDeskSections,
                     context: context,
+                    autumnRecord: $autumnRecord,
+                    onAutumnGust: {
+                        guard let session = activePerformanceSession, !session.isPaused else { return }
+                        autumnRecord.manualGusts.append(session.elapsedTime(at: .now))
+                    },
                     speedMultiplier: motionSpeedBinding,
                     amountMultiplier: motionAmountBinding,
                     atmosphereProgress: $atmosphereProgress,
@@ -1707,18 +1608,35 @@ struct SplashScreenView: View {
         }
         .background(PlanetFocusPalette.canvasInk.ignoresSafeArea())
         .onAppear {
+            if !ProcessInfo.processInfo.arguments.contains("--autumn-light-audit"),
+               !ProcessInfo.processInfo.arguments.contains("--autumn-fresh"),
+               let record = try? JSONDecoder().decode(AutumnBranchRecord.self, from: persistedAutumn) {
+                autumnRecord = record
+            }
             if let session = activePerformanceSession {
                 activeSplashScoreEvents = SplashMusicDirector.events(for: session)
             } else if !Self.isAtmosphereReview,
                       !ProcessInfo.processInfo.arguments.contains("--sunrise-audit"),
+                      !ProcessInfo.processInfo.arguments.contains("--autumn-light-audit"),
+                      !ProcessInfo.processInfo.arguments.contains("--autumn-fresh"),
                       let restored = try? JSONDecoder().decode(PerformanceSession.self, from: persistedPerformance),
                       !PerformanceRunner(session: restored).sample(at: .now).isComplete {
-                activeSplashScoreEvents = SplashMusicDirector.events(for: restored)
+                if let story = Story(rawValue: persistedStory) {
+                    stage = .story(story)
+                    activeSplashScoreEvents = nil
+                } else {
+                    activeSplashScoreEvents = SplashMusicDirector.events(for: restored)
+                }
                 activePerformanceSession = restored
             }
             synchronizeAudio()
         }
+        .onChange(of: autumnRecord) { _, record in
+            persistedAutumn = (try? JSONEncoder().encode(record)) ?? Data()
+        }
         .onChange(of: activePerformanceSession) { _, session in
+            if case .story(let story) = stage { persistedStory = story.rawValue }
+            else { persistedStory = "" }
             persistedPerformance = (try? session.map { try JSONEncoder().encode($0) }) ?? Data()
             synchronizeAudio()
         }
@@ -1745,7 +1663,7 @@ struct SplashScreenView: View {
         .onDisappear { synthesizer.fadeOut() }
 #if DEBUG
         .onAppear {
-            if ProcessInfo.processInfo.arguments.contains("--sunrise-audit-landscape"),
+            if (ProcessInfo.processInfo.arguments.contains("--sunrise-audit-landscape") || ProcessInfo.processInfo.arguments.contains("--autumn-landscape")),
                let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
                 scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeLeft)) { error in
                     print("Sunrise landscape audit unavailable: \(error)")
@@ -1917,6 +1835,7 @@ struct SplashScreenView: View {
         case .opening:
             startSplashRun(duration)
         case .story:
+            autumnRecord.manualGusts = []
             activePerformanceSession = PerformanceSession(
                 duration: duration,
                 randomSeed: UInt64(max(scoreSeed, 0))
@@ -1930,9 +1849,7 @@ struct SplashScreenView: View {
     private func stopCurrentScene() {
         activePerformanceSession = nil
         activeSplashScoreEvents = nil
-        if case .story = stage {
-            stage = .opening
-        }
+        // Ending a story leaves its scene and contextual tuning available.
     }
 #endif
 }
@@ -1941,6 +1858,8 @@ struct SplashScreenView: View {
 private struct PerformanceDesk: View {
     @Binding var expandedSections: Set<PerformanceDeskSection>
     let context: PerformanceDeskContext
+    @Binding var autumnRecord: AutumnBranchRecord
+    let onAutumnGust: () -> Void
     @Binding var speedMultiplier: Double
     @Binding var amountMultiplier: Double
     @Binding var atmosphereProgress: Double
@@ -1991,6 +1910,9 @@ private struct PerformanceDesk: View {
                         onTriggerEvent: onTriggerEvent,
                             onReset: onReset
                         )
+                    } else if case .story(.autumnTree) = context {
+                        AutumnBranchControls(record: $autumnRecord, seed: $scoreSeed,
+                            session: activePerformanceSession, onGust: onAutumnGust)
                     } else {
                         Text("This section is reserved for controls published by the active story director. It does not alter the splash while \(context.title) is open.")
                             .font(.caption)
@@ -2018,6 +1940,9 @@ private struct PerformanceDesk: View {
                             title: context.title,
                             session: activePerformanceSession
                         )
+                        if case .story(.autumnTree) = context {
+                            AutumnBranchMonitor(session: activePerformanceSession, record: autumnRecord)
+                        }
                     }
                 }
 
@@ -2028,7 +1953,7 @@ private struct PerformanceDesk: View {
                         activeSession: activePerformanceSession,
                         onRun: onRun,
                         onStop: onStop,
-                        onPauseResume: context.isSplash ? onPauseResume : nil
+                        onPauseResume: onPauseResume
                     )
                     if context.isSplash {
                         Toggle("Synth audition", isOn: $auditionEnabled)

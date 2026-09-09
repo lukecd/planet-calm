@@ -139,40 +139,56 @@ struct StorySceneLaunchView: View {
 
     let story: Story
     let onBack: () -> Void
+    let onStart: (FocusDuration) -> Void
+    let onPauseResume: () -> Void
+    @State private var duration = FocusDuration.fiveMinutes
 
-    private let session: FocusSession
+    private let session: PerformanceSession?
     private let player: StoryPlayer
+    private let autumnRecord: AutumnBranchRecord
 
     init(
         story: Story,
-        session: FocusSession? = nil,
+        session: PerformanceSession? = nil,
+        autumnRecord: AutumnBranchRecord = .init(),
+        onStart: @escaping (FocusDuration) -> Void,
+        onPauseResume: @escaping () -> Void,
         onBack: @escaping () -> Void
     ) {
         self.story = story
         self.onBack = onBack
+        self.onStart = onStart
+        self.onPauseResume = onPauseResume
 
-        let resolvedSession = session ?? FocusSession(
+        let resolvedSession = session?.focusSession(for: story) ?? FocusSession(
             story: story,
             duration: .twentyFiveMinutes,
             startedAt: .now
         )
-        self.session = resolvedSession
+        self.session = session
+        self.autumnRecord = autumnRecord
         self.player = StoryPlayer(session: resolvedSession)
     }
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
+            Group {
+            if story == .autumnTree {
+                AutumnBranchSceneView(session: session, record: autumnRecord, reduceMotion: reduceMotion)
+            } else {
             StorySceneCatalog.scene(
                 for: story,
                 context: StorySceneRenderContext(
-                    progress: session.progress(at: context.date),
-                    elapsedTime: session.elapsedTime(at: context.date),
+                    progress: session?.progress(at: context.date) ?? 0,
+                    elapsedTime: session?.elapsedTime(at: context.date) ?? 0,
                     referenceDate: context.date,
-                    performance: player.performance(at: context.date, reduceMotion: reduceMotion),
+                    performance: player.performance(atElapsedTime: session?.elapsedTime(at: context.date) ?? 0, reduceMotion: reduceMotion),
                     reduceMotion: reduceMotion,
                     showsFocusUI: false
                 )
             )
+            }
+            }
             .overlay(alignment: .topLeading) {
                 Button(action: onBack) {
                     Text("Stories")
@@ -183,10 +199,26 @@ struct StorySceneLaunchView: View {
                         .background(PlanetFocusPalette.canvasInk.opacity(0.76))
                 }
                 .buttonStyle(.plain)
-                .padding(.top, 8)
+                .padding(.top, 46)
                 .padding(.leading, 10)
                 .accessibilityHint("Return to the story chooser")
             }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            HStack {
+                if session == nil {
+                    Picker("Duration", selection: $duration) {
+                        ForEach(FocusDuration.available) { value in Text(value.title).tag(value) }
+                    }.tint(PlanetFocusPalette.typePaleBlue)
+                }
+                Button(session == nil ? "Begin" : session!.progress(at: .now) >= 1 ? "Again" : session!.isPaused ? "Resume" : "Pause") {
+                    if session == nil || session!.progress(at: .now) >= 1 { onStart(duration) }
+                    else { onPauseResume() }
+                }
+                .accessibilityIdentifier("autumnPlayback")
+                .buttonStyle(.borderedProminent)
+                .tint(PlanetFocusPalette.canvasInk)
+            }.padding(24)
         }
         .ignoresSafeArea()
     }

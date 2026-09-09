@@ -3,8 +3,9 @@
 **Status:** live splash integration with temporary synthesized audio · **Updated:** 2026-09-09
 
 One authoritative transport and one seeded score drive narrative motion and sound.
-The splash is the first integrated consumer. Autumn and Contemporary Lotus are not
-being migrated in this pass.
+The splash is the first integrated consumer. Autumn now has an integrated branch
+checkpoint using the same transport; its full tree and musical direction are not yet
+migrated. See [Autumn branch checkpoint](autumn-branch-checkpoint.md).
 
 ## Ownership: reuse these components
 
@@ -20,8 +21,9 @@ being migrated in this pass.
 | `SplashScreenView` | Connect transport, plan, renderer, audition, lifecycle, persistence, and the nonblocking performance desk. |
 | `StoryPlayer` / `StoryDirector` / `StoryMoment` | Existing focus-story adapters and visual/audio moment contract. Preserve them when adapting other scenes. |
 
-Implementation lives in `PlanetCalm/Directors/`, with existing splash event and visual
-types in `PlanetCalm/Views/SplashScreenView.swift`. Do not create another clock,
+Implementation lives in `PlanetCalm/Directors/`, with shared note/envelope/source contracts in
+`PlanetCalm/Directors/PerformanceNoteEvent.swift` and splash visual sampling in
+`PlanetCalm/Views/SplashScreenView.swift`. Do not create another clock,
 pool selector, ADSR implementation, or independently randomized audio schedule.
 
 ## Transport and lifecycle

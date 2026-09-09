@@ -13,8 +13,9 @@ struct SunriseUniforms {
 struct SunriseSkyView: UIViewRepresentable {
     let uniforms: SunriseUniforms
     var drawsClouds = false
+    var autumnSky = false
 
-    func makeCoordinator() -> SunriseRenderer { SunriseRenderer(drawsClouds: drawsClouds) }
+    func makeCoordinator() -> SunriseRenderer { SunriseRenderer(drawsClouds: drawsClouds, autumnSky: autumnSky) }
 
     func makeUIView(context: Context) -> MTKView {
         let view = MTKView(frame: .zero, device: context.coordinator.device)
@@ -57,7 +58,7 @@ final class SunriseRenderer: NSObject, MTKViewDelegate {
 
     private let drawsClouds: Bool
 
-    init(drawsClouds: Bool = false) {
+    init(drawsClouds: Bool = false, autumnSky: Bool = false) {
         self.drawsClouds = drawsClouds
         super.init()
         guard let device, let library = device.makeDefaultLibrary() else { return }
@@ -79,7 +80,7 @@ final class SunriseRenderer: NSObject, MTKViewDelegate {
             }
             let descriptor = MTLRenderPipelineDescriptor()
             descriptor.vertexFunction = library.makeFunction(name: "sunriseVertex")
-            descriptor.fragmentFunction = library.makeFunction(name: drawsClouds ? "paperCloudFragment" : "sunriseFragment")
+            descriptor.fragmentFunction = library.makeFunction(name: drawsClouds ? "paperCloudFragment" : autumnSky ? "autumnSkyFragment" : "sunriseFragment")
             descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
             pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
             if drawsClouds { return }

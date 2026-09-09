@@ -290,7 +290,7 @@ private struct AutumnTreeCanvas: View {
     }
 }
 
-private final class AutumnTreeImageStore: @unchecked Sendable {
+final class AutumnTreeImageStore: @unchecked Sendable {
     static let shared = AutumnTreeImageStore()
 
     private let cache = NSCache<NSString, UIImage>()

@@ -25,9 +25,13 @@ struct StoryPlayer {
     }
 
     func performance(at date: Date, reduceMotion: Bool) -> StoryPerformance {
-        let elapsedTime = session.elapsedTime(at: date)
+        performance(atElapsedTime: session.elapsedTime(at: date), reduceMotion: reduceMotion)
+    }
+
+    /// Shared-transport entry point; never reconstruct a second date-based clock.
+    func performance(atElapsedTime elapsedTime: Double, reduceMotion: Bool) -> StoryPerformance {
         let context = StoryContext(
-            progress: session.progress(at: date),
+            progress: min(max(elapsedTime / session.duration.timeInterval, 0), 1),
             elapsedTime: elapsedTime,
             duration: session.duration.timeInterval,
             reduceMotion: reduceMotion

@@ -11,6 +11,7 @@ struct StorySceneRenderContext: Equatable {
     let showsFocusUI: Bool
 }
 
+@MainActor
 enum StorySceneCatalog {
     @ViewBuilder
     static func scene(for story: Story, context: StorySceneRenderContext) -> some View {

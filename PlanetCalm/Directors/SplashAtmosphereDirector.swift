@@ -352,20 +352,8 @@ struct SplashAtmosphereSample: Equatable, Sendable {
     }
 }
 
-enum SplashSoundRole: String, Equatable, Sendable {
-    case drone
-    case pad
-    case melodicOneShot
-}
-
-/// A future audio engine resolves this semantic key to an imported recording. The key
-/// never contains a filename, so changing an Ableton export does not change the score.
-struct SplashSoundAssetKey: Equatable, Sendable {
-    let pool: SplashAtmospherePoolID
-    let role: SplashSoundRole
-    let tonalSlot: Int
-    let octaveOffset: Int
-}
+typealias SplashSoundRole = PerformanceSoundRole
+typealias SplashSoundAssetKey = PerformanceSoundAssetKey<SplashAtmospherePoolID>
 
 enum SplashAtmosphereDirector {
     /// The eventual automatic arc should run across minutes, not the visual frame rate.
@@ -407,14 +395,9 @@ enum SplashAtmosphereDirector {
         octaveOffset: Int = 0
     ) -> SplashSoundAssetKey {
         let unit = deterministicUnit(eventOrdinal: eventOrdinal, tonalSlot: tonalSlot)
-        let pool: SplashAtmospherePoolID
-        if unit < atmosphere.weights.night {
-            pool = .night
-        } else if unit < atmosphere.weights.night + atmosphere.weights.twilight {
-            pool = .twilight
-        } else {
-            pool = .daylight
-        }
+        let blend = PerformancePoolBlend(first: atmosphere.weights.night,
+            middle: atmosphere.weights.twilight, last: atmosphere.weights.daylight)
+        let pool: SplashAtmospherePoolID = [.night, .twilight, .daylight][blend.index(forUnit: unit)]
         return SplashSoundAssetKey(
             pool: pool,
             role: role,
@@ -439,14 +422,9 @@ enum SplashAtmosphereDirector {
             seed: sessionSeed ^ StableSeed.hash(eventID)
         )
         let unit = random.unitInterval()
-        let pool: SplashAtmospherePoolID
-        if unit < atmosphere.weights.night {
-            pool = .night
-        } else if unit < atmosphere.weights.night + atmosphere.weights.twilight {
-            pool = .twilight
-        } else {
-            pool = .daylight
-        }
+        let blend = PerformancePoolBlend(first: atmosphere.weights.night,
+            middle: atmosphere.weights.twilight, last: atmosphere.weights.daylight)
+        let pool: SplashAtmospherePoolID = [.night, .twilight, .daylight][blend.index(forUnit: unit)]
         return SplashSoundAssetKey(
             pool: pool,
             role: role,

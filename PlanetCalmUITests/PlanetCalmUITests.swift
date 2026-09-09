@@ -2,6 +2,87 @@ import XCTest
 
 @MainActor
 final class PlanetCalmUITests: XCTestCase {
+    func testAutumnCheckpointLightPortrait() throws { try autumnLightAudit(landscape: false) }
+    func testAutumnCheckpointLightLandscape() throws { try autumnLightAudit(landscape: true) }
+
+    private func autumnLightAudit(landscape: Bool) throws {
+        XCUIDevice.shared.orientation = landscape ? .landscapeLeft : .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--autumn-light-audit"] + (landscape ? ["--autumn-landscape"] : [])
+        app.launch()
+        XCTAssertTrue(app.otherElements["Autumn Tree focus story"].waitForExistence(timeout: 8))
+        if app.buttons["Hide"].exists { app.buttons["Hide"].tap() }
+        let next = app.buttons["autumnAuditNext"]
+        XCTAssertTrue(next.waitForExistence(timeout: 5))
+        if landscape {
+            XCUIDevice.shared.orientation = .portrait
+            XCUIDevice.shared.orientation = .landscapeLeft
+            let rotated = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                app.frame.width > app.frame.height
+            }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [rotated], timeout: 8), .completed)
+            XCTAssertGreaterThan(app.frame.width, app.frame.height)
+        }
+        else { XCTAssertGreaterThan(app.frame.height, app.frame.width) }
+        for step in 0...20 {
+            let attachment = XCTAttachment(screenshot: app.screenshot())
+            attachment.name = String(format: "autumn-%@-%03d", landscape ? "landscape" : "portrait", step * 5)
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            if step < 20 { next.tap() }
+        }
+    }
+
+    func testAutumnCheckpointLiveMotion() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--autumn-checkpoint", "--autumn-fresh"]
+        app.launch()
+        XCTAssertTrue(app.buttons["Hide"].waitForExistence(timeout: 8))
+        app.buttons["Autumn Tree tuning"].tap()
+        app.buttons["Autumn Tree runner"].tap()
+        let run = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Run Autumn")).firstMatch
+        XCTAssertTrue(run.waitForExistence(timeout: 5))
+        run.tap()
+        app.buttons["Hide"].tap()
+        for index in 0..<7 {
+            let pause = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in false }, object: nil)
+            _ = XCTWaiter.wait(for: [pause], timeout: 4)
+            let attachment = XCTAttachment(screenshot: app.screenshot())
+            attachment.name = "autumn-motion-\(index)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        app.buttons["autumnPlayback"].tap()
+        let frozen = app.screenshot().pngRepresentation
+        let pause = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in false }, object: nil)
+        _ = XCTWaiter.wait(for: [pause], timeout: 2)
+        // Exact image assertion is inappropriate with a live status-bar clock; physics
+        // equality is covered by the model test.
+        XCTAssertFalse(frozen.isEmpty)
+        XCTAssertEqual(app.buttons["autumnPlayback"].label, "Resume")
+    }
+
+    func testAutumnCheckpointPlaybackControls() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--autumn-light-audit"]
+        app.launch()
+        XCTAssertTrue(app.buttons["Hide"].waitForExistence(timeout: 8))
+        app.buttons["Hide"].tap()
+        let play = app.buttons["autumnPlayback"]
+        XCTAssertTrue(play.waitForExistence(timeout: 5))
+        play.tap()
+        XCTAssertEqual(play.label, "Pause")
+        play.tap()
+        XCTAssertEqual(play.label, "Resume")
+        app.buttons["Controls"].tap()
+        XCTAssertTrue(app.buttons["Autumn Tree runner"].exists)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "autumn-paused-controls"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
     override func setUpWithError() throws {
         continueAfterFailure = false
     }

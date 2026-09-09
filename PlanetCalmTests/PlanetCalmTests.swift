@@ -9,6 +9,63 @@ import CryptoKit
 @testable import PlanetCalm
 
 final class PlanetCalmTests: XCTestCase {
+    func testAutumnCheckpointDeterministicPhysicsAndSettling() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let plan = AutumnBranchPlan(duration: 120, seed: 42, tuning: .standard)
+        let stepped = AutumnBranchSimulation(plan: plan, reference: reference)
+        for time in stride(from: 0.0, through: 80, by: 0.1) { _ = stepped.sample(at: time) }
+        let direct = AutumnBranchSimulation(plan: plan, reference: reference)
+        XCTAssertEqual(stepped.sample(at: 80), direct.sample(at: 80))
+        let end = direct.sample(at: 120)
+        XCTAssertEqual(end.leaves.count, 6)
+        XCTAssertEqual(end.leaves.filter { $0.phase == .settled }.count, 3)
+        for leaf in end.leaves {
+            XCTAssertTrue(leaf.x.isFinite && leaf.y.isFinite && leaf.angle.isFinite)
+            XCTAssertGreaterThanOrEqual(leaf.y, 16)
+        }
+        XCTAssertEqual(direct.sample(at: 20),
+            AutumnBranchSimulation(plan: plan, reference: reference).sample(at: 20))
+    }
+
+    func testAutumnCheckpointReleaseContinuityAndPause() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let simulation = AutumnBranchSimulation(plan: .init(duration: 120, seed: 42, tuning: .standard), reference: reference)
+        var previous = simulation.sample(at: 0)
+        var releases = 0
+        for tick in 1...3600 {
+            let frame = simulation.sample(at: Double(tick) / 120)
+            for (before, after) in zip(previous.leaves, frame.leaves) where before.phase == .attached && after.phase == .falling {
+                releases += 1
+                XCTAssertLessThan(hypot(after.x - before.x, after.y - before.y), 1)
+                XCTAssertLessThan(abs(after.angle - before.angle), 0.1)
+                XCTAssertEqual(after.releasedAt, frame.time)
+            }
+            previous = frame
+        }
+        XCTAssertEqual(releases, 3)
+        let start = Date(timeIntervalSince1970: 100)
+        var session = PerformanceSession(duration: .twoMinutes, startedAt: start, randomSeed: 42)
+        session.pause(at: start.addingTimeInterval(15))
+        let frozen = simulation.sample(at: session.elapsedTime(at: start.addingTimeInterval(20)))
+        XCTAssertEqual(frozen, simulation.sample(at: session.elapsedTime(at: start.addingTimeInterval(60))))
+        let restored = try JSONDecoder().decode(PerformanceSession.self, from: JSONEncoder().encode(session))
+        XCTAssertEqual(frozen, AutumnBranchSimulation(plan: simulation.plan, reference: reference)
+            .sample(at: restored.elapsedTime(at: start.addingTimeInterval(70))))
+    }
+
+    func testAutumnCheckpointWindDurationAndManualEvents() throws {
+        let short = AutumnBranchPlan(duration: 300, seed: 42, tuning: .standard)
+        let long = AutumnBranchPlan(duration: 3000, seed: 42, tuning: .standard)
+        XCTAssertEqual(short.gusts.map(\.duration), long.gusts.map(\.duration))
+        XCTAssertEqual(long.gusts[0].startTime, short.gusts[0].startTime * 10)
+        let manual = AutumnBranchPlan(duration: 120, seed: 42, tuning: .standard, manualGusts: [3])
+        XCTAssertEqual(manual.gusts.last?.startTime, 3)
+        XCTAssertNotNil(manual.gusts.last?.audioCue)
+        XCTAssertEqual(manual.gusts.last?.visualCue?.effect.rawValue, "autumn.wind")
+        let record = AutumnBranchRecord(tuning: .standard, manualGusts: [3])
+        XCTAssertEqual(record, try JSONDecoder().decode(AutumnBranchRecord.self, from: JSONEncoder().encode(record)))
+    }
+
     @MainActor
     func testMusicRunnerLiveAudioOutput() async throws {
         let synth = PerformanceSynthesizer()
