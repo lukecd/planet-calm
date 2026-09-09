@@ -1,6 +1,6 @@
 # Planet Focus — Visual Design Foundation
 
-**Version:** 12 · **Updated:** 2026-09-07 · **Status:** Approved palette and current native splash
+**Version:** 13 · **Updated:** 2026-09-07 · **Status:** Approved palette and current native splash
 
 This is the current design source of truth for Planet Focus outer UI. Story artwork may
 use story-specific colors, but navigation, typography, and shared surfaces should use
@@ -122,57 +122,88 @@ paper world rather than uniformly squeezing the landscape composition.
 
 ## Animation boundaries
 
-The first milestone is static, but the layer structure must support later entrance and
-exit choreography without rebuilding the screen.
+The accepted static composition is the rest pose for animation. The same independently
+addressable layers now support entrance, living motion, and exit choreography without
+rebuilding or flattening the screen.
 
 - Every wave ribbon is a separate actor with a stable identity and an independent
-  horizontal travel direction.
+  entry edge. Its visible domain grows and recedes along the analytic centerline
+  rather than translating a finished shape.
 - Every lotus is a separate actor. Within each lotus, the upright center petal, paired
   side petals, outer petals, base petals, and warm-yellow heart remain independently
   addressable.
-- The settled lotus geometry is compatible with a later sequence in which the upright
-  center petal fades in first and the side petals fan outward from the base.
+- Lotus entry is built from the existing petals rather than scaling or translating a
+  completed flower. The upright center petal appears first, the side families fan
+  outward from their shared base, and the warm-yellow heart appears during that fan.
+  Flowers do not begin until the supporting ribbon field has finished unfurling, then
+  left, center, and right overlap in a 0.16-second cascade. Exit samples the same path
+  backward on a shorter 1.12-second clock.
 - Wordmark, sun, navigation, and the full scene remain separate actors.
 - A future navigation transition can animate the scene to an exit state before routing
   to Start, Stories, Stats, or Settings.
-- Reduce Motion will replace travel and petal fanning with calm fades or immediate state
-  changes. Motion will never be required to understand the screen.
+- Reduce Motion presents the settled composition and uses immediate state changes.
+  Motion is never required to understand the screen.
 
-## Material and accessibility
+### Approved first-pass splash score
 
-- The canvas uses `CanvasPaperTextureV3`, an original cardstock material field calibrated
-  directly around `canvas.ink`. Its Autumn-derived fibers remain visible at normal iPad
-  scale, with restrained contrast so the surface reads as clean cardstock rather than felt
-  or compressed pulp. It introduces no new semantic color and does not use a blend mode that
-  shifts the approved navy.
-- The canvas material is aspect-filled as one continuous crop rather than tiled, so its
-  fiber scale remains stable and it cannot expose repeating seams during rotation.
-- The sun uses its own locally clipped `SunPaperTexture`, calibrated around `sun.warm`.
-  A thin derived ochre backing disc is offset down and right to expose only the paper's cut
-  edge; a restrained pale highlight stays on the face. A tight contact shadow and softer
-  secondary cast shadow provide separation without changing the approved circle geometry.
-  These shadows use neutral black rather than `canvas.ink`; reusing the canvas color over
-  itself does not create enough luminance separation on the dark navy surface.
-- Each wave uses the neutral `WavePaperTexture` as a local tiled material field. The
-  grayscale fibers are soft-light composited inside an isolated face group, then clipped
-  by that ribbon's native path. This keeps the approved semantic color in control and
-  prevents the material from bleaching adjacent waves, the canvas, or the sun.
-- Every wave actor contains its own face, locally clipped fibers, thin darker derived-color
-  cut edge, tight contact shadow, and restrained cast shadow. The complete paper stack
-  travels as one actor during future entrance or exit motion.
-- Wave cut-edge colors are material tints derived from the approved ribbon colors; they
-  do not expand the semantic palette. Wave shadows use neutral black so layer separation
-  remains visible over both the navy canvas and neighboring colored paper.
-- Paper texture is subtle, clipped to each paper shape, and moves with that shape.
-- Shallow shadows may explain layer order; heavy floating-card shadows are inappropriate.
-- Navigation labels keep clear tap targets and VoiceOver labels.
-- Dynamic Type and compact layouts must avoid clipped navigation or an obscured wordmark.
-- Contrast is verified against rendered textured surfaces, not flat swatches alone.
+The provisional performance tempo is 65 BPM in 4/4. It schedules future musical
+moments; the continuous wave field remains fluid and derives from elapsed time.
 
-## Deferred decisions
+In the current living-motion study, the eight ribbons keep stable tonal slots but do
+not yet have assigned pitches. Four quiet foundation voices cover the initial score
+build, then hand off to long, overlapping pad envelopes on those same ribbon actors.
+Every note supplies a restrained whole-ribbon motion bed plus a stronger traveling
+packet. Both use one uninterrupted phase clock per ribbon; note onset never resets the
+wave. After the intro exactly four actors remain scheduled and at least three produce
+measurable visible movement throughout the cycle. This prevents full staticness and
+onset jerks without making every ribbon crest and fall together. The same
+performance-clock samples are the future synchronization seam for music.
 
-- Final approval or replacement of Aladin after it is reviewed in the native screen.
-- Exact grain treatment for the approved lotus construction.
-- Entrance timing, easing, stagger, wave phase, lotus bloom timing, idle behavior, and
-  exit choreography.
-- Navigation destinations beyond the minimal Stories path used to demonstrate the splash.
+- At 0.00 seconds only the ink-navy paper canvas is visible. The provisional drone and
+  note score begin with the visual performance rather than waiting after the intro.
+- Ribbon starts overlap from 0.25 through 1.51 seconds at 0.18-second intervals. Each
+  unfurls for 2.00 seconds, so the complete field is settled at 3.51 seconds.
+- The menu becomes usable when the ribbon field completes at 3.51 seconds. The lotus
+  sequence begins at 3.56 seconds and finishes at 4.46 seconds, but it never blocks a
+  returning user from navigating. An interrupted flower sequence reverses from its
+  exact current petal state.
+- The audition score is a 32-beat cycle. A new pad voice begins every four beats and
+  remains active for sixteen beats: three-beat attack, two-beat decay, 0.72 sustain,
+  ten-beat gate, and six-beat release. Four pad envelopes therefore overlap once the
+  first cycle has filled, with no quiet interval at the loop boundary.
+- Selecting Stories immediately starts a front-to-back ribbon release and a
+  time-compressed reverse lotus cascade. The lotuses finish in 1.12 seconds and routing
+  completes with the last ribbon at 1.50 seconds.
+- The advancing or receding frontier is part of the generated geometry: the sampled
+  domain changes over time and a smooth 0.09-world-width envelope tapers thickness to
+  zero at the tip. The final frame is the exact approved rest geometry.
+- Ribbons never use a moving rectangular mask, rigid translation, or opacity to enter
+  or leave.
+- Wordmark, sun, and navigation remain independently addressable alongside the authored
+  lotus petal choreography.
+
+## Generative atmosphere direction
+
+The splash is a story driven by the shared performance transport. Its current sunrise
+implementation is specified in [Splash sunrise renderer](splash-sunrise-model.md).
+That document supersedes the earlier full-canvas palette fades and expanding opaque masks.
+
+The sun begins approximately 10% exposed above the rear wave, rises, and carries a
+spatial light field. Native Metal evaluates atmospheric scattering; an explicit paper
+color treatment brings the result to the yellow reference. Three abstract paper cloud
+strips share their visible silhouettes with the ray-occlusion calculation. Texture
+stays neutral and separate from light.
+
+The approved yellow-paper reference is
+[planet-focus-yellow.png](../../fall-references/planet-focus-ui/splash-screen-v2/planet-focus-yellow.png).
+It is a visual target, never a flattened production scene plate.
+
+Waves retain their stable tonal slots and note envelopes. The existing abstract wave
+resonance remains the melodic study; no visiting animal is introduced by the sunrise work.
+Night, Twilight, and Daylight sound banks overlap according to normalized transport
+progress. A note chooses its bank at onset and keeps it through its release.
+
+The Light slider and Splash runner sample the same director. The configured session
+duration controls the arc. Every 5% state must be visually inspected in phone and tablet
+layouts, including both tablet orientations. Keep the established individual paper
+actors and their entrances/exits; future music refinement should use this shared system.

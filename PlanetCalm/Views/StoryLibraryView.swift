@@ -143,17 +143,21 @@ struct StorySceneLaunchView: View {
     private let session: FocusSession
     private let player: StoryPlayer
 
-    init(story: Story, onBack: @escaping () -> Void) {
+    init(
+        story: Story,
+        session: FocusSession? = nil,
+        onBack: @escaping () -> Void
+    ) {
         self.story = story
         self.onBack = onBack
 
-        let session = FocusSession(
+        let resolvedSession = session ?? FocusSession(
             story: story,
             duration: .twentyFiveMinutes,
             startedAt: .now
         )
-        self.session = session
-        self.player = StoryPlayer(session: session)
+        self.session = resolvedSession
+        self.player = StoryPlayer(session: resolvedSession)
     }
 
     var body: some View {
