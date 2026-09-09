@@ -1,4 +1,6 @@
+import Foundation
 import SwiftUI
+import AVFoundation
 
 enum SplashSceneActorID: String, CaseIterable, Identifiable {
     case background
@@ -42,31 +44,999 @@ enum SplashMenuItem: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-/// Settled values are used for the static milestone. These seams are intentionally
-/// state-driven so later choreography can animate waves, lotus petals, the sun, and
-/// the surrounding UI without changing the scene hierarchy.
+struct PerformanceClock: Equatable, Sendable {
+    let startedAt: Date
+
+    init(startedAt: Date = Date()) {
+        self.startedAt = startedAt
+    }
+
+    func elapsed(at date: Date) -> TimeInterval {
+        max(date.timeIntervalSince(startedAt), 0)
+    }
+}
+
+struct PerformanceTempo: Equatable, Sendable {
+    let beatsPerMinute: Double
+    let beatsPerBar: Int
+
+    var secondsPerBeat: TimeInterval {
+        60 / beatsPerMinute
+    }
+}
+
+struct SplashWaveMotionSample: Equatable {
+    let phase: CGFloat
+    let amplitude: CGFloat
+    let packetCenter: CGFloat
+    let packetHalfWidth: CGFloat
+    let bedPhase: CGFloat
+    let bedAmplitude: CGFloat
+
+    init(
+        phase: CGFloat,
+        amplitude: CGFloat,
+        packetCenter: CGFloat = 0.5,
+        packetHalfWidth: CGFloat = .infinity,
+        bedPhase: CGFloat = 0,
+        bedAmplitude: CGFloat = 0
+    ) {
+        self.phase = phase
+        self.amplitude = amplitude
+        self.packetCenter = packetCenter
+        self.packetHalfWidth = packetHalfWidth
+        self.bedPhase = bedPhase
+        self.bedAmplitude = bedAmplitude
+    }
+
+    var totalAmplitude: CGFloat {
+        min(amplitude + bedAmplitude, 1)
+    }
+
+    var isMoving: Bool {
+        totalAmplitude > 0
+    }
+
+    static let resting = SplashWaveMotionSample(
+        phase: 0,
+        amplitude: 0
+    )
+}
+
+/// A short, note-shaped disturbance that travels through the paper field.
+/// It is deliberately defined in wave-world coordinates, rather than screen
+/// coordinates, so the same event remains coherent across rotation and crop.
+struct SplashWaveResonanceTuning: Equatable {
+    var strength: CGFloat
+    var halfWidth: CGFloat
+
+    static let standard = SplashWaveResonanceTuning(
+        strength: 1,
+        halfWidth: 0.115
+    )
+}
+
+struct SplashWaveResonanceSample: Equatable {
+    let progress: CGFloat
+    let center: CGFloat
+    let strength: CGFloat
+    let halfWidth: CGFloat
+    let targetWaveIndex: Int
+
+    static func sample(
+        event: SplashWaveNoteEvent,
+        scoreBeat: Double,
+        tuning: SplashWaveResonanceTuning
+    ) -> SplashWaveResonanceSample? {
+        guard let envelope = event.sample(at: scoreBeat) else { return nil }
+
+        let progress = CGFloat(envelope.lifecycleProgress)
+        let center = -tuning.halfWidth
+            + (1 + tuning.halfWidth * 2) * progress
+        return SplashWaveResonanceSample(
+            progress: progress,
+            center: center,
+            strength: tuning.strength
+                * CGFloat(event.intensity)
+                * CGFloat(SplashPerformanceScore.visualMotionGain(for: envelope)),
+            halfWidth: tuning.halfWidth,
+            targetWaveIndex: event.tonalSlot
+        )
+    }
+
+    func verticalShift(at x: CGFloat, waveIndex: Int) -> CGFloat {
+        let distance = (x - center) / max(halfWidth, 0.001)
+        let localizedGain = exp(-0.5 * distance * distance)
+        guard waveIndex == targetWaveIndex else { return 0 }
+        return -0.034 * strength * localizedGain
+    }
+
+    func seamOpacity(for waveIndex: Int) -> Double {
+        waveIndex == targetWaveIndex ? Double(0.38 * strength) : 0
+    }
+}
+
+struct SplashWaveVoice: Equatable {
+    let actorID: SplashSceneActorID
+    let tonalSlot: Int
+    let noteName: String
+}
+
+enum SplashPerformanceRole: String, CaseIterable, Equatable, Sendable {
+    case drone
+    case pad
+    case chime
+    case melody
+}
+
+enum SplashEnvelopeStage: Equatable, Sendable {
+    case attack
+    case decay
+    case sustain
+    case release
+}
+
+struct SplashEnvelopeSample: Equatable, Sendable {
+    let value: Double
+    let lifecycleProgress: Double
+    let localBeat: Double
+    let stage: SplashEnvelopeStage
+}
+
+struct SplashADSREnvelope: Equatable, Sendable {
+    let attackBeats: Double
+    let decayBeats: Double
+    let sustainLevel: Double
+    let releaseBeats: Double
+
+    func sample(
+        localBeat: Double,
+        gateBeats: Double
+    ) -> SplashEnvelopeSample? {
+        let totalBeats = gateBeats + releaseBeats
+        guard localBeat >= 0, localBeat < totalBeats else { return nil }
+
+        let value: Double
+        let stage: SplashEnvelopeStage
+        if localBeat < attackBeats {
+            value = SplashMotionTiming.smootherStep(localBeat / attackBeats)
+            stage = .attack
+        } else if localBeat < attackBeats + decayBeats {
+            let decayProgress = SplashMotionTiming.smootherStep(
+                (localBeat - attackBeats) / decayBeats
+            )
+            value = 1 - (1 - sustainLevel) * decayProgress
+            stage = .decay
+        } else if localBeat < gateBeats {
+            value = sustainLevel
+            stage = .sustain
+        } else {
+            let releaseProgress = SplashMotionTiming.smootherStep(
+                (localBeat - gateBeats) / releaseBeats
+            )
+            value = sustainLevel * (1 - releaseProgress)
+            stage = .release
+        }
+
+        return SplashEnvelopeSample(
+            value: value,
+            lifecycleProgress: localBeat / totalBeats,
+            localBeat: localBeat,
+            stage: stage
+        )
+    }
+}
+
+struct SplashWaveNoteEvent: Equatable, Sendable {
+    let id: String
+    let tonalSlot: Int
+    let startBeat: Double
+    let gateBeats: Double
+    let envelope: SplashADSREnvelope
+    let role: SplashPerformanceRole
+    let intensity: Double
+    let isRepeating: Bool
+    let octaveOffset: Int
+
+    init(
+        id: String? = nil,
+        tonalSlot: Int,
+        startBeat: Double,
+        gateBeats: Double,
+        envelope: SplashADSREnvelope,
+        role: SplashPerformanceRole = .pad,
+        intensity: Double = 1,
+        isRepeating: Bool = true,
+        octaveOffset: Int = 0
+    ) {
+        self.id = id ?? "slot-\(tonalSlot)-beat-\(startBeat)"
+        self.tonalSlot = tonalSlot
+        self.startBeat = startBeat
+        self.gateBeats = gateBeats
+        self.envelope = envelope
+        self.role = role
+        self.intensity = intensity
+        self.isRepeating = isRepeating
+        self.octaveOffset = octaveOffset
+    }
+
+    var endBeat: Double {
+        startBeat + gateBeats + envelope.releaseBeats
+    }
+
+    var totalBeats: Double {
+        gateBeats + envelope.releaseBeats
+    }
+
+    func sample(at scoreBeat: Double) -> SplashEnvelopeSample? {
+        envelope.sample(
+            localBeat: scoreBeat - startBeat,
+            gateBeats: gateBeats
+        )
+    }
+}
+
+struct SplashScheduledPerformanceEvent: Identifiable, Equatable {
+    let event: SplashWaveNoteEvent
+    let scheduledStartBeat: Double
+
+    var id: String {
+        "\(event.id)-\(scheduledStartBeat)"
+    }
+
+    var endBeat: Double {
+        scheduledStartBeat + event.totalBeats
+    }
+
+    func sample(at scoreBeat: Double) -> SplashEnvelopeSample? {
+        event.envelope.sample(
+            localBeat: scoreBeat - scheduledStartBeat,
+            gateBeats: event.gateBeats
+        )
+    }
+}
+
+/// A stable, inspectable plan for the splash's future audio scheduler. It selects
+/// a semantic source key when an event starts; the eventual audio engine resolves
+/// that key to an imported recording and never reselects it during the release.
+struct SplashPerformancePlan: Equatable {
+    let session: PerformanceSession
+    let scoreEvents: [SplashWaveNoteEvent]
+
+    func atmosphere(at date: Date) -> SplashAtmosphereSample {
+        let progress = PerformanceRunner(session: session).sample(at: date).progress
+        return SplashAtmosphereDirector.sample(progress: progress)
+    }
+
+    func soundSource(
+        for scheduledEvent: SplashScheduledPerformanceEvent
+    ) -> SplashSoundAssetKey {
+        let secondsFromStart = scheduledEvent.scheduledStartBeat
+            * SplashPerformanceScore.tempo.secondsPerBeat
+        let eventProgress = min(
+            max(secondsFromStart / session.duration.timeInterval, 0),
+            1
+        )
+        let atmosphere = SplashAtmosphereDirector.sample(progress: eventProgress)
+        return SplashAtmosphereDirector.soundSource(
+            eventID: scheduledEvent.id,
+            sessionSeed: session.randomSeed,
+            tonalSlot: scheduledEvent.event.tonalSlot,
+            role: soundRole(for: scheduledEvent.event.role),
+            atmosphere: atmosphere,
+            octaveOffset: scheduledEvent.event.octaveOffset
+        )
+    }
+
+    private func soundRole(
+        for role: SplashPerformanceRole
+    ) -> SplashSoundRole {
+        switch role {
+        case .drone: .drone
+        case .pad: .pad
+        case .chime, .melody: .melodicOneShot
+        }
+    }
+}
+
+struct SplashScoreDiagnostics: Equatable {
+    let averageActiveVoices: Double
+    let longestSilentBeats: Double
+    let averageEventDurationSeconds: Double
+    let eventsPerMinute: Double
+    let participatingWaveCount: Int
+}
+
+struct SplashMotionTuning: Equatable {
+    static let standard = SplashMotionTuning()
+
+    private(set) var speedMultiplier: Double
+    private(set) var amountMultiplier: Double
+    private var phaseTimeAnchor: TimeInterval
+    private var activeTimeAnchor: TimeInterval
+
+    init(
+        speedMultiplier: Double = 1,
+        amountMultiplier: Double = 1,
+        phaseTimeAnchor: TimeInterval = 0,
+        activeTimeAnchor: TimeInterval = 0
+    ) {
+        self.speedMultiplier = speedMultiplier
+        self.amountMultiplier = amountMultiplier
+        self.phaseTimeAnchor = phaseTimeAnchor
+        self.activeTimeAnchor = activeTimeAnchor
+    }
+
+    func phaseTime(at activeTime: TimeInterval) -> TimeInterval {
+        phaseTimeAnchor
+            + max(activeTime - activeTimeAnchor, 0) * speedMultiplier
+    }
+
+    mutating func setSpeedMultiplier(
+        _ newValue: Double,
+        performanceElapsed: TimeInterval
+    ) {
+        let elapsed = max(performanceElapsed, 0)
+        phaseTimeAnchor = phaseTime(at: elapsed)
+        activeTimeAnchor = elapsed
+        speedMultiplier = min(max(newValue, 0.25), 4)
+    }
+
+    mutating func setAmountMultiplier(_ newValue: Double) {
+        amountMultiplier = min(max(newValue, 0.5), 2)
+    }
+
+    mutating func reset(performanceElapsed: TimeInterval) {
+        setSpeedMultiplier(1, performanceElapsed: performanceElapsed)
+        amountMultiplier = 1
+    }
+
+    mutating func restartKeepingValues() {
+        phaseTimeAnchor = 0
+        activeTimeAnchor = 0
+    }
+}
+
+
+enum SplashPerformanceScore {
+    static let tempo = PerformanceTempo(beatsPerMinute: 65, beatsPerBar: 4)
+    static let defaultSeed: UInt64 = 650_208
+    static let droneStartTime: TimeInterval = 0
+    static let noteCycleBeats: Double = 32
+    static let packetStart: CGFloat = -0.02
+    static let packetEnd: CGFloat = 1.02
+    static let packetHalfWidth: CGFloat = 0.22
+    static let droneFadeInDuration: TimeInterval = 2.4
+    static let droneSlots: Set<Int> = [0, 1, 3, 5]
+    static let noteBedShare: CGFloat = 0.28
+    static let packetShare: CGFloat = 0.86
+
+    /// Stable visual voices that can later address eight recorded scale tones.
+    static let waveVoices: [SplashWaveVoice] = [
+        .init(actorID: .waveRearPeriwinkle, tonalSlot: 0, noteName: "F2"),
+        .init(actorID: .waveRearDeep, tonalSlot: 1, noteName: "G2"),
+        .init(actorID: .waveWarmReveal, tonalSlot: 2, noteName: "A2"),
+        .init(actorID: .waveMiddleLavender, tonalSlot: 3, noteName: "B2"),
+        .init(actorID: .waveMiddleBlue, tonalSlot: 4, noteName: "C3"),
+        .init(actorID: .waveFrontDeep, tonalSlot: 5, noteName: "D3"),
+        .init(actorID: .waveFrontPeriwinkle, tonalSlot: 6, noteName: "E3"),
+        .init(actorID: .waveFrontLavender, tonalSlot: 7, noteName: "F3")
+    ]
+
+    /// Long, staggered pad notes overlap continuously after the initial build.
+    /// The future audio scheduler will consume the same starts and envelope.
+    static let noteEnvelope = SplashADSREnvelope(
+        attackBeats: 3,
+        decayBeats: 2,
+        sustainLevel: 0.72,
+        releaseBeats: 6
+    )
+    static let noteEvents: [SplashWaveNoteEvent] = [
+        .init(id: "drone-f2", tonalSlot: 0, startBeat: 0, gateBeats: 10, envelope: noteEnvelope, role: .drone, intensity: 0.78),
+        .init(id: "pad-b2", tonalSlot: 3, startBeat: 4, gateBeats: 10, envelope: noteEnvelope),
+        .init(id: "pad-d3", tonalSlot: 5, startBeat: 8, gateBeats: 10, envelope: noteEnvelope),
+        .init(id: "pad-g2", tonalSlot: 1, startBeat: 12, gateBeats: 10, envelope: noteEnvelope),
+        .init(id: "pad-c3", tonalSlot: 4, startBeat: 16, gateBeats: 10, envelope: noteEnvelope),
+        .init(id: "pad-f3", tonalSlot: 7, startBeat: 20, gateBeats: 10, envelope: noteEnvelope),
+        .init(id: "pad-a2", tonalSlot: 2, startBeat: 24, gateBeats: 10, envelope: noteEnvelope),
+        .init(id: "pad-e3", tonalSlot: 6, startBeat: 28, gateBeats: 10, envelope: noteEnvelope)
+    ]
+
+    static func events(seed: UInt64) -> [SplashWaveNoteEvent] {
+        guard seed != defaultSeed else { return noteEvents }
+
+        var random = SeededRandomNumberGenerator(seed: seed)
+        return noteEvents.enumerated().map { index, event in
+            let onsetJitter = index == 0 ? 0 : random.value(in: -0.55...0.55)
+            let gateVariation = random.value(in: -1.15...1.15)
+            return SplashWaveNoteEvent(
+                id: "\(event.id)-seed-\(seed)",
+                tonalSlot: event.tonalSlot,
+                startBeat: max(event.startBeat + onsetJitter, 0),
+                gateBeats: min(max(event.gateBeats + gateVariation, 8), 12),
+                envelope: event.envelope,
+                role: event.role,
+                intensity: event.intensity
+            )
+        }
+    }
+
+    static func noteName(for tonalSlot: Int) -> String {
+        waveVoices.first { $0.tonalSlot == tonalSlot }?.noteName ?? "?"
+    }
+
+    static func waveName(for tonalSlot: Int) -> String {
+        let number = min(max(tonalSlot + 1, 1), waveVoices.count)
+        return "Wave \(number)"
+    }
+
+    static func scoreBeat(
+        for performanceElapsed: TimeInterval,
+        tuning: SplashMotionTuning
+    ) -> Double {
+        tuning.phaseTime(at: max(performanceElapsed, 0)) / tempo.secondsPerBeat
+    }
+
+    static func waveMotionSample(
+        for actorID: SplashSceneActorID,
+        performanceElapsed: TimeInterval,
+        events: [SplashWaveNoteEvent] = noteEvents,
+        tuning: SplashMotionTuning = .standard
+    ) -> SplashWaveMotionSample {
+        guard let voice = waveVoices.first(where: { $0.actorID == actorID }) else {
+            return .resting
+        }
+
+        let elapsed = max(performanceElapsed, 0)
+        let tunedTime = tuning.phaseTime(at: elapsed)
+        let scoreBeat = tunedTime / tempo.secondsPerBeat
+        let noteEvent = events.first {
+            $0.tonalSlot == voice.tonalSlot
+        }
+        let liveSamples = events.filter { $0.tonalSlot == voice.tonalSlot }.compactMap {
+            scheduledSample(for: $0, scoreBeat: scoreBeat)?.envelope
+        }
+        let noteSample = liveSamples.max { $0.value < $1.value }
+        // Blend simultaneous notes continuously; a new melody never steals a pad's packet.
+        let gainSum = liveSamples.reduce(0.0) { $0 + $1.value }
+        let packetProgress = CGFloat(gainSum > 0.000001
+            ? liveSamples.reduce(0.0) { $0 + $1.lifecycleProgress * $1.value } / gainSum : 0)
+        let packetCenter = packetStart
+            + (packetEnd - packetStart) * packetProgress
+        // Every voice samples one continuous phase clock. Note events shape the
+        // strength and location of motion; they never restart the wave itself.
+        let phase = CGFloat(
+            tunedTime * SplashMotionTiming.motionPhaseUnitsPerSecond
+                + Double(voice.tonalSlot) * 0.17
+        )
+        let noteMotionGain = noteSample.map {
+            visualMotionGain(for: $0)
+        } ?? 0
+        let amplitude = SplashMotionTiming.maximumMotionAmount
+            * packetShare
+            * CGFloat(noteMotionGain)
+            * CGFloat(tuning.amountMultiplier)
+
+        let isInitialFoundation = droneSlots.contains(voice.tonalSlot)
+            && scoreBeat < (noteEvent?.startBeat ?? 0)
+        let attackHandoff: Double
+        let isFirstAttack = noteEvent.map {
+            scoreBeat >= $0.startBeat
+                && scoreBeat < $0.startBeat + $0.envelope.attackBeats
+        } ?? false
+        if let noteSample, noteSample.stage == .attack, isFirstAttack {
+            attackHandoff = 1 - SplashMotionTiming.smootherStep(
+                noteSample.localBeat / (noteEvent?.envelope.attackBeats ?? 1)
+            )
+        } else {
+            attackHandoff = 0
+        }
+        let foundationGain = max(isInitialFoundation ? 1 : 0, attackHandoff)
+        let fadeIn = SplashMotionTiming.smootherStep(
+            elapsed / droneFadeInDuration
+        )
+        let breathCycleBeats = 24 + Double(voice.tonalSlot) * 2
+        let breathAngle = 2 * Double.pi
+            * (scoreBeat / breathCycleBeats + Double(voice.tonalSlot) * 0.17)
+        let breathGain = 0.72 + 0.28 * (0.5 + 0.5 * sin(breathAngle))
+        let foundationBedGain = 0.34 * fadeIn * breathGain * foundationGain
+        let noteBedGain = Double(noteBedShare) * noteMotionGain
+        let bedAmplitude = SplashMotionTiming.maximumMotionAmount
+            * CGFloat(max(foundationBedGain, noteBedGain))
+            * CGFloat(tuning.amountMultiplier)
+
+        return SplashWaveMotionSample(
+            phase: phase,
+            amplitude: amplitude,
+            packetCenter: packetCenter,
+            packetHalfWidth: packetHalfWidth,
+            bedPhase: phase,
+            bedAmplitude: bedAmplitude
+        )
+    }
+
+    /// Preserves the audio ADSR endpoints while making its quieter shoulders
+    /// legible as paper motion. The curve and its derivative remain continuous.
+    static func visualMotionGain(
+        for sample: SplashEnvelopeSample
+    ) -> Double {
+        sample.value * (2 - sample.value)
+    }
+
+    static func repeatingSample(
+        for event: SplashWaveNoteEvent,
+        scoreBeat: Double,
+        cycleBeat: Double
+    ) -> SplashEnvelopeSample? {
+        scheduledSample(for: event, scoreBeat: scoreBeat)?.envelope
+    }
+
+    static func scheduledSample(
+        for event: SplashWaveNoteEvent,
+        scoreBeat: Double
+    ) -> (scheduledStartBeat: Double, envelope: SplashEnvelopeSample)? {
+        if !event.isRepeating {
+            return event.sample(at: scoreBeat).map { (event.startBeat, $0) }
+        }
+        let currentCycle = floor(scoreBeat / noteCycleBeats)
+        for cycle in [currentCycle, currentCycle - 1] where cycle >= 0 {
+            let startBeat = cycle * noteCycleBeats + event.startBeat
+            if let envelope = event.envelope.sample(
+                localBeat: scoreBeat - startBeat,
+                gateBeats: event.gateBeats
+            ) {
+                return (startBeat, envelope)
+            }
+        }
+        return nil
+    }
+
+    static func scheduledEvents(
+        around scoreBeat: Double,
+        radiusBeats: Double = 16,
+        events: [SplashWaveNoteEvent] = noteEvents,
+        manualEvent: SplashWaveNoteEvent? = nil
+    ) -> [SplashScheduledPerformanceEvent] {
+        let lowerBound = max(scoreBeat - radiusBeats, 0)
+        let upperBound = scoreBeat + radiusBeats
+        let firstCycle = max(Int(floor(lowerBound / noteCycleBeats)) - 1, 0)
+        let lastCycle = Int(floor(upperBound / noteCycleBeats)) + 1
+        var scheduled: [SplashScheduledPerformanceEvent] = []
+
+        for cycle in firstCycle...lastCycle {
+            for event in events where event.isRepeating {
+                let scheduledEvent = SplashScheduledPerformanceEvent(
+                    event: event,
+                    scheduledStartBeat: Double(cycle) * noteCycleBeats + event.startBeat
+                )
+                if scheduledEvent.endBeat >= lowerBound,
+                   scheduledEvent.scheduledStartBeat <= upperBound {
+                    scheduled.append(scheduledEvent)
+                }
+            }
+        }
+
+        for event in events where !event.isRepeating && event.endBeat >= lowerBound && event.startBeat <= upperBound {
+            scheduled.append(.init(event: event, scheduledStartBeat: event.startBeat))
+        }
+
+        if let manualEvent {
+            let scheduledEvent = SplashScheduledPerformanceEvent(
+                event: manualEvent,
+                scheduledStartBeat: manualEvent.startBeat
+            )
+            if scheduledEvent.endBeat >= lowerBound,
+               scheduledEvent.scheduledStartBeat <= upperBound {
+                scheduled.append(scheduledEvent)
+            }
+        }
+
+        return scheduled.sorted { $0.scheduledStartBeat < $1.scheduledStartBeat }
+    }
+
+    static func diagnostics(
+        durationMinutes: Double = 10,
+        events: [SplashWaveNoteEvent] = noteEvents
+    ) -> SplashScoreDiagnostics {
+        let totalBeats = durationMinutes * 60 / tempo.secondsPerBeat
+        let scheduled = scheduledEvents(
+            around: totalBeats / 2,
+            radiusBeats: totalBeats / 2 + noteCycleBeats,
+            events: events
+        ).filter { $0.scheduledStartBeat < totalBeats }
+
+        let activeCounts = stride(from: 0.0, to: totalBeats, by: 0.5).map {
+            sampleBeat in scheduled.filter { $0.sample(at: sampleBeat) != nil }.count
+        }
+        let averageActiveVoices = Double(activeCounts.reduce(0, +))
+            / Double(max(activeCounts.count, 1))
+
+        var longestSilentBeats = 0.0
+        var currentSilentBeats = 0.0
+        for activeCount in activeCounts {
+            if activeCount == 0 {
+                currentSilentBeats += 0.5
+                longestSilentBeats = max(longestSilentBeats, currentSilentBeats)
+            } else {
+                currentSilentBeats = 0
+            }
+        }
+
+        let averageDuration = scheduled.map {
+            $0.event.totalBeats * tempo.secondsPerBeat
+        }.reduce(0, +) / Double(max(scheduled.count, 1))
+
+        return SplashScoreDiagnostics(
+            averageActiveVoices: averageActiveVoices,
+            longestSilentBeats: longestSilentBeats,
+            averageEventDurationSeconds: averageDuration,
+            eventsPerMinute: Double(scheduled.count) / durationMinutes,
+            participatingWaveCount: Set(scheduled.map(\.event.tonalSlot)).count
+        )
+    }
+}
+
+enum SplashSceneMotionState: Equatable {
+    case presented
+    case entering(elapsed: TimeInterval)
+    case living(elapsed: TimeInterval)
+    case exiting(elapsed: TimeInterval)
+}
+
+enum SplashMotionTiming {
+    static let firstRibbonDelay: TimeInterval = 0.25
+    static let ribbonEntryDuration: TimeInterval = 2.00
+    static let ribbonEntryStagger: TimeInterval = 0.18
+    static let ribbonCount = 8
+
+    static let ribbonExitDuration: TimeInterval = 1.15
+    static let ribbonExitStagger: TimeInterval = 0.05
+
+    static let sunEntryDelay: TimeInterval = 0.45
+    static let sunEntryDuration: TimeInterval = 1.40
+    static let wordmarkEntryDelay: TimeInterval = 0.80
+    static let wordmarkEntryDuration: TimeInterval = 1.20
+    static let navigationEntryDelay: TimeInterval = 2.00
+    static let navigationEntryDuration: TimeInterval = 1.20
+
+    static let sunExitDuration: TimeInterval = 1.00
+    static let wordmarkExitDuration: TimeInterval = 0.85
+    static let navigationExitDuration: TimeInterval = 0.65
+
+    static let motionPhaseUnitsPerSecond: Double = 0.320
+    static let maximumMotionAmount: CGFloat = 0.188
+
+    static var ribbonEntranceCompleteTime: TimeInterval {
+        firstRibbonDelay
+            + ribbonEntryDuration
+            + TimeInterval(ribbonCount - 1) * ribbonEntryStagger
+    }
+
+    static var entranceCompleteTime: TimeInterval {
+        max(ribbonEntranceCompleteTime, SplashLotusChoreography.entryEnd)
+    }
+
+    static var interactionReadyTime: TimeInterval {
+        ribbonEntranceCompleteTime
+    }
+
+    static var exitCompleteTime: TimeInterval {
+        max(
+            ribbonExitDuration
+                + TimeInterval(ribbonCount - 1) * ribbonExitStagger,
+            SplashLotusChoreography.exitDuration
+        )
+    }
+
+    static var noteScoreStartTime: TimeInterval {
+        0
+    }
+
+    static func smootherStep(_ value: Double) -> Double {
+        let t = min(max(value, 0), 1)
+        return t * t * t * (t * (t * 6 - 15) + 10)
+    }
+
+    static func entryProgress(
+        for index: Int,
+        elapsed: TimeInterval
+    ) -> CGFloat {
+        let start = firstRibbonDelay + TimeInterval(index) * ribbonEntryStagger
+        return CGFloat(smootherStep((elapsed - start) / ribbonEntryDuration))
+    }
+
+    static func exitProgress(
+        for index: Int,
+        count: Int,
+        elapsed: TimeInterval
+    ) -> CGFloat {
+        let frontToBackOrder = count - 1 - index
+        let start = TimeInterval(frontToBackOrder) * ribbonExitStagger
+        return CGFloat(smootherStep((elapsed - start) / ribbonExitDuration))
+    }
+
+    static func revealProgress(
+        elapsed: TimeInterval,
+        delay: TimeInterval,
+        duration: TimeInterval
+    ) -> CGFloat {
+        CGFloat(smootherStep((elapsed - delay) / duration))
+    }
+
+    static func noteScoreTime(at elapsed: TimeInterval) -> TimeInterval {
+        max(elapsed, 0)
+    }
+}
+
+struct SplashLotusAnimationSample: Equatable {
+    let centerOpacity: Double
+    let fanProgress: CGFloat
+    let heartOpacity: Double
+
+    static let hidden = SplashLotusAnimationSample(
+        centerOpacity: 0,
+        fanProgress: 0,
+        heartOpacity: 0
+    )
+    static let presented = SplashLotusAnimationSample(
+        centerOpacity: 1,
+        fanProgress: 1,
+        heartOpacity: 1
+    )
+}
+
+enum SplashLotusChoreography {
+    static let order: [SplashSceneActorID] = [
+        .lotusLeft,
+        .lotusCenter,
+        .lotusRight
+    ]
+    /// Flowers wait until every supporting paper ribbon has finished unfurling.
+    static let firstStart: TimeInterval =
+        SplashMotionTiming.ribbonEntranceCompleteTime + 0.05
+    static let cascadeStagger: TimeInterval = 0.16
+    static let centerDuration: TimeInterval = 0.38
+    static let fanDelay: TimeInterval = 0.10
+    static let fanDuration: TimeInterval = 0.48
+    static let heartDelay: TimeInterval = 0.33
+    static let heartDuration: TimeInterval = 0.25
+    static let exitDuration: TimeInterval = 1.12
+
+    static var entryEnd: TimeInterval {
+        firstStart
+            + TimeInterval(order.count - 1) * cascadeStagger
+            + max(
+                centerDuration,
+                max(fanDelay + fanDuration, heartDelay + heartDuration)
+            )
+    }
+
+    static var activeDuration: TimeInterval {
+        entryEnd - firstStart
+    }
+
+    static func sample(
+        for actorID: SplashSceneActorID,
+        entryElapsed: TimeInterval
+    ) -> SplashLotusAnimationSample {
+        guard let index = order.firstIndex(of: actorID) else {
+            return .presented
+        }
+        let localTime = entryElapsed
+            - firstStart
+            - TimeInterval(index) * cascadeStagger
+        return SplashLotusAnimationSample(
+            centerOpacity: progress(localTime / centerDuration),
+            fanProgress: CGFloat(progress((localTime - fanDelay) / fanDuration)),
+            heartOpacity: progress((localTime - heartDelay) / heartDuration)
+        )
+    }
+
+    private static func progress(_ value: Double) -> Double {
+        if value <= 0.000_001 { return 0 }
+        if value >= 0.999_999 { return 1 }
+        return SplashMotionTiming.smootherStep(value)
+    }
+}
+
+/// A deterministic sample of the splash performance. Entry/exit travel and
+/// note-driven wave packets share one clock without replacing the rest geometry.
 struct SplashScenePresentation: Equatable {
-    var sceneOpacity: Double
-    var wordmarkOpacity: Double
-    var sunProgress: CGFloat
-    var waveProgress: CGFloat
-    var waveMotionPhase: CGFloat
-    var lotusCenterOpacity: Double
-    var lotusLeftFanProgress: CGFloat
-    var lotusRightFanProgress: CGFloat
-    var navigationOpacity: Double
+    let state: SplashSceneMotionState
+    let performanceElapsed: TimeInterval
+    let motionTuning: SplashMotionTuning
+    let scoreEvents: [SplashWaveNoteEvent]
 
     static let presented = SplashScenePresentation(
-        sceneOpacity: 1,
-        wordmarkOpacity: 1,
-        sunProgress: 1,
-        waveProgress: 1,
-        waveMotionPhase: 0,
-        lotusCenterOpacity: 1,
-        lotusLeftFanProgress: 1,
-        lotusRightFanProgress: 1,
-        navigationOpacity: 1
+        state: .presented,
+        performanceElapsed: 0,
+        motionTuning: .standard,
+        scoreEvents: SplashPerformanceScore.noteEvents
     )
+
+    static func sample(
+        performanceElapsed: TimeInterval,
+        exitElapsed: TimeInterval?,
+        reduceMotion: Bool,
+        motionTuning: SplashMotionTuning = .standard,
+        scoreEvents: [SplashWaveNoteEvent] = SplashPerformanceScore.noteEvents
+    ) -> SplashScenePresentation {
+        guard !reduceMotion else { return .presented }
+
+        let performanceElapsed = max(performanceElapsed, 0)
+        if let exitElapsed {
+            return SplashScenePresentation(
+                state: .exiting(elapsed: max(exitElapsed, 0)),
+                performanceElapsed: performanceElapsed,
+                motionTuning: motionTuning,
+                scoreEvents: scoreEvents
+            )
+        }
+        if performanceElapsed < SplashMotionTiming.entranceCompleteTime {
+            return SplashScenePresentation(
+                state: .entering(elapsed: performanceElapsed),
+                performanceElapsed: performanceElapsed,
+                motionTuning: motionTuning,
+                scoreEvents: scoreEvents
+            )
+        }
+        return SplashScenePresentation(
+            state: .living(elapsed: performanceElapsed),
+            performanceElapsed: performanceElapsed,
+            motionTuning: motionTuning,
+            scoreEvents: scoreEvents
+        )
+    }
+
+    var sceneOpacity: Double { 1 }
+    func lotusAnimation(
+        for actorID: SplashSceneActorID
+    ) -> SplashLotusAnimationSample {
+        switch state {
+        case .presented, .living:
+            return .presented
+        case .entering(let elapsed):
+            return SplashLotusChoreography.sample(
+                for: actorID,
+                entryElapsed: elapsed
+            )
+        case .exiting(let elapsed):
+            let exitStartPerformance = max(performanceElapsed - elapsed, 0)
+            let reverseRate = SplashLotusChoreography.activeDuration
+                / SplashLotusChoreography.exitDuration
+            let reverseEntryElapsed = min(
+                SplashLotusChoreography.entryEnd,
+                exitStartPerformance
+            ) - elapsed * reverseRate
+            return SplashLotusChoreography.sample(
+                for: actorID,
+                entryElapsed: reverseEntryElapsed
+            )
+        }
+    }
+
+    var wordmarkOpacity: Double {
+        Double(actorProgress(
+            entryDelay: SplashMotionTiming.wordmarkEntryDelay,
+            entryDuration: SplashMotionTiming.wordmarkEntryDuration,
+            exitDuration: SplashMotionTiming.wordmarkExitDuration
+        ))
+    }
+
+    var sunProgress: CGFloat {
+        actorProgress(
+            entryDelay: SplashMotionTiming.sunEntryDelay,
+            entryDuration: SplashMotionTiming.sunEntryDuration,
+            exitDuration: SplashMotionTiming.sunExitDuration
+        )
+    }
+
+    var navigationOpacity: Double {
+        Double(actorProgress(
+            entryDelay: SplashMotionTiming.navigationEntryDelay,
+            entryDuration: SplashMotionTiming.navigationEntryDuration,
+            exitDuration: SplashMotionTiming.navigationExitDuration
+        ))
+    }
+
+    var waveMotionPhase: CGFloat {
+        SplashPerformanceScore.waveVoices
+            .map {
+                let sample = waveMotionSample(for: $0.actorID)
+                return max(sample.phase, sample.bedPhase)
+            }
+            .max() ?? 0
+    }
+
+    var waveMotionAmount: CGFloat {
+        SplashPerformanceScore.waveVoices
+            .map { waveMotionSample(for: $0.actorID).totalAmplitude }
+            .max() ?? 0
+    }
+
+    func waveMotionSample(for actorID: SplashSceneActorID) -> SplashWaveMotionSample {
+        SplashPerformanceScore.waveMotionSample(
+            for: actorID,
+            performanceElapsed: performanceElapsed,
+            events: scoreEvents,
+            tuning: motionTuning
+        )
+    }
+
+    var isInteractive: Bool {
+        switch state {
+        case .presented, .living:
+            true
+        case .entering(let elapsed):
+            elapsed >= SplashMotionTiming.interactionReadyTime
+        case .exiting:
+            false
+        }
+    }
+
+    func horizontalTravelFactor(
+        forWaveAt index: Int,
+        edge: SplashWaveEntryEdge,
+        count: Int
+    ) -> CGFloat {
+        switch state {
+        case .presented, .living:
+            0
+        case .entering(let elapsed):
+            (1 - SplashMotionTiming.entryProgress(for: index, elapsed: elapsed))
+                * edge.rawValue
+        case .exiting(let elapsed):
+            -SplashMotionTiming.exitProgress(
+                for: index,
+                count: count,
+                elapsed: elapsed
+            ) * edge.rawValue
+        }
+    }
+
+    func waveExtent(
+        forWaveAt index: Int,
+        edge: SplashWaveEntryEdge,
+        count: Int
+    ) -> SplashWaveExtent {
+        switch state {
+        case .presented, .living:
+            .full
+        case .entering(let elapsed):
+            .entering(
+                progress: SplashMotionTiming.entryProgress(for: index, elapsed: elapsed),
+                edge: edge
+            )
+        case .exiting(let elapsed):
+            .exiting(
+                progress: SplashMotionTiming.exitProgress(
+                    for: index,
+                    count: count,
+                    elapsed: elapsed
+                ),
+                entryEdge: edge
+            )
+        }
+    }
+
+    private func actorProgress(
+        entryDelay: TimeInterval,
+        entryDuration: TimeInterval,
+        exitDuration: TimeInterval
+    ) -> CGFloat {
+        switch state {
+        case .presented, .living:
+            1
+        case .entering(let elapsed):
+            SplashMotionTiming.revealProgress(
+                elapsed: elapsed,
+                delay: entryDelay,
+                duration: entryDuration
+            )
+        case .exiting(let elapsed):
+            1 - CGFloat(SplashMotionTiming.smootherStep(elapsed / exitDuration))
+        }
+    }
 }
 
 enum SplashLayoutMode: Equatable {
@@ -133,8 +1103,32 @@ struct SplashLayout {
         }
     }
 
+    /// The dawn field shares the sun's responsive placement rather than assuming
+    /// a single device's coordinates. That keeps the transition visibly born
+    /// behind the sun in every orientation.
+    var sunUnitPoint: UnitPoint {
+        UnitPoint(
+            x: sunCenter.x / max(size.width, 1),
+            y: sunCenter.y / max(size.height, 1)
+        )
+    }
+
     var sunDiameter: CGFloat {
         shortSide * 0.38
+    }
+
+    /// Use the resting envelope so the sun does not bob with pad envelopes.
+    var sunriseHorizon: CGFloat {
+        let worldX = (sunCenter.x - waveWorldCenter.x) / waveWorldSize.width + 0.5
+        let coverage = SplashWaveGenerator.coverageRibbon(palette: .night)
+        let index = min(max(Int(worldX * CGFloat(coverage.top.count - 1)), 0), coverage.top.count - 1)
+        return waveWorldCenter.y + (coverage.top[index].y - 0.5) * waveWorldSize.height
+    }
+
+    func risingSunCenter(progress: Double) -> CGPoint {
+        let p = CGFloat(min(max(progress, 0), 1))
+        let initialY = sunriseHorizon + sunDiameter * 0.4
+        return CGPoint(x: sunCenter.x, y: initialY + (sunCenter.y - initialY) * p)
     }
 
     var waveWorldSize: CGSize {
@@ -208,39 +1202,68 @@ struct SplashLayout {
 
 struct SplashSceneView: View {
     var presentation: SplashScenePresentation = .presented
+    var atmosphere: SplashAtmosphereSample = .night
+    var resonance: SplashWaveResonanceSample?
     var selectedMenu: SplashMenuItem = .start
     var onSelectMenu: (SplashMenuItem) -> Void = { _ in }
 
     var body: some View {
         GeometryReader { proxy in
             let layout = SplashLayout(size: proxy.size, safeAreaInsets: proxy.safeAreaInsets)
+            let restingSunCenter = layout.risingSunCenter(progress: atmosphere.progress)
+            let sunCenter = CGPoint(x: restingSunCenter.x,
+                                    y: restingSunCenter.y + (1 - presentation.sunProgress) * 44)
 
             ZStack(alignment: .topLeading) {
-                SplashCanvasBackground()
+                SplashAtmosphereLayer(
+                    atmosphere: atmosphere,
+                    lightCenter: sunCenter,
+                    horizon: layout.sunriseHorizon,
+                    sunRadius: layout.sunDiameter / 2
+                )
                     .accessibilityIdentifier(SplashSceneActorID.background.rawValue)
 
-                SplashSunView(progress: presentation.sunProgress)
+                SplashSunView(
+                    progress: presentation.sunProgress,
+                    palette: atmosphere.palette
+                )
                     .frame(width: layout.sunDiameter, height: layout.sunDiameter)
-                    .position(layout.sunCenter)
+                    .position(sunCenter)
                     .accessibilityIdentifier(SplashSceneActorID.sun.rawValue)
                     .accessibilityHidden(true)
 
+                SplashAtmosphereLayer(
+                    atmosphere: atmosphere,
+                    lightCenter: sunCenter,
+                    horizon: layout.sunriseHorizon,
+                    sunRadius: layout.sunDiameter / 2,
+                    drawsClouds: true
+                )
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+
                 SplashWaveField(
                     layout: layout,
-                    progress: presentation.waveProgress,
-                    motionPhase: presentation.waveMotionPhase
+                    presentation: presentation,
+                    resonance: resonance,
+                    palette: atmosphere.palette
                 )
                     .accessibilityHidden(true)
 
                 ForEach(layout.lotusPlacements) { placement in
                     let lotusWidth = layout.shortSide * placement.width
+                    let lotusAnimation = presentation.lotusAnimation(
+                        for: placement.id
+                    )
 
                     SplashLotusView(
                         actorID: placement.id,
                         style: placement.style,
-                        centerOpacity: presentation.lotusCenterOpacity,
-                        leftFanProgress: presentation.lotusLeftFanProgress,
-                        rightFanProgress: presentation.lotusRightFanProgress
+                        palette: atmosphere.palette,
+                        centerOpacity: lotusAnimation.centerOpacity,
+                        heartOpacity: lotusAnimation.heartOpacity,
+                        leftFanProgress: lotusAnimation.fanProgress,
+                        rightFanProgress: lotusAnimation.fanProgress
                     )
                     .frame(
                         width: lotusWidth,
@@ -254,15 +1277,7 @@ struct SplashSceneView: View {
                     .accessibilityHidden(true)
                 }
 
-                Text("Planet\nFocus")
-                    .font(PlanetFocusTypography.wordmark(size: layout.wordmarkFontSize))
-                    .foregroundStyle(PlanetFocusPalette.typePaleBlue)
-                    .lineSpacing(-layout.wordmarkFontSize * 0.36)
-                    .fixedSize()
-                    .offset(x: layout.wordmarkLeading, y: layout.wordmarkTop)
-                    .opacity(presentation.wordmarkOpacity)
-                    .accessibilityIdentifier(SplashSceneActorID.wordmark.rawValue)
-                    .accessibilityAddTraits(.isHeader)
+                // Wordmark presentation is deferred while the scene animation is refined.
 
                 VStack(spacing: 0) {
                     Spacer(minLength: 0)
@@ -271,6 +1286,8 @@ struct SplashSceneView: View {
                         selectedItem: selectedMenu,
                         fontSize: layout.navigationFontSize,
                         spacing: layout.navigationSpacing,
+                        ink: atmosphere.sunrise.navigationInk,
+                        selectedInk: atmosphere.sunrise.selectedInk,
                         action: onSelectMenu
                     )
                     .frame(maxWidth: .infinity, alignment: layout.alignsNavigationToLeading ? .leading : .center)
@@ -280,25 +1297,51 @@ struct SplashSceneView: View {
                     .opacity(presentation.navigationOpacity)
                     .accessibilityIdentifier(SplashSceneActorID.navigation.rawValue)
                 }
+                    .disabled(!presentation.isInteractive)
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
             .clipped()
             .opacity(presentation.sceneOpacity)
         }
-        .background(PlanetFocusPalette.canvasInk.ignoresSafeArea())
     }
 }
 
-private struct SplashCanvasBackground: View {
+private struct SplashAtmosphereLayer: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var atmosphere: SplashAtmosphereSample = .night
+    var lightCenter: CGPoint
+    var horizon: CGFloat
+    var sunRadius: CGFloat
+    var drawsClouds = false
+
     var body: some View {
-        PlanetFocusPalette.canvasInk
+        GeometryReader { proxy in
+#if os(iOS)
+            SunriseSkyView(uniforms: SunriseUniforms(
+                viewport: SIMD4(Float(proxy.size.width), Float(proxy.size.height),
+                                Float(lightCenter.x), Float(lightCenter.y)),
+                story: SIMD4(Float(atmosphere.progress), Float(horizon),
+                             Float(sunRadius), Float(reduceMotion ? 0 : atmosphere.sunrise.cloudTime)),
+                optics: SIMD4(Float(atmosphere.sunrise.solarElevationRadians),
+                              Float(atmosphere.sunrise.exposure),
+                              Float(atmosphere.sunrise.paperSpread),
+                              Float(atmosphere.sunrise.paperAmount))
+            ), drawsClouds: drawsClouds)
+            .frame(width: proxy.size.width, height: proxy.size.height)
             .overlay {
-                Image("CanvasPaperTextureV3")
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .accessibilityHidden(true)
+                if !drawsClouds {
+                    Image("NeutralPaperGrainV1")
+                        .resizable(resizingMode: .tile)
+                        .blendMode(.softLight)
+                        .opacity(0.30)
+                        .allowsHitTesting(false)
+                }
             }
             .clipped()
+#else
+            Rectangle().fill(PlanetFocusPalette.canvasInk)
+#endif
+        }
     }
 }
 
@@ -309,10 +1352,58 @@ private enum SplashScreenStage: Equatable {
     case story(Story)
 }
 
+#if DEBUG
+private enum PerformanceDeskSection: Hashable {
+    case splashTuning
+    case scoreMonitor
+    case storyRunner
+}
+
+private enum PerformanceDeskContext {
+    case splash
+    case story(Story)
+
+    var title: String {
+        switch self {
+        case .splash: "Splash"
+        case .story(let story): story.title
+        }
+    }
+
+    var isSplash: Bool {
+        if case .splash = self { return true }
+        return false
+    }
+}
+#endif
+
 struct SplashScreenView: View {
     @Binding var selectedStory: Story
+    @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("splash.performance.session.v1") private var persistedPerformance = Data()
+    @State private var synthesizer = PerformanceSynthesizer()
+    @State private var auditionEnabled = true
+    @State private var runnerDuration: FocusDuration = .fiveMinutes
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selectedMenu: SplashMenuItem = .start
     @State private var stage: SplashScreenStage
+    @State private var performanceClock = PerformanceClock()
+    @State private var exitStartedAt: Date?
+    @State private var motionTuning = SplashMotionTuning.standard
+    @State private var resonanceTuning = SplashWaveResonanceTuning.standard
+    @State private var manualEvent: SplashWaveNoteEvent?
+    @State private var manualEventSequence = 0
+    @State private var manualTonalSlot = 4
+    @State private var manualGateBeats = 6.0
+    @State private var scoreSeed = Int(SplashPerformanceScore.defaultSeed)
+    @State private var atmosphereProgress = 0.0
+    @State private var activePerformanceSession: PerformanceSession?
+    @State private var activeSplashScoreEvents: [SplashWaveNoteEvent]?
+#if DEBUG
+    @State private var isPerformanceDeskVisible: Bool
+    @State private var expandedPerformanceDeskSections: Set<PerformanceDeskSection>
+    @State private var sunriseAuditIndex = 0
+#endif
 
     init(selectedStory: Binding<Story>) {
         _selectedStory = selectedStory
@@ -324,65 +1415,1295 @@ struct SplashScreenView: View {
         let initialStage: SplashScreenStage = .opening
 #endif
         _stage = State(initialValue: initialStage)
+        _atmosphereProgress = State(
+            initialValue: Self.debugAtmosphereProgress
+        )
+#if DEBUG
+        _runnerDuration = State(initialValue: Self.isRunnerReview ? .oneMinute : .twoMinutes)
+        _isPerformanceDeskVisible = State(
+            initialValue: !Self.isAtmosphereReview
+        )
+        _expandedPerformanceDeskSections = State(
+            initialValue: Self.isScoreMonitorReview
+                ? [.scoreMonitor]
+                : Self.isRunnerReview
+                    ? [.storyRunner]
+                    : [.splashTuning]
+        )
+        _activePerformanceSession = State(
+            initialValue: Self.isRunnerReview
+                ? PerformanceSession(
+                    duration: .oneMinute,
+                    randomSeed: SplashPerformanceScore.defaultSeed
+                )
+                : nil
+        )
+#endif
+    }
+
+    private static var debugAtmosphereProgress: Double {
+#if DEBUG
+        let prefix = "--atmosphere-progress="
+        let argumentValue = ProcessInfo.processInfo.arguments.first(
+            where: { $0.hasPrefix(prefix) }
+        ).flatMap { Double($0.dropFirst(prefix.count)) }
+        let environmentValue = ProcessInfo.processInfo.environment[
+            "SPLASH_ATMOSPHERE_PROGRESS"
+        ].flatMap(Double.init)
+        guard let value = argumentValue ?? environmentValue else {
+            return 0
+        }
+        return min(max(value, 0), 1)
+#else
+        return 0
+#endif
+    }
+
+    private static var isResonanceReview: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--resonance-review")
+#else
+        false
+#endif
+    }
+
+    private static var isScoreMonitorReview: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--score-monitor-review")
+#else
+        false
+#endif
+    }
+
+    private static var isRunnerReview: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--performance-runner-review")
+            || ProcessInfo.processInfo.environment[
+                "PERFORMANCE_RUNNER_REVIEW"
+            ] == "1"
+#else
+        false
+#endif
+    }
+
+    /// Static, clean-canvas review mode for the 5% visual audit.  It deliberately
+    /// avoids the running transport and the debug desk so each screenshot represents
+    /// one exact, reproducible atmosphere sample.
+    private static var isAtmosphereReview: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.environment["SPLASH_ATMOSPHERE_REVIEW"] == "1"
+            || ProcessInfo.processInfo.arguments.contains("--sunrise-audit")
+#else
+        false
+#endif
+    }
+
+    private var reviewProgress: Double? {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--sunrise-audit") {
+            return Double(sunriseAuditIndex) / 20
+        }
+#endif
+        return nil
+    }
+
+    private static var isResonancePeakReview: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--resonance-peak-review")
+#else
+        false
+#endif
+    }
+
+    private static func reviewEvent(
+        at scoreBeat: Double
+    ) -> SplashWaveNoteEvent? {
+        let event = SplashWaveNoteEvent(
+            id: "resonance-review",
+            tonalSlot: 4,
+            startBeat: 0,
+            gateBeats: 6,
+            envelope: SplashPerformanceScore.noteEnvelope,
+            intensity: 1
+        )
+        if isResonancePeakReview {
+            return SplashWaveNoteEvent(
+                id: event.id,
+                tonalSlot: event.tonalSlot,
+                startBeat: scoreBeat - event.totalBeats / 2,
+                gateBeats: event.gateBeats,
+                envelope: event.envelope
+            )
+        }
+        if isResonanceReview {
+            let localBeat = scoreBeat.truncatingRemainder(
+                dividingBy: event.totalBeats + 1
+            )
+            guard localBeat < event.totalBeats else { return nil }
+            return SplashWaveNoteEvent(
+                id: event.id,
+                tonalSlot: event.tonalSlot,
+                startBeat: scoreBeat - localBeat,
+                gateBeats: event.gateBeats,
+                envelope: event.envelope
+            )
+        }
+        return nil
+    }
+
+    private static func resonance(
+        manualEvent: SplashWaveNoteEvent?,
+        scoreBeat: Double,
+        tuning: SplashWaveResonanceTuning
+    ) -> SplashWaveResonanceSample? {
+        let event = manualEvent ?? reviewEvent(at: scoreBeat)
+        return event.flatMap {
+            SplashWaveResonanceSample.sample(
+                event: $0,
+                scoreBeat: scoreBeat,
+                tuning: tuning
+            )
+        }
     }
 
     var body: some View {
         ZStack {
-            // This canvas never leaves. Future splash-exit choreography removes
-            // only the independently addressable foreground actors above it.
-            SplashCanvasBackground()
+            // A neutral fallback remains continuous while splash actors enter and leave.
+            // The scene owns the full, measured atmospheric canvas below.
+            PlanetFocusPalette.canvasInk
                 .ignoresSafeArea()
 
             switch stage {
             case .opening:
-                SplashSceneView(selectedMenu: selectedMenu) { item in
-                    guard item == .stories else { return }
-                    selectedMenu = item
-                    stage = .chooser
+                TimelineView(
+                    .animation(
+                        minimumInterval: reduceMotion ? 1 : 1.0 / 60.0,
+                        paused: Self.isAtmosphereReview
+                    )
+                ) { context in
+                    let transportState = activePerformanceSession.map {
+                        PerformanceRunner(session: $0).sample(at: context.date)
+                    }
+                    let performanceElapsed = transportState?.elapsedTime
+                        ?? performanceClock.elapsed(at: context.date)
+                    let scoreEvents = splashScoreEvents
+                    let exitElapsed = exitStartedAt.map {
+                        context.date.timeIntervalSince($0)
+                    }
+                    let presentation = SplashScenePresentation.sample(
+                        performanceElapsed: Self.isAtmosphereReview ? 20 : performanceElapsed,
+                        exitElapsed: exitElapsed,
+                        reduceMotion: reduceMotion,
+                        motionTuning: motionTuning,
+                        scoreEvents: scoreEvents
+                    )
+                    let atmosphere = SplashAtmosphereDirector.sample(
+                        progress: reviewProgress ?? transportState?.progress ?? atmosphereProgress
+                    )
+                    let scoreBeat = SplashPerformanceScore.scoreBeat(
+                        for: performanceElapsed,
+                        tuning: motionTuning
+                    )
+                    let resonance = Self.resonance(
+                        manualEvent: manualEvent,
+                        scoreBeat: scoreBeat,
+                        tuning: resonanceTuning
+                    )
+
+                    SplashSceneView(
+                        presentation: presentation,
+                        atmosphere: atmosphere,
+                        resonance: resonance,
+                        selectedMenu: selectedMenu,
+                        onSelectMenu: selectMenu
+                    )
+                    .ignoresSafeArea()
+                }
+                .task(id: exitStartedAt) {
+                    await finishExitIfNeeded()
                 }
 
             case .chooser:
                 StoryChooserView(
                     onChoose: { story in
                         selectedStory = story
+                        activePerformanceSession = nil
                         stage = .story(story)
                     },
-                    onBack: {
-                        selectedMenu = .start
-                        stage = .opening
-                    }
+                    onBack: resetSplash
                 )
 
             case .story(let story):
-                StorySceneLaunchView(story: story) {
+                StorySceneLaunchView(
+                    story: story,
+                    session: activePerformanceSession?.focusSession(for: story)
+                ) {
+                    activePerformanceSession = nil
                     stage = .chooser
                 }
             }
+
+#if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--sunrise-audit") {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Button {
+                            sunriseAuditIndex = min(20, sunriseAuditIndex + 1)
+                        } label: {
+                            Color.clear.frame(width: 44, height: 44).contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Advance sunrise audit")
+                        .accessibilityIdentifier("sunriseAuditNext")
+                        .accessibilityValue(String(sunriseAuditIndex))
+                    }
+                }
+            }
+            if let context = performanceDeskContext, isPerformanceDeskVisible {
+                PerformanceDesk(
+                    expandedSections: $expandedPerformanceDeskSections,
+                    context: context,
+                    speedMultiplier: motionSpeedBinding,
+                    amountMultiplier: motionAmountBinding,
+                    atmosphereProgress: $atmosphereProgress,
+                    resonanceStrength: resonanceStrengthBinding,
+                    resonanceWidth: resonanceWidthBinding,
+                    tonalSlot: $manualTonalSlot,
+                    gateBeats: $manualGateBeats,
+                    scoreSeed: $scoreSeed,
+                    onTriggerEvent: triggerPerformanceEvent,
+                    onReset: resetMotionTuning,
+                    performanceClock: performanceClock,
+                    motionTuning: motionTuning,
+                    manualEvent: manualEvent,
+                    scoreEvents: splashScoreEvents,
+                    runnerDuration: $runnerDuration,
+                    activePerformanceSession: activePerformanceSession,
+                    onRun: runCurrentScene,
+                    onStop: stopCurrentScene,
+                    onPauseResume: togglePerformancePause,
+                    auditionEnabled: $auditionEnabled,
+                    audioStatus: synthesizer.status + (synthesizer.outputLevel > 0.00001
+                        ? String(format: " · %.0f dB peak", 20 * log10(synthesizer.outputLevel)) : ""),
+                    onHide: { isPerformanceDeskVisible = false }
+                )
+                .padding(.top, 10)
+                .padding(.horizontal, 16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            } else if performanceDeskContext != nil, !Self.isAtmosphereReview {
+                Button {
+                    isPerformanceDeskVisible = true
+                } label: {
+                    Label("Controls", systemImage: "slider.horizontal.3")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(PlanetFocusPalette.canvasInk.opacity(0.92))
+                .padding(.top, 10)
+                .padding(.trailing, 16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            }
+#endif
         }
         .background(PlanetFocusPalette.canvasInk.ignoresSafeArea())
+        .onAppear {
+            if let session = activePerformanceSession {
+                activeSplashScoreEvents = SplashMusicDirector.events(for: session)
+            } else if !Self.isAtmosphereReview,
+                      !ProcessInfo.processInfo.arguments.contains("--sunrise-audit"),
+                      let restored = try? JSONDecoder().decode(PerformanceSession.self, from: persistedPerformance),
+                      !PerformanceRunner(session: restored).sample(at: .now).isComplete {
+                activeSplashScoreEvents = SplashMusicDirector.events(for: restored)
+                activePerformanceSession = restored
+            }
+            synchronizeAudio()
+        }
+        .onChange(of: activePerformanceSession) { _, session in
+            persistedPerformance = (try? session.map { try JSONEncoder().encode($0) }) ?? Data()
+            synchronizeAudio()
+        }
+        .onChange(of: auditionEnabled) { _, _ in synchronizeAudio() }
+        .onChange(of: scenePhase) { _, _ in synchronizeAudio() }
+        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { notification in
+            if let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+               raw == AVAudioSession.InterruptionType.began.rawValue {
+                activePerformanceSession?.pause(at: .now)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { notification in
+            if let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+               raw == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue {
+                activePerformanceSession?.pause(at: .now)
+            }
+        }
+        .task(id: activePerformanceSession) {
+            guard let session = activePerformanceSession, !session.isPaused else { return }
+            try? await Task.sleep(for: .seconds(session.remainingTime(at: .now)))
+            guard !Task.isCancelled else { return }
+            synthesizer.fadeOut()
+        }
+        .onDisappear { synthesizer.fadeOut() }
+#if DEBUG
+        .onAppear {
+            if ProcessInfo.processInfo.arguments.contains("--sunrise-audit-landscape"),
+               let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeLeft)) { error in
+                    print("Sunrise landscape audit unavailable: \(error)")
+                }
+            }
+        }
+#endif
+    }
+
+    private func synchronizeAudio() {
+        guard scenePhase == .active, auditionEnabled,
+              ProcessInfo.processInfo.environment["SPLASH_AUDIO_DISABLED"] != "1",
+              let session = activePerformanceSession, !session.isPaused,
+              case .opening = stage else {
+            synthesizer.fadeOut()
+            return
+        }
+        synthesizer.play(session: session, events: splashScoreEvents + (manualEvent.map { [$0] } ?? []))
+    }
+
+    private func togglePerformancePause() {
+        guard var session = activePerformanceSession else { return }
+        if session.isPaused { session.resume(at: .now) }
+        else { session.pause(at: .now) }
+        activePerformanceSession = session
+    }
+
+    private func startSplashRun(_ duration: FocusDuration) {
+        let session = PerformanceSession(duration: duration, randomSeed: UInt64(max(scoreSeed, 0)))
+        motionTuning = SplashMotionTuning(amountMultiplier: motionTuning.amountMultiplier)
+        manualEvent = nil
+        activeSplashScoreEvents = SplashMusicDirector.events(for: session)
+        activePerformanceSession = session
+    }
+
+    private func selectMenu(_ item: SplashMenuItem) {
+        if item == .start, exitStartedAt == nil {
+            if activePerformanceSession == nil || activePerformanceSession?.progress(at: .now) == 1 { startSplashRun(runnerDuration) }
+            else { togglePerformancePause() }
+            return
+        }
+        guard item == .stories, exitStartedAt == nil else { return }
+        selectedMenu = item
+        activePerformanceSession = nil
+        activeSplashScoreEvents = nil
+
+        guard !reduceMotion else {
+            stage = .chooser
+            return
+        }
+        exitStartedAt = Date()
+    }
+
+    @MainActor
+    private func finishExitIfNeeded() async {
+        guard let exitStartedAt else { return }
+
+        let elapsed = Date().timeIntervalSince(exitStartedAt)
+        let remaining = max(SplashMotionTiming.exitCompleteTime - elapsed, 0)
+        if remaining > 0 {
+            try? await Task.sleep(for: .seconds(remaining))
+        }
+
+        guard !Task.isCancelled, self.exitStartedAt == exitStartedAt else { return }
+        stage = .chooser
+    }
+
+    private func resetSplash() {
+        selectedMenu = .start
+        performanceClock = PerformanceClock()
+        exitStartedAt = nil
+        motionTuning.restartKeepingValues()
+        manualEvent = nil
+        activePerformanceSession = nil
+        activeSplashScoreEvents = nil
+        stage = .opening
+    }
+
+    private var splashScoreEvents: [SplashWaveNoteEvent] {
+        activeSplashScoreEvents ?? SplashPerformanceScore.events(
+            seed: UInt64(max(scoreSeed, 0))
+        )
+    }
+
+#if DEBUG
+    private var motionSpeedBinding: Binding<Double> {
+        Binding(
+            get: { motionTuning.speedMultiplier },
+            set: { newValue in
+                motionTuning.setSpeedMultiplier(
+                    newValue,
+                    performanceElapsed: performanceClock.elapsed(at: Date())
+                )
+            }
+        )
+    }
+
+    private var motionAmountBinding: Binding<Double> {
+        Binding(
+            get: { motionTuning.amountMultiplier },
+            set: { motionTuning.setAmountMultiplier($0) }
+        )
+    }
+
+    private var resonanceStrengthBinding: Binding<Double> {
+        Binding(
+            get: { Double(resonanceTuning.strength) },
+            set: { resonanceTuning.strength = CGFloat($0) }
+        )
+    }
+
+    private var resonanceWidthBinding: Binding<Double> {
+        Binding(
+            get: { Double(resonanceTuning.halfWidth) },
+            set: { resonanceTuning.halfWidth = CGFloat($0) }
+        )
+    }
+
+    private func triggerPerformanceEvent() {
+        guard activePerformanceSession?.isPaused != true else { return }
+        let performanceElapsed = activePerformanceSession?.elapsedTime(at: .now)
+            ?? performanceClock.elapsed(at: Date())
+        let scoreBeat = SplashPerformanceScore.scoreBeat(
+            for: performanceElapsed,
+            tuning: motionTuning
+        )
+        manualEventSequence += 1
+        let attack = min(SplashPerformanceScore.noteEnvelope.attackBeats, manualGateBeats * 0.6)
+        let decay = min(SplashPerformanceScore.noteEnvelope.decayBeats, manualGateBeats - attack)
+        manualEvent = SplashWaveNoteEvent(
+            id: "manual-\(manualEventSequence)",
+            tonalSlot: manualTonalSlot,
+            startBeat: scoreBeat,
+            gateBeats: manualGateBeats,
+            envelope: .init(attackBeats: attack, decayBeats: decay,
+                            sustainLevel: SplashPerformanceScore.noteEnvelope.sustainLevel,
+                            releaseBeats: SplashPerformanceScore.noteEnvelope.releaseBeats),
+            role: .pad,
+            intensity: 1,
+            isRepeating: false
+        )
+        synchronizeAudio()
+    }
+
+    private func resetMotionTuning() {
+        if activePerformanceSession != nil {
+            motionTuning = .standard
+            resonanceTuning = .standard
+            return
+        }
+        motionTuning.reset(
+            performanceElapsed: performanceClock.elapsed(at: Date())
+        )
+        resonanceTuning = .standard
+        manualEvent = nil
+        atmosphereProgress = 0
+    }
+
+    private var performanceDeskContext: PerformanceDeskContext? {
+        switch stage {
+        case .opening: .splash
+        case .story(let story): .story(story)
+        case .chooser: nil
+        }
+    }
+
+    private func runCurrentScene(_ duration: FocusDuration) {
+        switch stage {
+        case .opening:
+            startSplashRun(duration)
+        case .story:
+            activePerformanceSession = PerformanceSession(
+                duration: duration,
+                randomSeed: UInt64(max(scoreSeed, 0))
+            )
+            activeSplashScoreEvents = nil
+        case .chooser:
+            break
+        }
+    }
+
+    private func stopCurrentScene() {
+        activePerformanceSession = nil
+        activeSplashScoreEvents = nil
+        if case .story = stage {
+            stage = .opening
+        }
+    }
+#endif
+}
+
+#if DEBUG
+private struct PerformanceDesk: View {
+    @Binding var expandedSections: Set<PerformanceDeskSection>
+    let context: PerformanceDeskContext
+    @Binding var speedMultiplier: Double
+    @Binding var amountMultiplier: Double
+    @Binding var atmosphereProgress: Double
+    @Binding var resonanceStrength: Double
+    @Binding var resonanceWidth: Double
+    @Binding var tonalSlot: Int
+    @Binding var gateBeats: Double
+    @Binding var scoreSeed: Int
+    let onTriggerEvent: () -> Void
+    let onReset: () -> Void
+    let performanceClock: PerformanceClock
+    let motionTuning: SplashMotionTuning
+    let manualEvent: SplashWaveNoteEvent?
+    let scoreEvents: [SplashWaveNoteEvent]
+    @Binding var runnerDuration: FocusDuration
+    let activePerformanceSession: PerformanceSession?
+    let onRun: (FocusDuration) -> Void
+    let onStop: () -> Void
+    let onPauseResume: () -> Void
+    @Binding var auditionEnabled: Bool
+    let audioStatus: String
+    let onHide: () -> Void
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(spacing: 8) {
+                HStack {
+                    Label("Performance desk", systemImage: "slider.horizontal.3")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    Spacer()
+                    Button("Hide", action: onHide)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(PlanetFocusPalette.warmYellow)
+                }
+
+                deskSection(.splashTuning, title: "\(context.title) tuning", icon: "water.waves") {
+                    if context.isSplash {
+                        SplashTuningControls(
+                            speedMultiplier: $speedMultiplier,
+                            amountMultiplier: $amountMultiplier,
+                            atmosphereProgress: $atmosphereProgress,
+                            resonanceStrength: $resonanceStrength,
+                            resonanceWidth: $resonanceWidth,
+                            tonalSlot: $tonalSlot,
+                            gateBeats: $gateBeats,
+                        scoreSeed: $scoreSeed,
+                        isTransportDrivingLight: activePerformanceSession != nil,
+                        onTriggerEvent: onTriggerEvent,
+                            onReset: onReset
+                        )
+                    } else {
+                        Text("This section is reserved for controls published by the active story director. It does not alter the splash while \(context.title) is open.")
+                            .font(.caption)
+                            .foregroundStyle(PlanetFocusPalette.typePaleBlue.opacity(0.72))
+                    }
+                }
+
+                deskSection(.scoreMonitor, title: "\(context.title) monitor", icon: "music.note.list") {
+                    if context.isSplash {
+                        ScrollView {
+                            SplashScoreMonitorContent(
+                                performanceClock: performanceClock,
+                                motionTuning: motionTuning,
+                            manualEvent: manualEvent,
+                            scoreEvents: scoreEvents,
+                            seed: activePerformanceSession?.randomSeed
+                                ?? UInt64(max(scoreSeed, 0)),
+                            performanceSession: activePerformanceSession
+                            )
+                            .padding(.trailing, 2)
+                        }
+                        .frame(maxHeight: 330)
+                    } else {
+                        StoryTransportMonitor(
+                            title: context.title,
+                            session: activePerformanceSession
+                        )
+                    }
+                }
+
+                deskSection(.storyRunner, title: "\(context.title) runner", icon: "play.circle") {
+                    StoryRunnerControls(
+                        contextTitle: context.title,
+                        duration: $runnerDuration,
+                        activeSession: activePerformanceSession,
+                        onRun: onRun,
+                        onStop: onStop,
+                        onPauseResume: context.isSplash ? onPauseResume : nil
+                    )
+                    if context.isSplash {
+                        Toggle("Synth audition", isOn: $auditionEnabled)
+                            .font(.caption)
+                            .tint(PlanetFocusPalette.warmYellow)
+                        Text(audioStatus)
+                            .font(.caption2)
+                        Text("Temporary sounds—not the final recordings.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(12)
+        }
+        .frame(maxWidth: 370, maxHeight: 620, alignment: .top)
+        .background(PlanetFocusPalette.canvasInk.opacity(0.95))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(PlanetFocusPalette.typePaleBlue.opacity(0.35), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.35), radius: 7, y: 3)
+        .foregroundStyle(PlanetFocusPalette.typePaleBlue)
+    }
+
+    private func deskSection<Content: View>(
+        _ section: PerformanceDeskSection,
+        title: String,
+        icon: String,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+        PerformanceDeskAccordion(
+            title: title,
+            icon: icon,
+            isExpanded: expansionBinding(for: section),
+            content: content
+        )
+    }
+
+    private func expansionBinding(
+        for section: PerformanceDeskSection
+    ) -> Binding<Bool> {
+        Binding(
+            get: { expandedSections.contains(section) },
+            set: { isExpanded in
+                if isExpanded {
+                    expandedSections.insert(section)
+                } else {
+                    expandedSections.remove(section)
+                }
+            }
+        )
     }
 }
+
+private struct PerformanceDeskAccordion<Content: View>: View {
+    let title: String
+    let icon: String
+    @Binding var isExpanded: Bool
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: icon)
+                        .frame(width: 18)
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.bold))
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 11)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 10) {
+                    Divider()
+                        .overlay(PlanetFocusPalette.typePaleBlue.opacity(0.24))
+                    content()
+                }
+                .padding(10)
+            }
+        }
+        .background(PlanetFocusPalette.typePaleBlue.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 11))
+    }
+}
+
+private struct StoryRunnerControls: View {
+    let contextTitle: String
+    @Binding var duration: FocusDuration
+    let activeSession: PerformanceSession?
+    let onRun: (FocusDuration) -> Void
+    let onStop: () -> Void
+    let onPauseResume: (() -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let activeSession {
+                HStack {
+                    Text("Length")
+                    Spacer()
+                    Text(activeSession.duration.title)
+                        .monospacedDigit()
+                }
+            } else {
+                Picker("Length", selection: $duration) {
+                    ForEach(FocusDuration.available) { duration in
+                        Text(duration.title).tag(duration)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
+            if let activeSession {
+                StoryRunProgress(session: activeSession, contextTitle: contextTitle)
+                if let onPauseResume {
+                    Button(activeSession.isPaused ? "Resume" : "Pause", action: onPauseResume)
+                        .accessibilityIdentifier("performancePauseResume")
+                        .frame(maxWidth: .infinity)
+                        .buttonStyle(.bordered)
+                }
+                Button("End run", action: onStop)
+                    .frame(maxWidth: .infinity)
+                    .buttonStyle(.bordered)
+            } else {
+                Text("Starts \(contextTitle) with the same session transport used by its director.")
+                    .font(.caption)
+                    .foregroundStyle(PlanetFocusPalette.typePaleBlue.opacity(0.72))
+            }
+
+            Button {
+                onRun(duration)
+            } label: {
+                Label(activeSession == nil ? "Run \(contextTitle)" : "Restart \(contextTitle)", systemImage: "play.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(PlanetFocusPalette.warmYellow)
+            .foregroundStyle(PlanetFocusPalette.canvasInk)
+        }
+        .font(.system(size: 12, weight: .medium, design: .rounded))
+    }
+}
+
+private struct StoryRunProgress: View {
+    let session: PerformanceSession
+    let contextTitle: String
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { context in
+            let state = PerformanceRunner(session: session).sample(at: context.date)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text(
+                        state.isComplete
+                            ? "\(contextTitle) complete"
+                            : (session.isPaused ? "Paused \(contextTitle)" : "Running \(contextTitle)")
+                    )
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    Text("\(Int(state.progress * 100))%")
+                        .monospacedDigit()
+                }
+                ProgressView(value: state.progress)
+                    .tint(PlanetFocusPalette.warmYellow)
+                Text("\(clockString(state.elapsedTime)) elapsed - \(clockString(state.remainingTime)) remaining")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(PlanetFocusPalette.typePaleBlue.opacity(0.72))
+            }
+            .padding(9)
+            .background(PlanetFocusPalette.warmYellow.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 9))
+        }
+    }
+
+    private func clockString(_ interval: TimeInterval) -> String {
+        let totalSeconds = max(Int(interval.rounded(.down)), 0)
+        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+}
+
+private struct StoryTransportMonitor: View {
+    let title: String
+    let session: PerformanceSession?
+
+    var body: some View {
+        if let session {
+            StoryRunProgress(session: session, contextTitle: title)
+        } else {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("\(title) is ready")
+                    .font(.caption.weight(.semibold))
+                Text("Run this scene to expose its live transport, timing, and future score events here.")
+                    .font(.caption)
+                    .foregroundStyle(PlanetFocusPalette.typePaleBlue.opacity(0.72))
+            }
+            .padding(9)
+            .background(PlanetFocusPalette.typePaleBlue.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 9))
+        }
+    }
+}
+
+private struct SplashTuningControls: View {
+    @Binding var speedMultiplier: Double
+    @Binding var amountMultiplier: Double
+    @Binding var atmosphereProgress: Double
+    @Binding var resonanceStrength: Double
+    @Binding var resonanceWidth: Double
+    @Binding var tonalSlot: Int
+    @Binding var gateBeats: Double
+    @Binding var scoreSeed: Int
+    let isTransportDrivingLight: Bool
+    let onTriggerEvent: () -> Void
+    let onReset: () -> Void
+
+    var body: some View {
+        VStack(spacing: 7) {
+            HStack {
+                Text("Splash tuning")
+                    .fontWeight(.semibold)
+
+                Spacer()
+
+                Button("Reset", action: onReset)
+                    .foregroundStyle(PlanetFocusPalette.warmYellow)
+            }
+
+            tuningRow(
+                label: "Speed",
+                value: $speedMultiplier,
+                range: 0.25...4
+            )
+            .disabled(isTransportDrivingLight)
+            tuningRow(
+                label: "Amount",
+                value: $amountMultiplier,
+                range: 0.5...2
+            )
+
+            Divider()
+                .overlay(PlanetFocusPalette.typePaleBlue.opacity(0.24))
+
+            tuningRow(
+                label: "Light",
+                value: $atmosphereProgress,
+                range: 0...1,
+                valueLabel: isTransportDrivingLight
+                    ? "Transport"
+                    : SplashAtmosphereDirector.sample(
+                        progress: atmosphereProgress
+                    ).displayLabel
+            )
+            .disabled(isTransportDrivingLight)
+
+            if isTransportDrivingLight {
+                Text("The runner owns speed, light, and sound pools. Amount still adjusts visual strength.")
+                    .font(.caption)
+                    .foregroundStyle(PlanetFocusPalette.typePaleBlue.opacity(0.72))
+            }
+
+            Divider()
+                .overlay(PlanetFocusPalette.typePaleBlue.opacity(0.24))
+
+            Button(action: onTriggerEvent) {
+                Label("Trigger scored note", systemImage: "waveform.path")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(PlanetFocusPalette.warmYellow)
+            .foregroundStyle(PlanetFocusPalette.canvasInk)
+            .accessibilityIdentifier("splashResonanceTrigger")
+
+            Stepper(value: $tonalSlot, in: 0...7) {
+                HStack {
+                    Text("Note / wave")
+                    Spacer()
+                    Text(
+                        "\(SplashPerformanceScore.noteName(for: tonalSlot)) - \(SplashPerformanceScore.waveName(for: tonalSlot))"
+                    )
+                    .monospacedDigit()
+                }
+            }
+
+            tuningRow(
+                label: "Gate",
+                value: $gateBeats,
+                range: 2...16,
+                valueLabel: String(
+                    format: "%.0f beats", gateBeats
+                )
+            )
+            tuningRow(
+                label: "Intensity",
+                value: $resonanceStrength,
+                range: 0...2
+            )
+            tuningRow(
+                label: "Seam width",
+                value: $resonanceWidth,
+                range: 0.04...0.22,
+                valueLabel: String(format: "%.2f", resonanceWidth)
+            )
+
+            Stepper(value: $scoreSeed, in: 1...999_999) {
+                HStack {
+                    Text("Score seed")
+                    Spacer()
+                    Text("\(scoreSeed)")
+                        .monospacedDigit()
+                }
+            }
+        }
+        .font(.system(size: 12, weight: .medium, design: .rounded))
+        .foregroundStyle(PlanetFocusPalette.typePaleBlue)
+    }
+
+    private func tuningRow(
+        label: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>,
+        valueLabel: String? = nil
+    ) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .frame(width: 48, alignment: .leading)
+
+            Slider(value: value, in: range)
+                .tint(PlanetFocusPalette.warmYellow)
+
+            Text(valueLabel ?? String(format: "%.2fx", value.wrappedValue))
+            .monospacedDigit()
+            .frame(width: valueLabel == nil ? 42 : 82, alignment: .trailing)
+        }
+    }
+}
+
+private struct SplashScoreMonitorContent: View {
+    let performanceClock: PerformanceClock
+    let motionTuning: SplashMotionTuning
+    let manualEvent: SplashWaveNoteEvent?
+    let scoreEvents: [SplashWaveNoteEvent]
+    let seed: UInt64
+    let performanceSession: PerformanceSession?
+
+    @State private var frozenScoreBeat: Double?
+    @State private var reviewOffsetBeats = 0.0
+    @State private var cachedDiagnostics: SplashScoreDiagnostics?
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.15)) { context in
+                let elapsedTime = performanceSession.map {
+                    PerformanceRunner(session: $0).sample(at: context.date).elapsedTime
+                } ?? performanceClock.elapsed(at: context.date)
+                let liveScoreBeat = SplashPerformanceScore.scoreBeat(
+                    for: elapsedTime,
+                    tuning: motionTuning
+                )
+                let atmosphere = performanceSession.map {
+                    SplashPerformancePlan(
+                        session: $0,
+                        scoreEvents: scoreEvents
+                    ).atmosphere(at: context.date)
+                }
+                let scoreBeat = frozenScoreBeat
+                    ?? liveScoreBeat + reviewOffsetBeats
+                let scheduledEvents = SplashPerformanceScore.scheduledEvents(
+                    around: scoreBeat,
+                    radiusBeats: 16,
+                    events: scoreEvents,
+                    manualEvent: manualEvent
+                )
+                let activeEvents = scheduledEvents.filter {
+                    $0.sample(at: scoreBeat) != nil
+                }
+
+                VStack(alignment: .leading, spacing: 14) {
+                        transportHeader(
+                            scoreBeat: scoreBeat,
+                            isFrozen: frozenScoreBeat != nil,
+                            atmosphere: atmosphere,
+                            onFreezeToggle: {
+                                frozenScoreBeat = frozenScoreBeat == nil
+                                    ? scoreBeat
+                                    : nil
+                            }
+                        )
+
+                        scoreDiagnostics
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Active events")
+                                .font(.headline)
+                            if activeEvents.isEmpty {
+                                Text("No active event at this beat")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(activeEvents) { scheduledEvent in
+                                    activeEventRow(
+                                        scheduledEvent,
+                                        scoreBeat: scoreBeat
+                                    )
+                                }
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("24-beat score roll")
+                                .font(.headline)
+                            Text("Every bar is a real score event. Its wave, ADSR, and synth voice share this exact start and end.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            SplashScoreRoll(
+                                scoreBeat: scoreBeat,
+                                events: scheduledEvents
+                            )
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Event log")
+                                .font(.headline)
+                            ForEach(scheduledEvents) { scheduledEvent in
+                                eventLogRow(scheduledEvent, scoreBeat: scoreBeat)
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Fast review")
+                                .font(.headline)
+                            Text("Inspect the score without changing the live splash transport.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            Slider(value: $reviewOffsetBeats, in: 0...max((performanceSession?.duration.timeInterval ?? 600) / SplashPerformanceScore.tempo.secondsPerBeat, 1))
+                                .tint(PlanetFocusPalette.warmYellow)
+                            Text(String(format: "+%.0f beats  |  +%.1f min", reviewOffsetBeats, reviewOffsetBeats * SplashPerformanceScore.tempo.secondsPerBeat / 60))
+                                .font(.footnote.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                }
+        }
+    }
+
+    private func transportHeader(
+        scoreBeat: Double,
+        isFrozen: Bool,
+        atmosphere: SplashAtmosphereSample?,
+        onFreezeToggle: @escaping () -> Void
+    ) -> some View {
+        let bar = Int(floor(scoreBeat / Double(SplashPerformanceScore.tempo.beatsPerBar))) + 1
+        let beat = scoreBeat.truncatingRemainder(
+            dividingBy: Double(SplashPerformanceScore.tempo.beatsPerBar)
+        ) + 1
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("65 BPM - F Lydian")
+                        .font(.headline)
+                    Text(String(format: "Seed %llu  |  Bar %d  |  Beat %.2f", seed, bar, beat))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(isFrozen ? "Resume live" : "Freeze", action: onFreezeToggle)
+                    .buttonStyle(.bordered)
+            }
+            Text(isFrozen ? "Monitor frozen; splash transport continues live." : "Live transport; synth audition is controlled in the runner.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            if let atmosphere {
+                Text(String(
+                    format: "Sound pool mix  Night %.0f%%  Twilight %.0f%%  Daylight %.0f%%",
+                    atmosphere.weights.night * 100,
+                    atmosphere.weights.twilight * 100,
+                    atmosphere.weights.daylight * 100
+                ))
+                .font(.footnote.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding()
+        .background(PlanetFocusPalette.canvasInk.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var scoreDiagnostics: some View {
+        let diagnostics = cachedDiagnostics ?? SplashScoreDiagnostics(
+            averageActiveVoices: 0, longestSilentBeats: 0, averageEventDurationSeconds: 0,
+            eventsPerMinute: 0, participatingWaveCount: 0)
+        return VStack(alignment: .leading, spacing: 8) {
+            Text(performanceSession == nil ? "10-minute structural check" : "Full-run structural check")
+                .font(.headline)
+            HStack(spacing: 12) {
+                diagnostic("Avg voices", String(format: "%.1f", diagnostics.averageActiveVoices))
+                diagnostic("Longest gap", String(format: "%.1f beats", diagnostics.longestSilentBeats))
+            }
+            HStack(spacing: 12) {
+                diagnostic("Avg note", String(format: "%.1fs", diagnostics.averageEventDurationSeconds))
+                diagnostic("Wave coverage", "\(diagnostics.participatingWaveCount)/8")
+            }
+        }
+        .task(id: "\(seed)-\(performanceSession?.duration.rawValue ?? 600)-\(scoreEvents.count)") {
+            cachedDiagnostics = SplashPerformanceScore.diagnostics(
+                durationMinutes: (performanceSession?.duration.timeInterval ?? 600) / 60,
+                events: scoreEvents)
+        }
+    }
+
+    private func diagnostic(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(value)
+                .font(.subheadline.weight(.semibold).monospacedDigit())
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(PlanetFocusPalette.canvasInk.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func activeEventRow(
+        _ scheduledEvent: SplashScheduledPerformanceEvent,
+        scoreBeat: Double
+    ) -> some View {
+        let sample = scheduledEvent.sample(at: scoreBeat)
+        return HStack {
+            Text(SplashMusicDirector.noteName(for: scheduledEvent.event))
+                .font(.headline.monospaced())
+                .frame(width: 42, alignment: .leading)
+            VStack(alignment: .leading) {
+                Text("\(SplashPerformanceScore.waveName(for: scheduledEvent.event.tonalSlot)) - \(scheduledEvent.event.role.rawValue.capitalized)")
+                Text("\(sample?.stage.label ?? "off")  |  \(String(format: "%.0f", scheduledEvent.event.gateBeats)) beat gate + \(String(format: "%.0f", scheduledEvent.event.envelope.releaseBeats)) release")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let source = performancePlan?.soundSource(for: scheduledEvent) {
+                    Text("\(source.pool.displayName) pool - \(source.role.rawValue)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Text(String(format: "%.0f%%", (sample?.value ?? 0) * 100))
+                .font(.caption.monospacedDigit())
+        }
+        .padding(10)
+        .background(PlanetFocusPalette.warmYellow.opacity(0.16))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func eventLogRow(
+        _ scheduledEvent: SplashScheduledPerformanceEvent,
+        scoreBeat: Double
+    ) -> some View {
+        let isActive = scheduledEvent.sample(at: scoreBeat) != nil
+        return HStack(spacing: 10) {
+            Text(String(format: "%.1f", scheduledEvent.scheduledStartBeat))
+                .font(.caption.monospacedDigit())
+                .frame(width: 42, alignment: .leading)
+            Text(SplashMusicDirector.noteName(for: scheduledEvent.event))
+                .font(.subheadline.monospaced())
+                .frame(width: 30, alignment: .leading)
+            Text(SplashPerformanceScore.waveName(for: scheduledEvent.event.tonalSlot))
+                .font(.subheadline)
+            Spacer()
+            Text("\(String(format: "%.0f", scheduledEvent.event.totalBeats)) beats")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            if isActive {
+                Circle()
+                    .fill(PlanetFocusPalette.warmYellow)
+                    .frame(width: 8, height: 8)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+
+    private var performancePlan: SplashPerformancePlan? {
+        performanceSession.map {
+            SplashPerformancePlan(session: $0, scoreEvents: scoreEvents)
+        }
+    }
+}
+
+private struct SplashScoreRoll: View {
+    let scoreBeat: Double
+    let events: [SplashScheduledPerformanceEvent]
+    private let windowStartOffset = 8.0
+    private let windowBeats = 24.0
+
+    var body: some View {
+        VStack(spacing: 5) {
+            ForEach(SplashPerformanceScore.waveVoices, id: \.tonalSlot) { voice in
+                HStack(spacing: 8) {
+                    Text(voice.noteName)
+                        .font(.caption.monospaced())
+                        .frame(width: 26, alignment: .leading)
+                    GeometryReader { proxy in
+                        let start = scoreBeat - windowStartOffset
+                        ZStack(alignment: .leading) {
+                            Capsule()
+                                .fill(PlanetFocusPalette.canvasInk.opacity(0.12))
+                                .frame(height: 9)
+                            ForEach(events.filter { $0.event.tonalSlot == voice.tonalSlot }) { event in
+                                let x = max(event.scheduledStartBeat - start, 0)
+                                let visibleEnd = min(event.endBeat - start, windowBeats)
+                                if visibleEnd > x {
+                                    Capsule()
+                                        .fill(PlanetFocusPalette.warmYellow.opacity(0.78))
+                                        .frame(
+                                            width: proxy.size.width * CGFloat((visibleEnd - x) / windowBeats),
+                                            height: 9
+                                        )
+                                        .offset(x: proxy.size.width * CGFloat(x / windowBeats))
+                                }
+                            }
+                        }
+                    }
+                    .frame(height: 12)
+                }
+            }
+        }
+        .padding(10)
+        .background(PlanetFocusPalette.canvasInk.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+private extension SplashEnvelopeStage {
+    var label: String {
+        switch self {
+        case .attack: "attack"
+        case .decay: "decay"
+        case .sustain: "sustain"
+        case .release: "release"
+        }
+    }
+}
+#endif
 #endif
 
 private struct SplashSunView: View {
     let progress: CGFloat
+    let palette: SplashAtmospherePalette
 
     var body: some View {
         ZStack {
             Circle()
-                .fill(SplashSunMaterial.cutEdgeColor)
+                .fill(palette.sunCutEdge.color)
                 .offset(
                     x: SplashSunMaterial.cutEdgeX,
                     y: SplashSunMaterial.cutEdgeY
                 )
 
             Circle()
-                .fill(PlanetFocusPalette.warmYellow)
+                .fill(palette.accent.color)
 
-            Image("SunPaperTexture")
+            Image("NeutralPaperGrainV1")
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .clipShape(Circle())
+                .blendMode(.softLight)
+                .opacity(0.52)
                 .accessibilityHidden(true)
 
             Circle()
@@ -404,7 +2725,6 @@ private struct SplashSunView: View {
                 x: SplashSunMaterial.castShadowX,
                 y: SplashSunMaterial.castShadowY
             )
-            .offset(y: (1 - progress) * 44)
             .opacity(progress)
     }
 }
@@ -431,6 +2751,12 @@ private enum SplashSunMaterial {
 enum SplashWaveEntryEdge: CGFloat {
     case leading = -1
     case trailing = 1
+}
+
+enum SplashWaveExtent: Equatable {
+    case full
+    case entering(progress: CGFloat, edge: SplashWaveEntryEdge)
+    case exiting(progress: CGFloat, entryEdge: SplashWaveEntryEdge)
 }
 
 struct SplashWaveRibbon: Identifiable {
@@ -495,6 +2821,7 @@ struct SplashWaveFormula {
     let thickness: SplashWaveFunction
     let entryEdge: SplashWaveEntryEdge
     let motionRate: CGFloat
+    let thicknessMotionRate: CGFloat
 }
 
 /// Generates the complete wave field from continuous low-frequency functions.
@@ -508,6 +2835,7 @@ enum SplashWaveGenerator {
     static let centerAmplitudeScale: CGFloat = 1
     static let thicknessAmplitudeScale: CGFloat = 1
     static let maximumRibbonSpanShare: CGFloat = 0.38
+    static let headTaperLength: CGFloat = 0.09
 
     static let formulas: [SplashWaveFormula] = [
         .init(
@@ -522,7 +2850,8 @@ enum SplashWaveGenerator {
                 .init(amplitude: 0.063, cycles: 4.497, phase: 0.835)
             ]),
             entryEdge: .trailing,
-            motionRate: 0.16
+            motionRate: 0.16,
+            thicknessMotionRate: -0.052
         ),
         .init(
             id: .waveRearDeep,
@@ -536,7 +2865,8 @@ enum SplashWaveGenerator {
                 .init(amplitude: 0.035, cycles: 3.700, phase: 0.376)
             ]),
             entryEdge: .leading,
-            motionRate: -0.11
+            motionRate: -0.11,
+            thicknessMotionRate: 0.041
         ),
         .init(
             id: .waveWarmReveal,
@@ -550,7 +2880,8 @@ enum SplashWaveGenerator {
                 .init(amplitude: 0.010, cycles: 4.000, phase: 0.949)
             ]),
             entryEdge: .leading,
-            motionRate: 0.08
+            motionRate: 0.08,
+            thicknessMotionRate: -0.031
         ),
         .init(
             id: .waveMiddleLavender,
@@ -565,7 +2896,8 @@ enum SplashWaveGenerator {
                 .init(amplitude: 0.062, cycles: 3.322, phase: 0.253)
             ]),
             entryEdge: .trailing,
-            motionRate: -0.09
+            motionRate: -0.09,
+            thicknessMotionRate: 0.047
         ),
         .init(
             id: .waveMiddleBlue,
@@ -579,7 +2911,8 @@ enum SplashWaveGenerator {
                 .init(amplitude: 0.025, cycles: 4.100, phase: 0.671)
             ]),
             entryEdge: .leading,
-            motionRate: 0.12
+            motionRate: 0.12,
+            thicknessMotionRate: -0.044
         ),
         .init(
             id: .waveFrontDeep,
@@ -593,7 +2926,8 @@ enum SplashWaveGenerator {
                 .init(amplitude: 0.030, cycles: 4.000, phase: 0.514)
             ]),
             entryEdge: .trailing,
-            motionRate: -0.14
+            motionRate: -0.14,
+            thicknessMotionRate: 0.038
         ),
         .init(
             id: .waveFrontPeriwinkle,
@@ -607,7 +2941,8 @@ enum SplashWaveGenerator {
                 .init(amplitude: 0.020, cycles: 4.500, phase: 0.641)
             ]),
             entryEdge: .leading,
-            motionRate: 0.10
+            motionRate: 0.10,
+            thicknessMotionRate: -0.036
         ),
         .init(
             id: .waveFrontLavender,
@@ -621,16 +2956,44 @@ enum SplashWaveGenerator {
                 .init(amplitude: 0.025, cycles: 3.800, phase: 0.116)
             ]),
             entryEdge: .trailing,
-            motionRate: -0.07
+            motionRate: -0.07,
+            thicknessMotionRate: 0.029
         )
     ]
 
-    static func ribbons(motionPhase: CGFloat = 0) -> [SplashWaveRibbon] {
+    static func ribbons(
+        motionPhase: CGFloat = 0,
+        motionAmount: CGFloat = 1,
+        resonance: SplashWaveResonanceSample? = nil,
+        palette: SplashAtmospherePalette = .night
+    ) -> [SplashWaveRibbon] {
+        ribbons(
+            motionSamples: Array(
+                repeating: SplashWaveMotionSample(
+                    phase: motionPhase,
+                    amplitude: motionAmount
+                ),
+                count: formulas.count
+            ),
+            resonance: resonance,
+            palette: palette
+        )
+    }
+
+    static func ribbons(
+        motionSamples: [SplashWaveMotionSample],
+        resonance: SplashWaveResonanceSample? = nil,
+        palette: SplashAtmospherePalette = .night
+    ) -> [SplashWaveRibbon] {
         var topSamples = Array(repeating: [CGPoint](), count: formulas.count)
         var bottomSamples = Array(repeating: [CGPoint](), count: formulas.count)
         for index in 0...sampleCount {
             let x = CGFloat(index) / CGFloat(sampleCount)
-            let edges = rawEdges(at: x, motionPhase: motionPhase)
+            let edges = rawEdges(
+                at: x,
+                motionSamples: motionSamples,
+                resonance: resonance
+            )
             for formulaIndex in formulas.indices {
                 topSamples[formulaIndex].append(
                     CGPoint(x: x, y: edges[formulaIndex].top)
@@ -645,7 +3008,7 @@ enum SplashWaveGenerator {
             let formula = formulas[index]
             return SplashWaveRibbon(
                 id: formula.id,
-                color: formula.color,
+                color: palette.waveColor(for: formula.id),
                 top: topSamples[index],
                 bottom: bottomSamples[index],
                 entryEdge: formula.entryEdge
@@ -653,7 +3016,9 @@ enum SplashWaveGenerator {
         }
     }
 
-    static func coverageRibbon() -> SplashWaveRibbon {
+    static func coverageRibbon(
+        palette: SplashAtmospherePalette = .night
+    ) -> SplashWaveRibbon {
         var top: [CGPoint] = []
         var bottom: [CGPoint] = []
         for index in 0...sampleCount {
@@ -664,36 +3029,262 @@ enum SplashWaveGenerator {
         }
         return SplashWaveRibbon(
             id: .waveRearDeep,
-            color: PlanetFocusPalette.waveDeep,
+            color: palette.waveDeep.color,
             top: top,
             bottom: bottom,
             entryEdge: .leading
         )
     }
 
+    static func applying(
+        _ extent: SplashWaveExtent,
+        to ribbon: SplashWaveRibbon
+    ) -> SplashWaveRibbon {
+        switch extent {
+        case .full:
+            ribbon
+        case .entering(let progress, let edge):
+            enteringRibbon(ribbon, progress: progress, edge: edge)
+        case .exiting(let progress, let entryEdge):
+            exitingRibbon(ribbon, progress: progress, entryEdge: entryEdge)
+        }
+    }
+
+    private static func enteringRibbon(
+        _ ribbon: SplashWaveRibbon,
+        progress: CGFloat,
+        edge: SplashWaveEntryEdge
+    ) -> SplashWaveRibbon {
+        let progress = min(max(progress, 0), 1)
+        guard progress > 0 else { return emptyRibbon(copying: ribbon) }
+        guard progress < 1 else { return ribbon }
+
+        switch edge {
+        case .leading:
+            return partialRibbon(
+                ribbon,
+                lowerBound: 0,
+                upperBound: progress,
+                taperOrigin: progress
+            )
+        case .trailing:
+            return partialRibbon(
+                ribbon,
+                lowerBound: 1 - progress,
+                upperBound: 1,
+                taperOrigin: 1 - progress
+            )
+        }
+    }
+
+    private static func exitingRibbon(
+        _ ribbon: SplashWaveRibbon,
+        progress: CGFloat,
+        entryEdge: SplashWaveEntryEdge
+    ) -> SplashWaveRibbon {
+        let progress = min(max(progress, 0), 1)
+        guard progress > 0 else { return ribbon }
+        guard progress < 1 else { return emptyRibbon(copying: ribbon) }
+
+        switch entryEdge {
+        case .leading:
+            return partialRibbon(
+                ribbon,
+                lowerBound: progress,
+                upperBound: 1,
+                taperOrigin: progress
+            )
+        case .trailing:
+            return partialRibbon(
+                ribbon,
+                lowerBound: 0,
+                upperBound: 1 - progress,
+                taperOrigin: 1 - progress
+            )
+        }
+    }
+
+    private static func partialRibbon(
+        _ ribbon: SplashWaveRibbon,
+        lowerBound: CGFloat,
+        upperBound: CGFloat,
+        taperOrigin: CGFloat
+    ) -> SplashWaveRibbon {
+        let lowerBound = min(max(lowerBound, 0), 1)
+        let upperBound = min(max(upperBound, lowerBound), 1)
+        guard upperBound > lowerBound else {
+            return emptyRibbon(copying: ribbon)
+        }
+
+        var xValues = [lowerBound]
+        xValues.append(contentsOf: ribbon.top.lazy.map(\.x).filter {
+            $0 > lowerBound && $0 < upperBound
+        })
+        xValues.append(upperBound)
+
+        var top: [CGPoint] = []
+        var bottom: [CGPoint] = []
+        top.reserveCapacity(xValues.count)
+        bottom.reserveCapacity(xValues.count)
+
+        for x in xValues {
+            let edges = interpolatedEdges(in: ribbon, at: x)
+            let center = (edges.top.y + edges.bottom.y) / 2
+            let halfThickness = (edges.bottom.y - edges.top.y) / 2
+            let distanceFromTip = abs(x - taperOrigin)
+            let taperProgress = min(distanceFromTip / headTaperLength, 1)
+            let thicknessScale = CGFloat(
+                SplashMotionTiming.smootherStep(Double(taperProgress))
+            )
+            let taperedHalfThickness = halfThickness * thicknessScale
+
+            top.append(CGPoint(x: x, y: center - taperedHalfThickness))
+            bottom.append(CGPoint(x: x, y: center + taperedHalfThickness))
+        }
+
+        return SplashWaveRibbon(
+            id: ribbon.id,
+            color: ribbon.color,
+            top: top,
+            bottom: bottom,
+            entryEdge: ribbon.entryEdge
+        )
+    }
+
+    private static func interpolatedEdges(
+        in ribbon: SplashWaveRibbon,
+        at x: CGFloat
+    ) -> (top: CGPoint, bottom: CGPoint) {
+        let count = min(ribbon.top.count, ribbon.bottom.count)
+        guard count > 1 else {
+            let point = CGPoint(x: x, y: 0)
+            return (point, point)
+        }
+
+        let samplePosition = min(max(x, 0), 1) * CGFloat(count - 1)
+        let lowerIndex = min(Int(floor(samplePosition)), count - 1)
+        let upperIndex = min(lowerIndex + 1, count - 1)
+        let fraction = samplePosition - CGFloat(lowerIndex)
+
+        return (
+            top: interpolatedPoint(
+                from: ribbon.top[lowerIndex],
+                to: ribbon.top[upperIndex],
+                x: x,
+                fraction: fraction
+            ),
+            bottom: interpolatedPoint(
+                from: ribbon.bottom[lowerIndex],
+                to: ribbon.bottom[upperIndex],
+                x: x,
+                fraction: fraction
+            )
+        )
+    }
+
+    private static func interpolatedPoint(
+        from start: CGPoint,
+        to end: CGPoint,
+        x: CGFloat,
+        fraction: CGFloat
+    ) -> CGPoint {
+        CGPoint(
+            x: x,
+            y: start.y + (end.y - start.y) * fraction
+        )
+    }
+
+    private static func emptyRibbon(
+        copying ribbon: SplashWaveRibbon
+    ) -> SplashWaveRibbon {
+        SplashWaveRibbon(
+            id: ribbon.id,
+            color: ribbon.color,
+            top: [],
+            bottom: [],
+            entryEdge: ribbon.entryEdge
+        )
+    }
+
     private static func rawEdges(
         at x: CGFloat,
-        motionPhase: CGFloat
+        motionSamples: [SplashWaveMotionSample],
+        resonance: SplashWaveResonanceSample? = nil
     ) -> [(top: CGFloat, bottom: CGFloat)] {
         let guardEdges = envelope(at: x)
         let availableSpan = max(guardEdges.bottom - guardEdges.top, 0.10)
-        return formulas.map { formula in
-            let phase = motionPhase * formula.motionRate
-            let rawCenter = formula.centerline.value(
+
+        return formulas.enumerated().map { index, formula in
+            let sample = index < motionSamples.count
+                ? motionSamples[index]
+                : .resting
+            let packetGain = travelingPacketGain(
                 at: x,
-                motionPhase: phase,
+                center: sample.packetCenter,
+                halfWidth: sample.packetHalfWidth
+            )
+            let packetAmount = min(max(sample.amplitude, 0), 1) * packetGain
+            let bedAmount = min(max(sample.bedAmplitude, 0), 1)
+            let packetCenterPhase = -sample.phase * abs(formula.motionRate)
+            let bedCenterPhase = -sample.bedPhase * abs(formula.motionRate)
+            let packetThicknessPhase = -sample.phase * abs(formula.thicknessMotionRate)
+            let bedThicknessPhase = -sample.bedPhase * abs(formula.thicknessMotionRate)
+
+            let restingCenterField = formula.centerline.value(
+                at: x,
                 spatialScale: ribbonFrequencyScale
             )
-            let center = formula.centerline.base
-                + centerAmplitudeScale * (rawCenter - formula.centerline.base)
-            let thicknessField = formula.thickness.value(
+            let packetCenterField = formula.centerline.value(
                 at: x,
-                motionPhase: phase,
+                motionPhase: packetCenterPhase,
                 spatialScale: ribbonFrequencyScale
             )
-            let rawThickness = formula.thickness.base
+            let bedCenterField = formula.centerline.value(
+                at: x,
+                motionPhase: bedCenterPhase,
+                spatialScale: ribbonFrequencyScale
+            )
+            let restingCenter = formula.centerline.base
+                + centerAmplitudeScale
+                * (restingCenterField - formula.centerline.base)
+            let packetCenter = formula.centerline.base
+                + centerAmplitudeScale
+                * (packetCenterField - formula.centerline.base)
+            let bedCenter = formula.centerline.base
+                + centerAmplitudeScale
+                * (bedCenterField - formula.centerline.base)
+            let center = restingCenter
+                + bedAmount * (bedCenter - restingCenter)
+                + packetAmount * (packetCenter - restingCenter)
+                + (resonance?.verticalShift(at: x, waveIndex: index) ?? 0)
+
+            let restingThicknessField = formula.thickness.value(
+                at: x,
+                spatialScale: ribbonFrequencyScale
+            )
+            let packetThicknessField = formula.thickness.value(
+                at: x,
+                motionPhase: packetThicknessPhase,
+                spatialScale: ribbonFrequencyScale
+            )
+            let bedThicknessField = formula.thickness.value(
+                at: x,
+                motionPhase: bedThicknessPhase,
+                spatialScale: ribbonFrequencyScale
+            )
+            let restingThickness = formula.thickness.base
                 + thicknessAmplitudeScale
-                * (thicknessField - formula.thickness.base)
+                * (restingThicknessField - formula.thickness.base)
+            let packetThickness = formula.thickness.base
+                + thicknessAmplitudeScale
+                * (packetThicknessField - formula.thickness.base)
+            let bedThickness = formula.thickness.base
+                + thicknessAmplitudeScale
+                * (bedThicknessField - formula.thickness.base)
+            let rawThickness = restingThickness
+                + bedAmount * 0.32 * (bedThickness - restingThickness)
+                + packetAmount * 0.50 * (packetThickness - restingThickness)
+
             let positiveThickness = 0.010
                 + softplus(rawThickness - 0.010, sharpness: 32)
             let thickness = min(
@@ -711,6 +3302,24 @@ enum SplashWaveGenerator {
                 bottom: min(boundedCenter + halfThickness, guardEdges.bottom)
             )
         }
+    }
+
+    static func travelingPacketGain(
+        at x: CGFloat,
+        center: CGFloat,
+        halfWidth: CGFloat
+    ) -> CGFloat {
+        guard halfWidth.isFinite else { return 1 }
+        guard halfWidth > 0 else { return 0 }
+
+        let normalizedDistance = abs(x - center) / halfWidth
+        guard normalizedDistance < 1 else { return 0 }
+
+        return CGFloat(
+            SplashMotionTiming.smootherStep(
+                Double(1 - normalizedDistance)
+            )
+        )
     }
 
     private static func envelope(at x: CGFloat) -> (top: CGFloat, bottom: CGFloat) {
@@ -745,8 +3354,8 @@ enum SplashWaveGenerator {
         upper: CGFloat
     ) -> CGFloat {
         lower
-            + softplus(value - lower, sharpness: 48)
-            - softplus(value - upper, sharpness: 48)
+            + softplus(value - lower, sharpness: 44)
+            - softplus(value - upper, sharpness: 44)
     }
 
     private static func softplus(_ value: CGFloat, sharpness: CGFloat) -> CGFloat {
@@ -757,17 +3366,47 @@ enum SplashWaveGenerator {
 
 private struct SplashWaveField: View {
     let layout: SplashLayout
-    let progress: CGFloat
-    let motionPhase: CGFloat
+    let presentation: SplashScenePresentation
+    let resonance: SplashWaveResonanceSample?
+    let palette: SplashAtmospherePalette
 
     var body: some View {
         let worldSize = layout.waveWorldSize
-        let ribbons = SplashWaveGenerator.ribbons(motionPhase: motionPhase)
-        let coverage = SplashWaveGenerator.coverageRibbon()
+        let motionSamples = SplashWaveGenerator.formulas.map {
+            presentation.waveMotionSample(for: $0.id)
+        }
+        let fullRibbons = SplashWaveGenerator.ribbons(
+            motionSamples: motionSamples,
+            resonance: resonance,
+            palette: palette
+        )
+        let ribbons = fullRibbons.enumerated().map { index, ribbon in
+            SplashWaveGenerator.applying(
+                presentation.waveExtent(
+                    forWaveAt: index,
+                    edge: ribbon.entryEdge,
+                    count: fullRibbons.count
+                ),
+                to: ribbon
+            )
+        }
+        let fullCoverage = SplashWaveGenerator.coverageRibbon(palette: palette)
+        let coverageIndex = SplashWaveGenerator.formulas.firstIndex {
+            $0.id == .waveRearDeep
+        } ?? 0
+        let coverageEdge = SplashWaveGenerator.formulas[coverageIndex].entryEdge
+        let coverage = SplashWaveGenerator.applying(
+            presentation.waveExtent(
+                forWaveAt: coverageIndex,
+                edge: coverageEdge,
+                count: fullRibbons.count
+            ),
+            to: fullCoverage
+        )
 
         ZStack {
             SplashWaveRibbonShape(top: coverage.top, bottom: coverage.bottom)
-                .fill(PlanetFocusPalette.waveDeep)
+                .fill(palette.waveDeep.color)
                 .frame(width: worldSize.width, height: worldSize.height)
                 .accessibilityIdentifier("waveCoverageBacking")
 
@@ -777,12 +3416,13 @@ private struct SplashWaveField: View {
                 SplashWavePaperLayer(
                     shape: shape,
                     faceColor: ribbon.color,
-                    cutEdgeColor: SplashWaveMaterial.cutEdgeColor(for: ribbon.id)
+                    cutEdgeColor: palette.waveCutEdgeColor(for: ribbon.id),
+                    resonance: resonance,
+                    waveIndex: SplashWaveGenerator.formulas.firstIndex {
+                        $0.id == ribbon.id
+                    } ?? 0
                 )
                     .frame(width: worldSize.width, height: worldSize.height)
-                    .offset(
-                        x: (1 - progress) * ribbon.entryEdge.rawValue * worldSize.width
-                    )
                     .accessibilityIdentifier(ribbon.id.rawValue)
             }
         }
@@ -795,6 +3435,8 @@ private struct SplashWavePaperLayer: View {
     let shape: SplashWaveRibbonShape
     let faceColor: Color
     let cutEdgeColor: Color
+    let resonance: SplashWaveResonanceSample?
+    let waveIndex: Int
 
     var body: some View {
         ZStack {
@@ -808,7 +3450,7 @@ private struct SplashWavePaperLayer: View {
             ZStack {
                 shape.fill(faceColor)
 
-                Image("WavePaperTexture")
+                Image("NeutralPaperGrainV1")
                     .resizable(resizingMode: .tile)
                     .mask(shape)
                     .blendMode(.softLight)
@@ -819,6 +3461,18 @@ private struct SplashWavePaperLayer: View {
                     Color.white.opacity(SplashWaveMaterial.edgeHighlightOpacity),
                     lineWidth: SplashWaveMaterial.edgeHighlightWidth
                 )
+
+                if let resonance, resonance.seamOpacity(for: waveIndex) > 0 {
+                    SplashWaveResonanceSeam(
+                        points: shape.top,
+                        center: resonance.center,
+                        halfWidth: resonance.halfWidth * 2.1
+                    )
+                    .stroke(
+                        Color.white.opacity(resonance.seamOpacity(for: waveIndex)),
+                        style: StrokeStyle(lineWidth: 1.45, lineCap: .round)
+                    )
+                }
             }
             .compositingGroup()
         }
@@ -835,6 +3489,29 @@ private struct SplashWavePaperLayer: View {
             x: SplashWaveMaterial.castShadowX,
             y: SplashWaveMaterial.castShadowY
         )
+    }
+}
+
+/// The bright, temporary cut-edge that rides the focal wave with a resonance.
+/// It draws the same sampled analytic curve as the ribbon, never a separate
+/// overlay, so the light follows the paper rather than crossing through it.
+private struct SplashWaveResonanceSeam: Shape {
+    let points: [CGPoint]
+    let center: CGFloat
+    let halfWidth: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let lowerBound = center - halfWidth
+        let upperBound = center + halfWidth
+        let segment = points.filter { $0.x >= lowerBound && $0.x <= upperBound }
+        guard let first = segment.first else { return Path() }
+
+        var path = Path()
+        path.move(to: CGPoint(x: first.x * rect.width, y: first.y * rect.height))
+        for point in segment.dropFirst() {
+            path.addLine(to: CGPoint(x: point.x * rect.width, y: point.y * rect.height))
+        }
+        return path
     }
 }
 
@@ -910,13 +3587,16 @@ enum SplashLotusStyle {
     case blue
     case lavender
 
-    fileprivate func color(for petal: SplashLotusPetalID) -> Color {
+    fileprivate func color(
+        for petal: SplashLotusPetalID,
+        palette: SplashAtmospherePalette
+    ) -> Color {
         return switch (self, petal) {
-        case (_, .heart): PlanetFocusPalette.warmYellow
-        case (.blue, .center), (.blue, .innerLeft), (.blue, .innerRight): PlanetFocusPalette.waveMid
-        case (.blue, .baseLeft), (.blue, .baseRight): PlanetFocusPalette.waveMid
-        case (.blue, _): PlanetFocusPalette.waveDeep
-        case (.lavender, _): PlanetFocusPalette.waveLavender
+        case (_, .heart): palette.accent.color
+        case (.blue, .center), (.blue, .innerLeft), (.blue, .innerRight): palette.waveMid.color
+        case (.blue, .baseLeft), (.blue, .baseRight): palette.waveMid.color
+        case (.blue, _): palette.waveDeep.color
+        case (.lavender, _): palette.waveLavender.color
         }
     }
 }
@@ -939,7 +3619,6 @@ private struct SplashLotusPetal: Identifiable {
     let restingRotation: Double
     let depth: Double
 
-    var isCenter: Bool { id == .center || id == .heart }
 }
 
 private enum SplashLotusPetalFamily {
@@ -959,7 +3638,9 @@ private enum SplashLotusPetalSide {
 private struct SplashLotusView: View {
     let actorID: SplashSceneActorID
     let style: SplashLotusStyle
+    let palette: SplashAtmospherePalette
     let centerOpacity: Double
+    let heartOpacity: Double
     let leftFanProgress: CGFloat
     let rightFanProgress: CGFloat
 
@@ -987,13 +3668,13 @@ private struct SplashLotusView: View {
                     let activeProgress = progress(for: petal)
 
                     SplashLotusPetalShape(family: petal.family)
-                        .fill(style.color(for: petal.id))
+                        .fill(style.color(for: petal.id, palette: palette))
                         .overlay(
                             SplashLotusPetalShape(family: petal.family)
-                                .stroke(PlanetFocusPalette.typePaleBlue.opacity(0.20), lineWidth: 0.6)
+                                .stroke(palette.type.color.opacity(0.20), lineWidth: 0.6)
                         )
                         .shadow(
-                            color: PlanetFocusPalette.canvasInk.opacity(0.52),
+                            color: Color.black.opacity(0.38),
                             radius: max(1.4, proxy.size.width * 0.012),
                             y: max(1.7, proxy.size.width * 0.015)
                         )
@@ -1008,7 +3689,7 @@ private struct SplashLotusView: View {
                                 + proxy.size.height * petal.bottomOffset * activeProgress
                                 - petalHeight / 2
                         )
-                        .opacity(petal.isCenter ? centerOpacity : Double(activeProgress))
+                        .opacity(opacity(for: petal, fanProgress: activeProgress))
                         .zIndex(petal.depth)
                         .accessibilityIdentifier("\(actorID.rawValue)-\(petal.id.rawValue)")
                 }
@@ -1022,6 +3703,17 @@ private struct SplashLotusView: View {
         case .left: leftFanProgress
         case .center: 1
         case .right: rightFanProgress
+        }
+    }
+
+    private func opacity(
+        for petal: SplashLotusPetal,
+        fanProgress: CGFloat
+    ) -> Double {
+        switch petal.id {
+        case .center: centerOpacity
+        case .heart: heartOpacity
+        default: Double(fanProgress)
         }
     }
 }
@@ -1083,6 +3775,8 @@ private struct SplashNavigationBar: View {
     let selectedItem: SplashMenuItem
     let fontSize: CGFloat
     let spacing: CGFloat
+    let ink: SplashColorComponents
+    let selectedInk: SplashColorComponents
     let action: (SplashMenuItem) -> Void
     @State private var hoveredItem: SplashMenuItem?
     @Namespace private var indicatorNamespace
@@ -1100,15 +3794,15 @@ private struct SplashNavigationBar: View {
                             .font(PlanetFocusTypography.navigation(size: fontSize))
                             .foregroundStyle(
                                 item == activeItem
-                                    ? PlanetFocusPalette.warmYellow
-                                    : PlanetFocusPalette.typePaleBlue
+                                    ? selectedInk.color
+                                    : ink.color
                             )
                             .lineLimit(1)
 
                         ZStack {
                             if item == activeItem {
                                 Circle()
-                                    .fill(PlanetFocusPalette.warmYellow)
+                                    .fill(selectedInk.color)
                                     .matchedGeometryEffect(
                                         id: SplashNavigationMotion.dotID,
                                         in: indicatorNamespace
@@ -1120,7 +3814,7 @@ private struct SplashNavigationBar: View {
                         ZStack {
                             if item == activeItem {
                                 Capsule()
-                                    .fill(PlanetFocusPalette.warmYellow)
+                                    .fill(selectedInk.color)
                                     .matchedGeometryEffect(
                                         id: SplashNavigationMotion.underlineID,
                                         in: indicatorNamespace

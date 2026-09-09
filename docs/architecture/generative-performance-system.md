@@ -1,133 +1,174 @@
 # Generative Performance System
 
-**Status:** architectural direction · **Updated:** 2026-09-06
+**Status:** live splash integration with temporary synthesized audio · **Updated:** 2026-09-09
 
-Planet Focus uses one canonical time-and-event system for narrative motion and sound.
-The goal is not one object that performs every job. The goal is one authoritative
-clock, one seeded plan, and one shared performance state consumed independently by
-renderers and audio engines.
+One authoritative transport and one seeded score drive narrative motion and sound.
+The splash is the first integrated consumer. Autumn and Contemporary Lotus are not
+being migrated in this pass.
 
-## Current foundation
+## Ownership: reuse these components
 
-The existing story runtime already establishes the core flow:
+| Component | Responsibility |
+| --- | --- |
+| `PerformanceSession` / `PerformanceRunner` | Duration, start date, seed, explicit pause state, accumulated paused time; derive elapsed seconds and progress from a date. |
+| `SplashMusicDirector` | Materialize the complete finite score once for a duration and seed. |
+| `SplashWaveNoteEvent` | Canonical event ID, tonal slot/wave, start beat, gate, ADSR, role, intensity, and octave offset. |
+| `SplashPerformancePlan` | Resolve the semantic sound source at each event's onset; sample atmosphere from the same session. |
+| `SplashAtmosphereDirector` | Progress-to-pool weights, semantic palette, and renderer-independent sunrise state. |
+| `SplashPerformanceScore` | Shared tempo, note envelopes, scheduled-event queries, and visual sampling. Its old repeating score is a calibration fixture only. |
+| `PerformanceSynthesizer` | Temporary native audio consumer of the same event plan. It does not invent note timing or random choices. |
+| `SplashScreenView` | Connect transport, plan, renderer, audition, lifecycle, persistence, and the nonblocking performance desk. |
+| `StoryPlayer` / `StoryDirector` / `StoryMoment` | Existing focus-story adapters and visual/audio moment contract. Preserve them when adapting other scenes. |
+
+Implementation lives in `PlanetCalm/Directors/`, with existing splash event and visual
+types in `PlanetCalm/Views/SplashScreenView.swift`. Do not create another clock,
+pool selector, ADSR implementation, or independently randomized audio schedule.
+
+## Transport and lifecycle
+
+A run's selected duration is the complete darkness-to-daylight story length. Debug
+offers 1 and 2 minutes as well as the existing 5–50-minute choices. Start begins a
+splash run; the runner accordion exposes restart, pause/resume, end, and synth audition.
+The bottom Start control can also start or pause/resume the splash.
+
+Elapsed time is clamped to the duration and is calculated as:
 
 ```text
-FocusSession + persisted seed
-            ↓
-       StoryDirector
-            ↓
-     immutable StoryPlan
-            ↓
-        StoryPlayer
-       ↙           ↘
-visual renderer   audio engine
+sampleDate = pausedAt ?? now
+elapsed = clamp(sampleDate - startedAt - accumulatedPause, 0, duration)
+progress = elapsed / duration
 ```
 
-- `StoryDirector` owns story-specific creative decisions and materializes a
-  deterministic `StoryPlan`.
-- `StoryPlayer` combines the authoritative session clock, selected module, Director,
-  and immutable plan.
-- `StoryMoment` is the synchronization boundary. One moment may carry visual and audio
-  intent, plus identity, start time, duration, intensity, seed, and quantization.
-- Renderers and audio engines consume the same moments. They never command one another.
-- Normalized progress controls the macro narrative. Elapsed seconds control local
-  motion, musical cadence, and event duration.
+Pause freezes all consumers at the same elapsed time. Resume adds the pause interval
+without resetting the seed, envelopes, or note identities. Restart creates a new
+session at zero using the selected seed, so repeated auditions are comparable.
+Change the seed between runs for another deterministic variation.
 
-There are no separate `MusicDirector` and `ActionDirector` implementations in the
-current repository. `StoryAudioEngine` is still silent, and musical quantization is
-recorded as intent but not yet executed.
+The splash stores its transport in the app's local preferences. On relaunch, an
+unfinished run regenerates the same score and reconciles to its current time; a paused
+run remains paused. Background/inactive audio stops, while an unpaused story keeps
+wall-clock progress. Foreground playback resumes current note envelopes, never a
+burst of missed attacks. Audio interruptions and headphone disconnection explicitly
+pause the run and require resume. Background audio playback is not enabled.
 
-## Canonical extension
+An ended/completed run has no future notes. Completion holds the final sunrise state.
+The app does not start another musical cycle automatically. Calibration mode remains
+available when no finite run is active.
 
-The reusable layer beneath stories and the splash should eventually provide:
+While running, the speed and light calibration sliders are disabled. The visual Amount
+control can still scale wave displacement without changing any musical time or envelope.
+Reduce Motion changes visual presentation only, not score timing.
 
-1. An authoritative performance clock derived from a persisted start date. It must
-   reconcile after backgrounding or device lock and must never use animation-frame
-   count as time.
-2. A seeded score that contains continuous beds and discrete moments.
-3. Reusable continuous envelopes for visual intensity, audio gain, and other bounded
-   parameters.
-4. A visual sampler that can evaluate a deterministic performance at any elapsed time.
-5. An audio scheduler that schedules ahead against the same clock and deduplicates
-   already-issued moments.
+## Musical structure and controlled randomness
 
-`StoryPlayer` remains the focus-story adapter. The splash should use the lower-level
-clock and score without pretending to be a `FocusSession`.
+Provisional tonal constraint: **F Lydian**, 65 BPM, 4/4.
+Eight stable slots map to F2, G2, A2, B2, C3, D3, E3, F3; octave offsets change the
+sounding register while retaining the same wave assignment. This is an audition
+language, not a final composition or timbre decision.
 
-## Musical layers
+The director has independent named seeded streams for pads and melody. Randomness is
+evaluated when building the plan, never in an animation frame or audio callback.
 
-### Continuous beds
+- **Drone:** root F2, renewed every 28 beats, with a 32-beat gate and 10-beat release.
+  The next attack overlaps the previous sustain/release, including bank changes.
+- **Pads:** four initial staggered voices, followed by bounded 4.6–5.2-beat onset
+  intervals, 16–18-beat gates, and 7-beat releases. Selection favors the current
+  harmonic collection and unoccupied wave slots. Dynamics, attack, and occasional
+  octave displacement vary within bounds.
+- **Melody:** small 2–4-note phrases, neighboring choices in a constrained upper
+  register, short gates, and 7–13-beat rests between phrases. The drone/pads continue
+  through those melodic rests.
+- **Ending:** gates and releases are bounded by session duration; insufficient space
+  for a valid attack/decay/release prevents a new late note. The endpoint is silence,
+  not abruptly cut active events.
 
-Long pad voices, drones, and environmental beds belong to the score rather than being
-repeated random moments. Future bed metadata may describe an asset or stem, loop
-region, tempo or marker map, gain, and fade envelope.
+The retained repeating 32-beat score is used only for visual calibration outside a
+run. Finite events set `isRepeating = false`, and the shared query/sampler must never
+duplicate them into subsequent cycles.
 
-### Directed moments
+## Event-to-wave synchronization
 
-Bird passages, gusts, leaf releases, wave pulses, gong notes, sitar notes, and similar
-events are bounded `StoryMoment`-style occurrences. A single occurrence carries both
-its visual and audio intent. A shared envelope may drive both a visible accent and the
-gain of its sound.
+Every event's source of truth is its absolute start beat plus gate and release.
+Both audio and visuals sample the same `SplashADSREnvelope`. A note's lifetime is
+`gateBeats + releaseBeats`; no separate UI animation timer is started.
 
-Randomness is directed rather than unconstrained. Rules must include progress or time
-windows, evaluation cadence, probability, cooldown, duration, intensity, event-count
-limits, quiet margins, and cross-family priority. Musical choices must also respect the
-current tonal state, register, polyphony, repetition limits, and dynamic range.
+The eight paper ribbons remain in the scene. Notes create traveling deformations,
+not new cardstock bands. Attack enters smoothly; sustain carries the packet; release
+returns to the resting ribbon. Existing continuous phase is never reset at onset.
+If several notes share a wave, their envelope-weighted packet positions combine
+continuously; they do not steal or restart each other's phase. The manual tuning
+trigger is also an event: during a run it is heard and shown at the same transport beat.
 
-### Tonal constraint
+The nonblocking monitor shows active notes, role, ADSR, source bank, actual octave,
+wave assignment, and scheduled starts/lengths. Its frozen/fast-review view is inspection
+only; it does not seek playback. Structural diagnostics are cached per plan rather
+than recomputed for every animation frame.
 
-The selected scale or mode is the performance's **tonal constraint**. It limits which
-recorded notes a generative rule may choose and may later include a root, register,
-allowed intervals, chord tones, tension tones, and voice-leading rules. Lydian is a
-promising direction for the calm opening scene, but it is not locked until the first
-Ableton recordings are auditioned in the app.
+## Sound pools and visual evolution
 
-Plans are materialized once from stable named random streams. The scheduler never
-rolls randomness per frame. Missed or expired moments are not replayed after resume.
+Night, Twilight, and Daylight are the three semantic pools. For progress p:
 
-## Wave score
+- 0…0.5: weights are Night = 1−2p, Twilight = 2p, Daylight = 0.
+- 0.5…1: weights are Night = 0, Twilight = 2−2p, Daylight = 2p−1.
 
-The splash wave field is a continuous generative performance. Each ribbon has a stable
-identity and a deterministic oscillator configuration containing an absolute spatial
-centerline, independent phase, temporal rate, amplitude modulation, wavelength
-modulation, thickness field, and future musical voice assignment. A shared outer
-envelope constrains only the composition boundary; it does not transport the internal
-ribbons up and down.
+Each event deterministically selects its pool from its onset progress, run seed, and
+event identity. It holds that source through its release. Long overlaps therefore
+blend banks naturally; a held note is never replaced at a pool boundary.
 
-The field has two behaviors:
+The same progress drives the approved native Metal sunrise: sun rise, cloud lighting,
+atmospheric scattering, and paper-color treatment. Do not replace it with an even
+whole-screen RGB fade. See [Splash sunrise model](../design/splash-sunrise-model.md).
+Cloud artwork and its ray-blocking shapes share geometry and depth.
 
-- continuous, slow analytic motion sampled from elapsed time;
-- sparse directed accents represented as shared visual/audio moments.
+## Temporary audio implementation
 
-At rest, the generated geometry must retain the approved reference's silhouette,
-varied ribbon thickness, phase counterpoint, and responsive crop. Across time, sampled
-frames must stay inside the same visual bounds. Animation remains deferred until the
-static field is accepted.
+The audition uses native AVAudioEngine and AVAudioSourceNode, not JavaScript, MIDI
+sent to another app, bundled samples, or a second transport. Immutable prepared voices
+retain the canonical score event and selected semantic source key.
 
-## Future audio asset intake
+The source callback maps the audio host timestamp to session elapsed seconds using
+one start anchor; it samples only voices intersecting the requested audio block.
+Audio callbacks are explicitly sendable and do not inherit main-actor isolation.
+They perform no file I/O, random selection, or score mutation. A mixer tap reports
+actual output level to the debug desk, so a successful engine start is not mistaken
+for nonzero output.
 
-The system should accept both individually recorded synth notes and authored stems.
-Before production recording, define a small delivery contract covering note and octave,
-tuning reference, articulation or variation, sample rate and bit depth, attack and full
-release tail, loop points where applicable, tempo and bar markers for phrases, and the
-intended audio bus. Preserve raw recordings; normalization and app encoding are derived
-steps.
+The drone and pads use quiet harmonic synthesis with a slow spectral-tilt modulation;
+the melodic voice has decaying bell-like partials. Pool choices alter harmonic
+brightness. Gain is conservative and output is soft-limited. Resume/unmute has a
+short click-prevention ramp; pause/end fades output briefly. These are audition
+instruments, not an assertion that the final music is approved.
 
-## Non-goals for the current wave pass
+The app uses an ambient, mixing audio session and respects silent mode. Existing
+focus-story `StoryAudioEngine` remains silent; it has not been silently switched to
+this splash audition.
 
-- No production audio engine or imported music assets.
-- No final harmonic language, scale, tempo, instrumentation, or mix decisions.
-- No visible idle animation, note triggering, or entrance/exit choreography.
-- No independent subsystem clocks and no renderer-to-audio callbacks.
-- No broad rewrite of the working Autumn scheduling and reconciliation behavior.
+Relevant Apple API contracts:
+[Source render callback](https://developer.apple.com/documentation/avfaudio/avaudiosourcenoderenderblock)
+and [host-time conversion](https://developer.apple.com/documentation/avfaudio/avaudiotime/seconds(forhosttime:)).
 
-## Incremental migration
+## Recording intake and future scenes
 
-1. Accept the static analytic wave field and its reference-derived scoring.
-2. Introduce reusable envelope and performance-time value types when the first real
-   motion/audio consumer requires them.
-3. Adapt `StoryPlayer` and the splash to the shared lower-level clock without changing
-   story-owned direction.
-4. Add production audio scheduling behind the existing audio protocol.
-5. Add authored beds and directed event voices after the recording contract and first
-   assets are available.
+Retain `SplashSoundAssetKey` as the source lookup contract: pool, role, tonal slot,
+octave offset. Original recordings can replace the audition voice without changing
+score timing, wave envelopes, or bank selection. Provide long pad/drone notes and
+short melodic articulations separately, with note/octave, tuning, sample format,
+full release tail, loop metadata where applicable, and tempo markers for phrases.
+Do not discard originals or normalize them destructively.
+
+The Autumn adapter should consume the same transport progress for leaf evolution and
+shared moments for synchronized cues, while retaining its own director and geometry.
+Do that as a separate scoped integration after the splash checkpoint is accepted.
+
+## Verification and limits
+
+Automated checks cover pause/resume persistence, deterministic seeds, finite endings,
+drone continuity, active-wave density, event/audio envelope identity, source-key
+stability, offline PCM output, live mixer output, and nonblocking playback controls.
+Use the one-minute rendered audition to evaluate musical structure, then audition
+longer sessions before accepting final harmony or mix.
+
+Existing intro/exit choreography and the approved sun/cloud scene are preserved.
+The desktop simulator is a functional check, not physical-device latency, battery,
+or audio-route qualification. Production recordings, full background playback, and
+final musical taste approval remain outstanding.

@@ -1,4 +1,5 @@
 import XCTest
+import AVFoundation
 #if canImport(UIKit)
 import UIKit
 import SpriteKit
@@ -8,6 +9,135 @@ import CryptoKit
 @testable import PlanetCalm
 
 final class PlanetCalmTests: XCTestCase {
+    @MainActor
+    func testMusicRunnerLiveAudioOutput() async throws {
+        let synth = PerformanceSynthesizer()
+        let session = PerformanceSession(duration: .oneMinute,
+            startedAt: Date().addingTimeInterval(-12), randomSeed: 650_208)
+        synth.play(session: session, events: SplashMusicDirector.events(for: session))
+        for _ in 0..<30 {
+            if synth.outputLevel > 0.001 { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertGreaterThan(synth.outputLevel, 0.001, synth.status)
+        print("Live synth output peak: \(synth.outputLevel)")
+        synth.stop()
+        XCTAssertEqual(synth.outputLevel, 0)
+    }
+
+    func testMusicRunnerPauseResumeAndPersistence() throws {
+        let start = Date(timeIntervalSince1970: 1_000)
+        var session = PerformanceSession(duration: .fiveMinutes, startedAt: start, randomSeed: 42)
+        session.pause(at: start.addingTimeInterval(40))
+        session.pause(at: start.addingTimeInterval(60))
+        XCTAssertEqual(session.elapsedTime(at: start.addingTimeInterval(100)), 40)
+        XCTAssertEqual(session.remainingTime(at: start.addingTimeInterval(100)), 260)
+        session = try JSONDecoder().decode(PerformanceSession.self, from: JSONEncoder().encode(session))
+        XCTAssertTrue(session.isPaused)
+        session.resume(at: start.addingTimeInterval(100))
+        XCTAssertEqual(session.elapsedTime(at: start.addingTimeInterval(110)), 50)
+        XCTAssertEqual(session.progress(at: start.addingTimeInterval(360)), 1)
+        XCTAssertEqual(session.focusSession(for: .autumnTree).elapsedTime(at: start.addingTimeInterval(110)), 50)
+    }
+
+    func testMusicRunnerFiniteScoreContinuityAndDeterminism() {
+        for duration in [FocusDuration.oneMinute, .fiveMinutes, .fiftyMinutes] {
+            for seed: UInt64 in [42, 650_208, 91_337] {
+                let session = PerformanceSession(duration: duration, randomSeed: seed)
+                let events = SplashMusicDirector.events(for: session)
+                XCTAssertEqual(events, SplashMusicDirector.events(for: session))
+                XCTAssertEqual(Set(events.map(\.id)).count, events.count)
+                XCTAssertTrue(events.contains { $0.role == .drone })
+                XCTAssertTrue(events.contains { $0.role == .melody })
+                let endBeat = duration.timeInterval / SplashPerformanceScore.tempo.secondsPerBeat
+                for event in events {
+                    XCTAssertFalse(event.isRepeating)
+                    XCTAssertLessThanOrEqual(event.endBeat, endBeat + 0.000001)
+                    XCTAssertGreaterThanOrEqual(event.gateBeats, event.envelope.attackBeats + event.envelope.decayBeats)
+                    XCTAssertTrue((0...7).contains(event.tonalSlot))
+                }
+                for beat in stride(from: 5.0, to: endBeat - 7, by: 1) {
+                    let active = events.filter { ($0.sample(at: beat)?.value ?? 0) > 0.015 }
+                    XCTAssertGreaterThanOrEqual(Set(active.map(\.tonalSlot)).count, 3, "seed \(seed), beat \(beat)")
+                    XCTAssertLessThanOrEqual(active.count, 12)
+                    XCTAssertTrue(active.contains { $0.role == .drone }, "Drone gap at \(beat)")
+                }
+                XCTAssertEqual(SplashPerformanceScore.diagnostics(
+                    durationMinutes: duration.timeInterval / 60, events: events).longestSilentBeats, 0)
+                let all = SplashPerformanceScore.scheduledEvents(around: endBeat / 2,
+                    radiusBeats: endBeat / 2, events: events)
+                XCTAssertEqual(all.count, events.count, "Finite events must not repeat")
+                XCTAssertTrue(SplashPerformanceScore.scheduledEvents(around: endBeat + 50,
+                    radiusBeats: 10, events: events).isEmpty)
+            }
+        }
+        let a = SplashMusicDirector.events(for: .init(duration: .fiveMinutes, randomSeed: 42))
+        let b = SplashMusicDirector.events(for: .init(duration: .fiveMinutes, randomSeed: 43))
+        XCTAssertNotEqual(a, b)
+    }
+
+    func testMusicRunnerAudioAndVisualShareEvents() {
+        let session = PerformanceSession(duration: .fiveMinutes, randomSeed: 42)
+        let events = SplashMusicDirector.events(for: session)
+        let plan = SplashPerformancePlan(session: session, scoreEvents: events)
+        for event in events {
+            let scheduled = SplashScheduledPerformanceEvent(event: event, scheduledStartBeat: event.startBeat)
+            let key = plan.soundSource(for: scheduled)
+            let voice = PerformanceSynthVoice(event: event, source: key)
+            XCTAssertEqual(key.octaveOffset, event.octaveOffset)
+            XCTAssertEqual(voice.event, event)
+            XCTAssertEqual(voice.sample(at: (event.startBeat - 0.001) * voice.secondsPerBeat), 0)
+            XCTAssertEqual(voice.sample(at: (event.endBeat + 0.001) * voice.secondsPerBeat), 0)
+            let middle = event.startBeat + event.totalBeats * 0.5
+            XCTAssertEqual(SplashPerformanceScore.scheduledSample(for: event, scoreBeat: middle)?.envelope,
+                           event.sample(at: middle))
+            XCTAssertEqual(key, plan.soundSource(for: scheduled))
+        }
+    }
+
+    func testMusicRunnerRendersAudition() throws {
+        let session = PerformanceSession(duration: .oneMinute, randomSeed: 650_208)
+        let events = SplashMusicDirector.events(for: session)
+        let plan = SplashPerformancePlan(session: session, scoreEvents: events)
+        let voices = events.map { PerformanceSynthVoice(event: $0,
+            source: plan.soundSource(for: .init(event: $0, scheduledStartBeat: $0.startBeat))) }
+        let rate = 22050.0
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("splash-synth-audition.wav")
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024))
+        var peak = 0.0
+        var energy = 0.0
+        let frameCount = Int(session.duration.timeInterval * rate)
+        for blockStart in stride(from: 0, to: frameCount, by: 1024) {
+            let count = min(1024, frameCount - blockStart)
+            buffer.frameLength = AVAudioFrameCount(count)
+            let active = voices.filter {
+                $0.event.endBeat * $0.secondsPerBeat > Double(blockStart) / rate
+                    && $0.event.startBeat * $0.secondsPerBeat < Double(blockStart + count) / rate
+            }
+            let data = try XCTUnwrap(buffer.floatChannelData?[0])
+            for frame in 0..<count {
+                let time = Double(blockStart + frame) / rate
+                let value = tanh(active.reduce(0.0) { $0 + $1.sample(at: time) }) * 0.65
+                XCTAssertTrue(value.isFinite)
+                data[frame] = Float(value)
+                peak = max(peak, abs(value))
+                energy += value * value
+            }
+            try file.write(from: buffer)
+        }
+        XCTAssertGreaterThan(peak, 0.02)
+        XCTAssertLessThan(peak, 0.7)
+        XCTAssertGreaterThan(sqrt(energy / Double(frameCount)), 0.005)
+        print("Synth audition peak=\(peak), RMS=\(sqrt(energy / Double(frameCount))), events=\(events.count)")
+        let attachment = XCTAttachment(contentsOfFile: url)
+        attachment.name = "splash-synth-audition.wav"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+
     func testStoryChooserKeepsSmallSquarePreviewsAcrossDevices() {
         let phone = StoryChooserLayout(
             size: CGSize(width: 430, height: 932),
@@ -44,6 +174,915 @@ final class PlanetCalmTests: XCTestCase {
         )
         XCTAssertEqual(SplashLotusPetalID.allCases.count, 8)
     }
+
+    func testPerformanceClockUsesStableElapsedTime() {
+        let start = Date(timeIntervalSinceReferenceDate: 1_000)
+        let clock = PerformanceClock(startedAt: start)
+
+        XCTAssertEqual(clock.elapsed(at: start.addingTimeInterval(2.5)), 2.5)
+        XCTAssertEqual(clock.elapsed(at: start.addingTimeInterval(-1)), 0)
+        XCTAssertEqual(clock.startedAt, start)
+    }
+
+    func testPerformanceRunnerIsAStableResumableTransport() {
+        let start = Date(timeIntervalSinceReferenceDate: 4_000)
+        let session = PerformanceSession(
+            duration: .oneMinute,
+            startedAt: start,
+            randomSeed: 42
+        )
+        let runner = PerformanceRunner(session: session)
+
+        let middle = runner.sample(at: start.addingTimeInterval(30))
+        XCTAssertEqual(middle.elapsedTime, 30)
+        XCTAssertEqual(middle.progress, 0.5)
+        XCTAssertEqual(middle.remainingTime, 30)
+        XCTAssertFalse(middle.isComplete)
+
+        let completed = runner.sample(at: start.addingTimeInterval(90))
+        XCTAssertEqual(completed.elapsedTime, 60)
+        XCTAssertEqual(completed.progress, 1)
+        XCTAssertEqual(completed.remainingTime, 0)
+        XCTAssertTrue(completed.isComplete)
+    }
+
+    func testSplashPerformancePlanKeepsOneSeededSoundChoicePerEvent() {
+        let session = PerformanceSession(
+            duration: .twoMinutes,
+            startedAt: .distantPast,
+            randomSeed: 8_173
+        )
+        let plan = SplashPerformancePlan(
+            session: session,
+            scoreEvents: SplashPerformanceScore.events(seed: session.randomSeed)
+        )
+        let scheduled = SplashScheduledPerformanceEvent(
+            event: SplashPerformanceScore.noteEvents[3],
+            scheduledStartBeat: 44
+        )
+
+        let firstSelection = plan.soundSource(for: scheduled)
+        XCTAssertEqual(firstSelection, plan.soundSource(for: scheduled))
+        XCTAssertEqual(firstSelection.tonalSlot, scheduled.event.tonalSlot)
+        XCTAssertEqual(firstSelection.role, .pad)
+    }
+
+    func testAtmosphereUsesContinuousVisualAndMusicalPoolCrossfades() {
+        let night = SplashAtmosphereDirector.sample(progress: 0)
+        XCTAssertEqual(night.palette, .night)
+        XCTAssertEqual(night.weights.night, 1)
+        XCTAssertEqual(night.weights.twilight, 0)
+        XCTAssertEqual(night.weights.daylight, 0)
+
+        let firstCrossfade = SplashAtmosphereDirector.sample(progress: 0.25)
+        XCTAssertEqual(firstCrossfade.weights.night, 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(firstCrossfade.weights.twilight, 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(firstCrossfade.weights.daylight, 0)
+
+        let twilight = SplashAtmosphereDirector.sample(progress: 0.5)
+        XCTAssertEqual(twilight.palette, .twilight)
+        XCTAssertEqual(twilight.weights.night, 0)
+        XCTAssertEqual(twilight.weights.twilight, 1)
+
+        let daylight = SplashAtmosphereDirector.sample(progress: 1)
+        XCTAssertEqual(daylight.palette, .daylight)
+        XCTAssertEqual(daylight.weights.night, 0)
+        XCTAssertEqual(daylight.weights.twilight, 0)
+        XCTAssertEqual(daylight.weights.daylight, 1)
+
+        XCTAssertEqual(
+            SplashAtmosphereDirector.sample(
+                at: SplashAtmosphereDirector.suggestedCycleDuration
+            ),
+            daylight
+        )
+    }
+
+    func testFutureSoundSelectionIsDeterministicAndKeepsPoolAtEventStart() {
+        let daylight = SplashAtmosphereDirector.sample(progress: 1)
+        let selection = SplashAtmosphereDirector.soundSource(
+            eventOrdinal: 12,
+            tonalSlot: 5,
+            role: .pad,
+            atmosphere: daylight,
+            octaveOffset: 1
+        )
+        XCTAssertEqual(selection.pool, .daylight)
+        XCTAssertEqual(selection.role, .pad)
+        XCTAssertEqual(selection.tonalSlot, 5)
+        XCTAssertEqual(selection.octaveOffset, 1)
+        XCTAssertEqual(
+            selection,
+            SplashAtmosphereDirector.soundSource(
+                eventOrdinal: 12,
+                tonalSlot: 5,
+                role: .pad,
+                atmosphere: daylight,
+                octaveOffset: 1
+            )
+        )
+
+        let blend = SplashAtmosphereDirector.sample(progress: 0.25)
+        let selectedPools = Set((0..<64).map {
+            SplashAtmosphereDirector.soundSource(
+                eventOrdinal: $0,
+                tonalSlot: $0 % 8,
+                role: .melodicOneShot,
+                atmosphere: blend
+            ).pool
+        })
+        XCTAssertTrue(selectedPools.contains(.night))
+        XCTAssertTrue(selectedPools.contains(.twilight))
+        XCTAssertFalse(selectedPools.contains(.daylight))
+    }
+
+    func testSunriseGeometryAndTransportAgreement() {
+        for size in [CGSize(width: 393, height: 852), CGSize(width: 852, height: 393),
+                     CGSize(width: 820, height: 1180), CGSize(width: 1180, height: 820)] {
+            let layout = SplashLayout(size: size)
+            let first = layout.risingSunCenter(progress: 0)
+            XCTAssertEqual(layout.sunriseHorizon - (first.y - layout.sunDiameter / 2),
+                           layout.sunDiameter * 0.1, accuracy: 0.0001)
+            XCTAssertEqual(layout.risingSunCenter(progress: 1), layout.sunCenter)
+            var previousY = first.y
+            for step in 0...20 {
+                let center = layout.risingSunCenter(progress: Double(step) / 20)
+                XCTAssertLessThanOrEqual(center.y, previousY)
+                XCTAssertEqual(center.x, layout.sunCenter.x)
+                previousY = center.y
+            }
+        }
+        let startedAt = Date(timeIntervalSince1970: 1000)
+        for duration in [FocusDuration.oneMinute, .twoMinutes] {
+            let session = PerformanceSession(duration: duration, startedAt: startedAt, randomSeed: 42)
+            for step in 0...20 {
+                let progress = Double(step) / 20
+                let time = startedAt.addingTimeInterval(duration.timeInterval * progress)
+                let automatic = SplashAtmosphereDirector.sample(progress: PerformanceRunner(session: session).sample(at: time).progress)
+                let manual = SplashAtmosphereDirector.sample(progress: progress)
+                XCTAssertEqual(automatic.sunrise, manual.sunrise)
+                XCTAssertEqual(automatic.weights, manual.weights)
+            }
+        }
+        XCTAssertEqual(SplashSunriseState(progress: -.infinity).progress, 0)
+        XCTAssertEqual(SplashSunriseState(progress: 2).progress, 1)
+        let samples = (0...20).map { SplashSunriseState(progress: Double($0) / 20) }
+        XCTAssertEqual(samples.first!.solarElevationRadians, -0.004, accuracy: 0.00001)
+        XCTAssertEqual(samples.last!.solarElevationRadians, 0.21, accuracy: 0.00001)
+        XCTAssertTrue(zip(samples, samples.dropFirst()).allSatisfy {
+            $0.exposure <= $1.exposure && $0.paperSpread <= $1.paperSpread
+        })
+    }
+
+    func testWarmPerceptualPaletteRouteAvoidsTheOldOliveMidpoint() {
+        let twilightCanvas = SplashAtmospherePalette.twilight.canvas
+        let daylightCanvas = SplashAtmospherePalette.daylight.canvas
+        let oldRGBMidpoint = SplashColorComponents(
+            twilightCanvas.red + (daylightCanvas.red - twilightCanvas.red) * 0.36,
+            twilightCanvas.green + (daylightCanvas.green - twilightCanvas.green) * 0.36,
+            twilightCanvas.blue + (daylightCanvas.blue - twilightCanvas.blue) * 0.36
+        )
+        let warmMidpoint = twilightCanvas.blended(
+            toward: daylightCanvas,
+            amount: 0.36,
+            hueRoute: .warm
+        )
+
+        XCTAssertGreaterThan(oldRGBMidpoint.green, oldRGBMidpoint.blue)
+        XCTAssertGreaterThan(warmMidpoint.red, warmMidpoint.green)
+    }
+
+    func testSplashPerformanceUsesApprovedTempoAndMeditativeOverlappingTravel() {
+        XCTAssertEqual(SplashPerformanceScore.tempo.beatsPerMinute, 65)
+        XCTAssertEqual(SplashPerformanceScore.tempo.beatsPerBar, 4)
+        XCTAssertEqual(
+            SplashPerformanceScore.tempo.secondsPerBeat,
+            60.0 / 65.0,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(SplashPerformanceScore.droneStartTime, 0)
+        XCTAssertEqual(SplashPerformanceScore.noteCycleBeats, 32)
+        XCTAssertEqual(
+            SplashMotionTiming.ribbonEntranceCompleteTime,
+            3.51,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            SplashMotionTiming.entranceCompleteTime,
+            SplashLotusChoreography.entryEnd,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            SplashMotionTiming.entranceCompleteTime,
+            4.46,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            SplashMotionTiming.interactionReadyTime,
+            3.51,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            SplashMotionTiming.exitCompleteTime,
+            1.50,
+            accuracy: 0.000_001
+        )
+
+        XCTAssertEqual(SplashMotionTiming.entryProgress(for: 0, elapsed: 0), 0)
+        XCTAssertEqual(SplashMotionTiming.entryProgress(for: 0, elapsed: 2.25), 1)
+        XCTAssertEqual(SplashMotionTiming.entryProgress(for: 7, elapsed: 1.50), 0)
+        XCTAssertEqual(
+            SplashMotionTiming.entryProgress(
+                for: 7,
+                elapsed: SplashMotionTiming.ribbonEntranceCompleteTime
+            ),
+            1,
+            accuracy: 0.000_001
+        )
+
+        XCTAssertEqual(
+            SplashMotionTiming.exitProgress(for: 7, count: 8, elapsed: 1.15),
+            1
+        )
+        XCTAssertEqual(
+            SplashMotionTiming.exitProgress(for: 0, count: 8, elapsed: 1.50),
+            1
+        )
+    }
+
+    func testSplashWaveVoicesHaveStableTonalSlotsAndScoredPolyphony() {
+        let voices = SplashPerformanceScore.waveVoices
+        XCTAssertEqual(voices.count, SplashMotionTiming.ribbonCount)
+        XCTAssertEqual(Set(voices.map(\.tonalSlot)), Set(0..<8))
+        XCTAssertEqual(Set(voices.map { $0.actorID.rawValue }).count, 8)
+        XCTAssertEqual(
+            Set(SplashPerformanceScore.noteEvents.map(\.tonalSlot)),
+            Set(0..<8)
+        )
+
+        var stablePolyphony = Set<Int>()
+        for step in 320...640 {
+            let scoreBeat = Double(step) / 10
+            let cycleBeat = scoreBeat.truncatingRemainder(
+                dividingBy: SplashPerformanceScore.noteCycleBeats
+            )
+            let activeCount = SplashPerformanceScore.noteEvents.filter {
+                SplashPerformanceScore.repeatingSample(
+                    for: $0,
+                    scoreBeat: scoreBeat,
+                    cycleBeat: cycleBeat
+                ) != nil
+            }.count
+            stablePolyphony.insert(activeCount)
+        }
+        XCTAssertEqual(stablePolyphony, [4])
+
+        let attackElapsed = SplashMotionTiming.noteScoreStartTime
+            + 3 * SplashPerformanceScore.tempo.secondsPerBeat
+        let attackSamples = voices.map {
+            SplashPerformanceScore.waveMotionSample(
+                for: $0.actorID,
+                performanceElapsed: attackElapsed
+            )
+        }
+        XCTAssertEqual(attackSamples.filter { $0.amplitude > 0 }.count, 1)
+        XCTAssertEqual(attackSamples.filter { $0.bedAmplitude > 0 }.count, 4)
+        XCTAssertEqual(attackSamples.filter(\.isMoving).count, 4)
+        XCTAssertTrue(attackSamples.allSatisfy {
+            $0.amplitude >= 0
+                && $0.amplitude
+                    <= SplashMotionTiming.maximumMotionAmount + 0.000_001
+        })
+
+        let firstEvent = SplashPerformanceScore.noteEvents[0]
+        let nearStart = firstEvent.sample(at: firstEvent.startBeat + 0.25)
+        let nearEnd = firstEvent.sample(at: firstEvent.endBeat - 0.25)
+        XCTAssertNotNil(nearStart)
+        XCTAssertNotNil(nearEnd)
+        XCTAssertEqual(
+            firstEvent.sample(at: firstEvent.startBeat - 0.01),
+            nil
+        )
+        XCTAssertEqual(
+            firstEvent.sample(at: firstEvent.endBeat),
+            nil
+        )
+    }
+
+    func testSplashPresentationSeparatesTravelFromLivingMotion() {
+        let initial = SplashScenePresentation.sample(
+            performanceElapsed: 0,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        XCTAssertFalse(initial.isInteractive)
+        XCTAssertEqual(initial.waveMotionAmount, 0)
+        XCTAssertEqual(
+            initial.horizontalTravelFactor(
+                forWaveAt: 0,
+                edge: .trailing,
+                count: 8
+            ),
+            1
+        )
+
+        let settled = SplashScenePresentation.sample(
+            performanceElapsed: SplashMotionTiming.entranceCompleteTime,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        XCTAssertTrue(settled.isInteractive)
+        XCTAssertEqual(
+            settled.horizontalTravelFactor(
+                forWaveAt: 0,
+                edge: .trailing,
+                count: 8
+            ),
+            0
+        )
+
+        let almostReady = SplashScenePresentation.sample(
+            performanceElapsed: SplashMotionTiming.interactionReadyTime - 0.01,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        let readyDuringFlowers = SplashScenePresentation.sample(
+            performanceElapsed: SplashMotionTiming.interactionReadyTime,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        XCTAssertFalse(almostReady.isInteractive)
+        XCTAssertTrue(readyDuringFlowers.isInteractive)
+        XCTAssertGreaterThan(settled.waveMotionAmount, 0)
+
+        let activeNoteElapsed = SplashMotionTiming.noteScoreStartTime
+            + 3 * SplashPerformanceScore.tempo.secondsPerBeat
+        let living = SplashScenePresentation.sample(
+            performanceElapsed: activeNoteElapsed,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        XCTAssertGreaterThan(living.waveMotionAmount, 0)
+        XCTAssertGreaterThan(living.waveMotionPhase, 0)
+
+        let exiting = SplashScenePresentation.sample(
+            performanceElapsed: 30,
+            exitElapsed: SplashMotionTiming.exitCompleteTime,
+            reduceMotion: false
+        )
+        XCTAssertFalse(exiting.isInteractive)
+        XCTAssertEqual(
+            exiting.horizontalTravelFactor(
+                forWaveAt: 0,
+                edge: .trailing,
+                count: 8
+            ),
+            -1
+        )
+
+        let reduced = SplashScenePresentation.sample(
+            performanceElapsed: 30,
+            exitElapsed: 0.4,
+            reduceMotion: true
+        )
+        XCTAssertEqual(reduced, .presented)
+        XCTAssertTrue(reduced.isInteractive)
+    }
+
+    func testSplashDroneAndPadsBeginWithIntroWithoutChangingZeroAmountGeometry() {
+        XCTAssertEqual(
+            SplashMotionTiming.noteScoreTime(
+                at: SplashMotionTiming.entranceCompleteTime
+            ),
+            SplashMotionTiming.entranceCompleteTime
+        )
+        XCTAssertEqual(
+            SplashMotionTiming.noteScoreTime(
+                at: SplashMotionTiming.noteScoreStartTime
+            ),
+            0
+        )
+
+        let activePresentation = SplashScenePresentation.sample(
+            performanceElapsed: SplashMotionTiming.entranceCompleteTime,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        let activeSamples = SplashWaveGenerator.formulas.map {
+            activePresentation.waveMotionSample(for: $0.id)
+        }
+        XCTAssertEqual(activeSamples.filter(\.isMoving).count, 4)
+
+        for step in 0...640 {
+            let elapsed = SplashMotionTiming.entranceCompleteTime
+                + Double(step) / 10 * SplashPerformanceScore.tempo.secondsPerBeat
+            let samples = SplashPerformanceScore.waveVoices.map {
+                SplashPerformanceScore.waveMotionSample(
+                    for: $0.actorID,
+                    performanceElapsed: elapsed
+                )
+            }
+            XCTAssertEqual(
+                samples.filter(\.isMoving).count,
+                4,
+                "Expected four active ribbon actors at elapsed \(elapsed)"
+            )
+        }
+
+        let resting = SplashWaveGenerator.ribbons()
+        let scoredRest = SplashWaveGenerator.ribbons(motionAmount: 0)
+        XCTAssertEqual(resting.count, scoredRest.count)
+        for index in resting.indices {
+            XCTAssertEqual(resting[index].top, scoredRest[index].top)
+            XCTAssertEqual(resting[index].bottom, scoredRest[index].bottom)
+        }
+    }
+
+    func testSplashLotusesCascadeByPetalAndExitInExactReverse() {
+        let beforeEntry = SplashLotusChoreography.sample(
+            for: .lotusLeft,
+            entryElapsed: SplashLotusChoreography.firstStart
+        )
+        XCTAssertEqual(beforeEntry, .hidden)
+
+        let leftMidFanTime = SplashLotusChoreography.firstStart + 0.25
+        let leftMidFan = SplashLotusChoreography.sample(
+            for: .lotusLeft,
+            entryElapsed: leftMidFanTime
+        )
+        XCTAssertGreaterThan(leftMidFan.centerOpacity, 0)
+        XCTAssertGreaterThan(leftMidFan.fanProgress, 0)
+        XCTAssertEqual(leftMidFan.heartOpacity, 0)
+
+        let cascadeTime = SplashLotusChoreography.firstStart
+            + SplashLotusChoreography.cascadeStagger
+            + 0.42
+        let left = SplashLotusChoreography.sample(
+            for: .lotusLeft,
+            entryElapsed: cascadeTime
+        )
+        let center = SplashLotusChoreography.sample(
+            for: .lotusCenter,
+            entryElapsed: cascadeTime
+        )
+        let right = SplashLotusChoreography.sample(
+            for: .lotusRight,
+            entryElapsed: cascadeTime
+        )
+        XCTAssertGreaterThan(left.fanProgress, center.fanProgress)
+        XCTAssertGreaterThan(center.centerOpacity, right.centerOpacity)
+
+        let entryElapsed = SplashLotusChoreography.firstStart + 0.55
+        let exitElapsed = (
+            SplashLotusChoreography.entryEnd - entryElapsed
+        ) / SplashLotusChoreography.activeDuration
+            * SplashLotusChoreography.exitDuration
+        let entering = SplashScenePresentation.sample(
+            performanceElapsed: entryElapsed,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        let exiting = SplashScenePresentation.sample(
+            performanceElapsed: 30,
+            exitElapsed: exitElapsed,
+            reduceMotion: false
+        )
+        for actorID in SplashLotusChoreography.order {
+            XCTAssertEqual(
+                entering.lotusAnimation(for: actorID),
+                exiting.lotusAnimation(for: actorID)
+            )
+        }
+
+        let completedExit = SplashScenePresentation.sample(
+            performanceElapsed: 30,
+            exitElapsed: SplashLotusChoreography.exitDuration,
+            reduceMotion: false
+        )
+        for actorID in SplashLotusChoreography.order {
+            XCTAssertEqual(completedExit.lotusAnimation(for: actorID), .hidden)
+        }
+
+        let interruptedEntryElapsed = SplashLotusChoreography.firstStart + 0.30
+        let justBeforeExit = SplashScenePresentation.sample(
+            performanceElapsed: interruptedEntryElapsed,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        let exitStart = SplashScenePresentation.sample(
+            performanceElapsed: interruptedEntryElapsed,
+            exitElapsed: 0,
+            reduceMotion: false
+        )
+        for actorID in SplashLotusChoreography.order {
+            XCTAssertEqual(
+                exitStart.lotusAnimation(for: actorID),
+                justBeforeExit.lotusAnimation(for: actorID)
+            )
+        }
+    }
+
+    func testSplashRibbonUnfurlUsesZeroWidthProceduralFrontiers() {
+        let ribbons = SplashWaveGenerator.ribbons(motionAmount: 0)
+        let trailingRibbon = ribbons[0]
+        let leadingRibbon = ribbons[1]
+
+        let leadingEntry = SplashWaveGenerator.applying(
+            .entering(progress: 0.42, edge: .leading),
+            to: leadingRibbon
+        )
+        XCTAssertEqual(leadingEntry.top.last!.x, 0.42, accuracy: 0.000_001)
+        XCTAssertEqual(leadingEntry.bottom.last!.x, 0.42, accuracy: 0.000_001)
+        XCTAssertEqual(leadingEntry.top.last!.y, leadingEntry.bottom.last!.y, accuracy: 0.000_001)
+        XCTAssertGreaterThan(leadingEntry.bottom.first!.y - leadingEntry.top.first!.y, 0.01)
+
+        let trailingEntry = SplashWaveGenerator.applying(
+            .entering(progress: 0.42, edge: .trailing),
+            to: trailingRibbon
+        )
+        XCTAssertEqual(trailingEntry.top.first!.x, 0.58, accuracy: 0.000_001)
+        XCTAssertEqual(trailingEntry.bottom.first!.x, 0.58, accuracy: 0.000_001)
+        XCTAssertEqual(trailingEntry.top.first!.y, trailingEntry.bottom.first!.y, accuracy: 0.000_001)
+
+        let leadingExit = SplashWaveGenerator.applying(
+            .exiting(progress: 0.55, entryEdge: .leading),
+            to: leadingRibbon
+        )
+        XCTAssertEqual(leadingExit.top.first!.x, 0.55, accuracy: 0.000_001)
+        XCTAssertEqual(leadingExit.top.first!.y, leadingExit.bottom.first!.y, accuracy: 0.000_001)
+
+        let trailingExit = SplashWaveGenerator.applying(
+            .exiting(progress: 0.55, entryEdge: .trailing),
+            to: trailingRibbon
+        )
+        XCTAssertEqual(trailingExit.top.last!.x, 0.45, accuracy: 0.000_001)
+        XCTAssertEqual(trailingExit.top.last!.y, trailingExit.bottom.last!.y, accuracy: 0.000_001)
+
+        let completedEntry = SplashWaveGenerator.applying(
+            .entering(progress: 1, edge: .leading),
+            to: leadingRibbon
+        )
+        XCTAssertEqual(completedEntry.top, leadingRibbon.top)
+        XCTAssertEqual(completedEntry.bottom, leadingRibbon.bottom)
+
+        let notStarted = SplashWaveGenerator.applying(
+            .entering(progress: 0, edge: .leading),
+            to: leadingRibbon
+        )
+        let completedExit = SplashWaveGenerator.applying(
+            .exiting(progress: 1, entryEdge: .leading),
+            to: leadingRibbon
+        )
+        XCTAssertTrue(notStarted.top.isEmpty)
+        XCTAssertTrue(notStarted.bottom.isEmpty)
+        XCTAssertTrue(completedExit.top.isEmpty)
+        XCTAssertTrue(completedExit.bottom.isEmpty)
+    }
+
+    func testSplashNotePacketsAreDeterministicLocalizedAndRestrained() {
+        let activeElapsed = SplashMotionTiming.noteScoreStartTime
+            + 5 * SplashPerformanceScore.tempo.secondsPerBeat
+        let presentation = SplashScenePresentation.sample(
+            performanceElapsed: activeElapsed,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        let resting = SplashWaveGenerator.ribbons()
+        let motionSamples = SplashWaveGenerator.formulas.map {
+            presentation.waveMotionSample(for: $0.id)
+        }
+        XCTAssertEqual(motionSamples.filter { $0.amplitude > 0 }.count, 2)
+
+        let packetOnlySamples = motionSamples.map {
+            SplashWaveMotionSample(
+                phase: $0.phase,
+                amplitude: $0.amplitude,
+                packetCenter: $0.packetCenter,
+                packetHalfWidth: $0.packetHalfWidth
+            )
+        }
+
+        let firstSample = SplashWaveGenerator.ribbons(
+            motionSamples: packetOnlySamples
+        )
+        let secondSample = SplashWaveGenerator.ribbons(
+            motionSamples: packetOnlySamples
+        )
+
+        var maximumDisplacement: CGFloat = 0
+        var changedSamples = 0
+        var unchangedSamplesOutsidePackets = 0
+
+        for index in resting.indices {
+            XCTAssertEqual(firstSample[index].top, secondSample[index].top)
+            XCTAssertEqual(firstSample[index].bottom, secondSample[index].bottom)
+
+            for sampleIndex in resting[index].top.indices {
+                let x = resting[index].top[sampleIndex].x
+                let topDelta = abs(
+                    firstSample[index].top[sampleIndex].y
+                        - resting[index].top[sampleIndex].y
+                )
+                let bottomDelta = abs(
+                    firstSample[index].bottom[sampleIndex].y
+                        - resting[index].bottom[sampleIndex].y
+                )
+                maximumDisplacement = max(maximumDisplacement, topDelta, bottomDelta)
+                if max(topDelta, bottomDelta) > 0.000_001 {
+                    changedSamples += 1
+                }
+
+                let packetGain = SplashWaveGenerator.travelingPacketGain(
+                    at: x,
+                    center: packetOnlySamples[index].packetCenter,
+                    halfWidth: packetOnlySamples[index].packetHalfWidth
+                )
+                if packetGain == 0 {
+                    XCTAssertEqual(topDelta, 0, accuracy: 0.000_001)
+                    XCTAssertEqual(bottomDelta, 0, accuracy: 0.000_001)
+                    unchangedSamplesOutsidePackets += 1
+                }
+
+                XCTAssertGreaterThan(
+                    firstSample[index].bottom[sampleIndex].y
+                        - firstSample[index].top[sampleIndex].y,
+                    0.01
+                )
+            }
+        }
+
+        XCTAssertGreaterThan(maximumDisplacement, 0.000_5)
+        XCTAssertLessThan(maximumDisplacement, 0.08)
+        XCTAssertGreaterThan(changedSamples, 0)
+        XCTAssertGreaterThan(unchangedSamplesOutsidePackets, changedSamples)
+
+        let early = SplashPerformanceScore.waveMotionSample(
+            for: .waveRearPeriwinkle,
+            performanceElapsed:
+                SplashMotionTiming.noteScoreStartTime
+                + 4 * SplashPerformanceScore.tempo.secondsPerBeat
+        )
+        let later = SplashPerformanceScore.waveMotionSample(
+            for: .waveRearPeriwinkle,
+            performanceElapsed:
+                SplashMotionTiming.noteScoreStartTime
+                + 6 * SplashPerformanceScore.tempo.secondsPerBeat
+        )
+        XCTAssertGreaterThan(later.packetCenter, early.packetCenter)
+    }
+
+    func testSplashLivingMotionIsPerceptibleOverOneSecond() {
+        let startTime = SplashMotionTiming.noteScoreStartTime
+            + 5 * SplashPerformanceScore.tempo.secondsPerBeat
+        let endTime = startTime + 1
+        let startPresentation = SplashScenePresentation.sample(
+            performanceElapsed: startTime,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        let endPresentation = SplashScenePresentation.sample(
+            performanceElapsed: endTime,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        let startRibbons = SplashWaveGenerator.ribbons(
+            motionSamples: SplashWaveGenerator.formulas.map {
+                startPresentation.waveMotionSample(for: $0.id)
+            }
+        )
+        let endRibbons = SplashWaveGenerator.ribbons(
+            motionSamples: SplashWaveGenerator.formulas.map {
+                endPresentation.waveMotionSample(for: $0.id)
+            }
+        )
+
+        var maximumOneSecondDisplacement: CGFloat = 0
+        for ribbonIndex in startRibbons.indices {
+            for sampleIndex in startRibbons[ribbonIndex].top.indices {
+                maximumOneSecondDisplacement = max(
+                    maximumOneSecondDisplacement,
+                    abs(
+                        endRibbons[ribbonIndex].top[sampleIndex].y
+                            - startRibbons[ribbonIndex].top[sampleIndex].y
+                    ),
+                    abs(
+                        endRibbons[ribbonIndex].bottom[sampleIndex].y
+                            - startRibbons[ribbonIndex].bottom[sampleIndex].y
+                    )
+                )
+            }
+        }
+
+        XCTAssertGreaterThan(maximumOneSecondDisplacement, 0.001)
+        XCTAssertLessThan(maximumOneSecondDisplacement, 0.03)
+
+        let cycleStart = SplashMotionTiming.entranceCompleteTime
+            + SplashPerformanceScore.noteCycleBeats
+                * SplashPerformanceScore.tempo.secondsPerBeat
+        for step in 0..<64 {
+            let sampleTime = cycleStart
+                + Double(step) * 0.5
+                    * SplashPerformanceScore.tempo.secondsPerBeat
+            let nextTime = sampleTime + 0.75
+            let first = SplashWaveGenerator.ribbons(
+                motionSamples: SplashWaveGenerator.formulas.map {
+                    SplashPerformanceScore.waveMotionSample(
+                        for: $0.id,
+                        performanceElapsed: sampleTime
+                    )
+                }
+            )
+            let second = SplashWaveGenerator.ribbons(
+                motionSamples: SplashWaveGenerator.formulas.map {
+                    SplashPerformanceScore.waveMotionSample(
+                        for: $0.id,
+                        performanceElapsed: nextTime
+                    )
+                }
+            )
+
+            let perceptibleRibbonCount = first.indices.filter { ribbonIndex in
+                first[ribbonIndex].top.indices.contains { sampleIndex in
+                    abs(
+                        first[ribbonIndex].top[sampleIndex].y
+                            - second[ribbonIndex].top[sampleIndex].y
+                    ) > 0.000_6
+                        || abs(
+                            first[ribbonIndex].bottom[sampleIndex].y
+                                - second[ribbonIndex].bottom[sampleIndex].y
+                        ) > 0.000_6
+                }
+            }.count
+
+            XCTAssertGreaterThanOrEqual(
+                perceptibleRibbonCount,
+                3,
+                "Expected at least three visibly moving ribbons at elapsed \(sampleTime)"
+            )
+        }
+    }
+
+    func testSplashWavePhaseNeverRestartsAtNoteBoundaries() {
+        let frameInterval = 1.0 / 120.0
+        let cycleOffset = SplashPerformanceScore.noteCycleBeats
+            * SplashPerformanceScore.tempo.secondsPerBeat
+
+        for event in SplashPerformanceScore.noteEvents {
+            let boundary = cycleOffset
+                + event.startBeat * SplashPerformanceScore.tempo.secondsPerBeat
+            guard let voice = SplashPerformanceScore.waveVoices.first(
+                where: { $0.tonalSlot == event.tonalSlot }
+            ) else {
+                XCTFail("Missing wave voice for tonal slot \(event.tonalSlot)")
+                continue
+            }
+            let before = SplashPerformanceScore.waveMotionSample(
+                for: voice.actorID,
+                performanceElapsed: boundary - frameInterval
+            )
+            let after = SplashPerformanceScore.waveMotionSample(
+                for: voice.actorID,
+                performanceElapsed: boundary + frameInterval
+            )
+            let expectedAdvance = 2 * frameInterval
+                * SplashMotionTiming.motionPhaseUnitsPerSecond
+
+            XCTAssertEqual(
+                Double(after.phase - before.phase),
+                expectedAdvance,
+                accuracy: 0.000_01
+            )
+            XCTAssertEqual(after.bedPhase, after.phase)
+        }
+    }
+
+    func testSplashMotionTuningPreservesPhaseWhileSpeedChanges() {
+        var tuning = SplashMotionTuning.standard
+        let elapsed = SplashMotionTiming.noteScoreStartTime
+            + 8
+        let activeTime = SplashMotionTiming.noteScoreTime(at: elapsed)
+        let phaseBeforeChange = tuning.phaseTime(at: activeTime)
+
+        tuning.setSpeedMultiplier(3, performanceElapsed: elapsed)
+
+        XCTAssertEqual(
+            tuning.phaseTime(at: activeTime),
+            phaseBeforeChange,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(tuning.speedMultiplier, 3)
+
+        let laterActiveTime = SplashMotionTiming.noteScoreTime(
+            at: elapsed + 2
+        )
+        XCTAssertEqual(
+            tuning.phaseTime(at: laterActiveTime),
+            phaseBeforeChange + (laterActiveTime - activeTime) * 3,
+            accuracy: 0.000_001
+        )
+
+        tuning.setAmountMultiplier(8)
+        XCTAssertEqual(tuning.amountMultiplier, 2)
+
+        tuning.reset(performanceElapsed: elapsed + 2)
+        XCTAssertEqual(tuning.speedMultiplier, 1)
+        XCTAssertEqual(tuning.amountMultiplier, 1)
+    }
+    func testSplashADSRDefinesEveryNoteLifecycleBoundary() throws {
+        let envelope = SplashPerformanceScore.noteEnvelope
+        let gateBeats = 10.0
+
+        let attackStart = try XCTUnwrap(
+            envelope.sample(localBeat: 0, gateBeats: gateBeats)
+        )
+        XCTAssertEqual(attackStart.stage, .attack)
+        XCTAssertEqual(attackStart.value, 0)
+
+        let decayStart = try XCTUnwrap(
+            envelope.sample(
+                localBeat: envelope.attackBeats,
+                gateBeats: gateBeats
+            )
+        )
+        XCTAssertEqual(decayStart.stage, .decay)
+        XCTAssertEqual(decayStart.value, 1, accuracy: 0.000_001)
+
+        let sustainStart = try XCTUnwrap(
+            envelope.sample(
+                localBeat: envelope.attackBeats + envelope.decayBeats,
+                gateBeats: gateBeats
+            )
+        )
+        XCTAssertEqual(sustainStart.stage, .sustain)
+        XCTAssertEqual(
+            sustainStart.value,
+            envelope.sustainLevel,
+            accuracy: 0.000_001
+        )
+
+        let releaseStart = try XCTUnwrap(
+            envelope.sample(localBeat: gateBeats, gateBeats: gateBeats)
+        )
+        XCTAssertEqual(releaseStart.stage, .release)
+        XCTAssertEqual(
+            releaseStart.value,
+            envelope.sustainLevel,
+            accuracy: 0.000_001
+        )
+        XCTAssertNil(
+            envelope.sample(
+                localBeat: gateBeats + envelope.releaseBeats,
+                gateBeats: gateBeats
+            )
+        )
+    }
+
+    func testSplashTravelingPacketHasSmoothCompactSupport() {
+        let center: CGFloat = 0.4
+        let halfWidth: CGFloat = 0.2
+
+        XCTAssertEqual(
+            SplashWaveGenerator.travelingPacketGain(
+                at: center,
+                center: center,
+                halfWidth: halfWidth
+            ),
+            1,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            SplashWaveGenerator.travelingPacketGain(
+                at: center - halfWidth,
+                center: center,
+                halfWidth: halfWidth
+            ),
+            0
+        )
+        XCTAssertEqual(
+            SplashWaveGenerator.travelingPacketGain(
+                at: center + halfWidth,
+                center: center,
+                halfWidth: halfWidth
+            ),
+            0
+        )
+        XCTAssertEqual(
+            SplashWaveGenerator.travelingPacketGain(
+                at: center - halfWidth / 2,
+                center: center,
+                halfWidth: halfWidth
+            ),
+            SplashWaveGenerator.travelingPacketGain(
+                at: center + halfWidth / 2,
+                center: center,
+                halfWidth: halfWidth
+            ),
+            accuracy: 0.000_001
+        )
+    }
+
+
+
 
     func testSplashUsesResponsiveCompositionModes() {
         XCTAssertEqual(
@@ -130,7 +1169,10 @@ final class PlanetCalmTests: XCTestCase {
     func testSplashWaveGeneratorHasNoLocalCurvatureSpikes() {
         for motionPhase in [CGFloat(0), 0.25, 0.75, 1] {
             for ribbon in SplashWaveGenerator.ribbons(motionPhase: motionPhase) {
-                for edge in [ribbon.top, ribbon.bottom] {
+                for (edgeName, edge) in [
+                    ("top", ribbon.top),
+                    ("bottom", ribbon.bottom)
+                ] {
                     var largestThirdDifference: CGFloat = 0
                     for index in 0..<(edge.count - 3) {
                         let difference = edge[index + 3].y
@@ -143,7 +1185,7 @@ final class PlanetCalmTests: XCTestCase {
                     XCTAssertLessThan(
                         largestThirdDifference,
                         0.009,
-                        "\(ribbon.id.rawValue) developed a visible local curvature spike"
+                        "\(ribbon.id.rawValue) \(edgeName) at phase \(motionPhase) developed a visible local curvature spike"
                     )
                 }
             }

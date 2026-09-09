@@ -22,6 +22,8 @@ enum Story: String, CaseIterable, Identifiable, Codable {
 }
 
 enum FocusDuration: Int, CaseIterable, Identifiable, Codable {
+    case fiveMinutes = 300
+    case tenMinutes = 600
     case fifteenMinutes = 900
     case twentyFiveMinutes = 1_500
     case fiftyMinutes = 3_000
@@ -45,9 +47,9 @@ enum FocusDuration: Int, CaseIterable, Identifiable, Codable {
 
     static var available: [FocusDuration] {
         #if DEBUG
-        [.oneMinute, .twoMinutes, .fifteenMinutes, .twentyFiveMinutes, .fiftyMinutes]
+        [.oneMinute, .twoMinutes, .fiveMinutes, .tenMinutes, .fifteenMinutes, .twentyFiveMinutes, .fiftyMinutes]
         #else
-        [.fifteenMinutes, .twentyFiveMinutes, .fiftyMinutes]
+        [.fiveMinutes, .tenMinutes, .fifteenMinutes, .twentyFiveMinutes, .fiftyMinutes]
         #endif
     }
 }
