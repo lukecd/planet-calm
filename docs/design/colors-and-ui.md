@@ -76,7 +76,9 @@ The image is an opaque composition reference, not a production scene plate. The 
 screen recreates its hierarchy with independently addressable SwiftUI layers:
 
 1. Ink-navy background.
-2. Two-line Planet Focus wordmark.
+2. Wordmark omitted for now while the animation is refined. Retain its typography and
+   motion definitions for a possible opening-only appearance; do not reserve visible
+   space or introduce a replacement logo yet.
 3. Warm-yellow sun behind the wave field.
 4. Individual closed wave ribbons with sinuous top and bottom contours.
 5. Three lotus groups, each composed from independent petals and a warm-yellow center.
@@ -149,15 +151,16 @@ rebuilding or flattening the screen.
 The provisional performance tempo is 65 BPM in 4/4. It schedules future musical
 moments; the continuous wave field remains fluid and derives from elapsed time.
 
-In the current living-motion study, the eight ribbons keep stable tonal slots but do
-not yet have assigned pitches. Four quiet foundation voices cover the initial score
+In calibration mode, the eight ribbons keep stable F-Lydian tonal slots. Four quiet foundation voices cover the initial score
 build, then hand off to long, overlapping pad envelopes on those same ribbon actors.
 Every note supplies a restrained whole-ribbon motion bed plus a stronger traveling
 packet. Both use one uninterrupted phase clock per ribbon; note onset never resets the
-wave. After the intro exactly four actors remain scheduled and at least three produce
+wave. In the calibration loop, exactly four actors remain scheduled after the intro and at least three produce
 measurable visible movement throughout the cycle. This prevents full staticness and
 onset jerks without making every ribbon crest and fall together. The same
-performance-clock samples are the future synchronization seam for music.
+performance-clock samples are shared by the finite runner's synthesized audition.
+The live runner now uses a full-length seeded drone/pad/melody plan, not this repeating
+calibration fixture; see [Generative Performance System](../architecture/generative-performance-system.md).
 
 - At 0.00 seconds only the ink-navy paper canvas is visible. The provisional drone and
   note score begin with the visual performance rather than waiting after the intro.
@@ -167,7 +170,7 @@ performance-clock samples are the future synchronization seam for music.
   sequence begins at 3.56 seconds and finishes at 4.46 seconds, but it never blocks a
   returning user from navigating. An interrupted flower sequence reverses from its
   exact current petal state.
-- The audition score is a 32-beat cycle. A new pad voice begins every four beats and
+- The calibration score is a 32-beat cycle. A new pad voice begins every four beats and
   remains active for sixteen beats: three-beat attack, two-beat decay, 0.72 sustain,
   ten-beat gate, and six-beat release. Four pad envelopes therefore overlap once the
   first cycle has filled, with no quiet interval at the loop boundary.
@@ -190,9 +193,10 @@ That document supersedes the earlier full-canvas palette fades and expanding opa
 
 The sun begins approximately 10% exposed above the rear wave, rises, and carries a
 spatial light field. Native Metal evaluates atmospheric scattering; an explicit paper
-color treatment brings the result to the yellow reference. Three abstract paper cloud
-strips share their visible silhouettes with the ray-occlusion calculation. Texture
-stays neutral and separate from light.
+color treatment brings the result to the yellow reference. The current cloud study uses
+one assembly of three overlapping paper cutouts, with real depth values shared by the
+visible artwork and solar-occlusion calculation. Texture stays neutral and separate from
+light; the final multi-cloud arrangement awaits approval of this construction.
 
 The approved yellow-paper reference is
 [planet-focus-yellow.png](../../fall-references/planet-focus-ui/splash-screen-v2/planet-focus-yellow.png).

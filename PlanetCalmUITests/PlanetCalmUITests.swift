@@ -6,6 +6,55 @@ final class PlanetCalmUITests: XCTestCase {
         continueAfterFailure = false
     }
 
+    func testSplashMusicRunnerRestoresPausedRun() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--performance-runner-review"]
+        app.launchEnvironment["SPLASH_AUDIO_DISABLED"] = "1"
+        app.launch()
+        let pause = app.buttons["performancePauseResume"]
+        XCTAssertTrue(pause.waitForExistence(timeout: 10))
+        pause.tap()
+        XCTAssertTrue(app.staticTexts["Paused Splash"].waitForExistence(timeout: 3))
+        let timing = app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'elapsed -'")).firstMatch
+        let pausedTiming = timing.label
+        app.terminate()
+        app.launchArguments = []
+        app.launch()
+        let runner = app.buttons["Splash runner"]
+        XCTAssertTrue(runner.waitForExistence(timeout: 10))
+        runner.tap()
+        XCTAssertTrue(app.staticTexts["Paused Splash"].waitForExistence(timeout: 3))
+        XCTAssertEqual(timing.label, pausedTiming)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "splash-restored-pause"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        app.buttons["End run"].tap()
+    }
+
+    func testSplashMusicRunnerControls() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--performance-runner-review"]
+        app.launchEnvironment["SPLASH_AUDIO_DISABLED"] = "1"
+        app.launch()
+        let pause = app.buttons["performancePauseResume"]
+        XCTAssertTrue(pause.waitForExistence(timeout: 10))
+        pause.tap()
+        XCTAssertTrue(app.staticTexts["Paused Splash"].waitForExistence(timeout: 3))
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "splash-runner-paused"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        pause.tap()
+        XCTAssertTrue(app.staticTexts["Running Splash"].waitForExistence(timeout: 3))
+        app.buttons["Hide"].tap()
+        XCTAssertTrue(app.buttons["Controls"].waitForExistence(timeout: 3))
+        app.buttons["Controls"].tap()
+        XCTAssertTrue(pause.waitForExistence(timeout: 3))
+        app.buttons["End run"].tap()
+        XCTAssertTrue(app.buttons["Run Splash"].waitForExistence(timeout: 3))
+    }
+
     func testAutumnCastReviewPortrait() throws {
         captureAutumnCastReview(orientation: .portrait, name: "actual-ipad-portrait-flock-t10")
     }
@@ -50,9 +99,16 @@ final class PlanetCalmUITests: XCTestCase {
 
     private func captureSunriseAudit(orientation: UIDeviceOrientation, name: String) {
         let app = XCUIApplication()
+        let wantsLandscape = orientation == .landscapeLeft || orientation == .landscapeRight
         app.launchArguments = ["--sunrise-audit"]
+        if wantsLandscape { app.launchArguments.append("--sunrise-audit-landscape") }
         app.launch()
         XCUIDevice.shared.orientation = orientation
+        let geometryExpectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                wantsLandscape ? app.frame.width > app.frame.height : app.frame.height > app.frame.width
+            }, object: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [geometryExpectation], timeout: 8), .completed)
         let advance = app.buttons["sunriseAuditNext"]
         XCTAssertTrue(advance.waitForExistence(timeout: 8))
         for index in 0...20 {

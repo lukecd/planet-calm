@@ -1,4 +1,5 @@
 import XCTest
+import AVFoundation
 #if canImport(UIKit)
 import UIKit
 import SpriteKit
@@ -8,6 +9,135 @@ import CryptoKit
 @testable import PlanetCalm
 
 final class PlanetCalmTests: XCTestCase {
+    @MainActor
+    func testMusicRunnerLiveAudioOutput() async throws {
+        let synth = PerformanceSynthesizer()
+        let session = PerformanceSession(duration: .oneMinute,
+            startedAt: Date().addingTimeInterval(-12), randomSeed: 650_208)
+        synth.play(session: session, events: SplashMusicDirector.events(for: session))
+        for _ in 0..<30 {
+            if synth.outputLevel > 0.001 { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertGreaterThan(synth.outputLevel, 0.001, synth.status)
+        print("Live synth output peak: \(synth.outputLevel)")
+        synth.stop()
+        XCTAssertEqual(synth.outputLevel, 0)
+    }
+
+    func testMusicRunnerPauseResumeAndPersistence() throws {
+        let start = Date(timeIntervalSince1970: 1_000)
+        var session = PerformanceSession(duration: .fiveMinutes, startedAt: start, randomSeed: 42)
+        session.pause(at: start.addingTimeInterval(40))
+        session.pause(at: start.addingTimeInterval(60))
+        XCTAssertEqual(session.elapsedTime(at: start.addingTimeInterval(100)), 40)
+        XCTAssertEqual(session.remainingTime(at: start.addingTimeInterval(100)), 260)
+        session = try JSONDecoder().decode(PerformanceSession.self, from: JSONEncoder().encode(session))
+        XCTAssertTrue(session.isPaused)
+        session.resume(at: start.addingTimeInterval(100))
+        XCTAssertEqual(session.elapsedTime(at: start.addingTimeInterval(110)), 50)
+        XCTAssertEqual(session.progress(at: start.addingTimeInterval(360)), 1)
+        XCTAssertEqual(session.focusSession(for: .autumnTree).elapsedTime(at: start.addingTimeInterval(110)), 50)
+    }
+
+    func testMusicRunnerFiniteScoreContinuityAndDeterminism() {
+        for duration in [FocusDuration.oneMinute, .fiveMinutes, .fiftyMinutes] {
+            for seed: UInt64 in [42, 650_208, 91_337] {
+                let session = PerformanceSession(duration: duration, randomSeed: seed)
+                let events = SplashMusicDirector.events(for: session)
+                XCTAssertEqual(events, SplashMusicDirector.events(for: session))
+                XCTAssertEqual(Set(events.map(\.id)).count, events.count)
+                XCTAssertTrue(events.contains { $0.role == .drone })
+                XCTAssertTrue(events.contains { $0.role == .melody })
+                let endBeat = duration.timeInterval / SplashPerformanceScore.tempo.secondsPerBeat
+                for event in events {
+                    XCTAssertFalse(event.isRepeating)
+                    XCTAssertLessThanOrEqual(event.endBeat, endBeat + 0.000001)
+                    XCTAssertGreaterThanOrEqual(event.gateBeats, event.envelope.attackBeats + event.envelope.decayBeats)
+                    XCTAssertTrue((0...7).contains(event.tonalSlot))
+                }
+                for beat in stride(from: 5.0, to: endBeat - 7, by: 1) {
+                    let active = events.filter { ($0.sample(at: beat)?.value ?? 0) > 0.015 }
+                    XCTAssertGreaterThanOrEqual(Set(active.map(\.tonalSlot)).count, 3, "seed \(seed), beat \(beat)")
+                    XCTAssertLessThanOrEqual(active.count, 12)
+                    XCTAssertTrue(active.contains { $0.role == .drone }, "Drone gap at \(beat)")
+                }
+                XCTAssertEqual(SplashPerformanceScore.diagnostics(
+                    durationMinutes: duration.timeInterval / 60, events: events).longestSilentBeats, 0)
+                let all = SplashPerformanceScore.scheduledEvents(around: endBeat / 2,
+                    radiusBeats: endBeat / 2, events: events)
+                XCTAssertEqual(all.count, events.count, "Finite events must not repeat")
+                XCTAssertTrue(SplashPerformanceScore.scheduledEvents(around: endBeat + 50,
+                    radiusBeats: 10, events: events).isEmpty)
+            }
+        }
+        let a = SplashMusicDirector.events(for: .init(duration: .fiveMinutes, randomSeed: 42))
+        let b = SplashMusicDirector.events(for: .init(duration: .fiveMinutes, randomSeed: 43))
+        XCTAssertNotEqual(a, b)
+    }
+
+    func testMusicRunnerAudioAndVisualShareEvents() {
+        let session = PerformanceSession(duration: .fiveMinutes, randomSeed: 42)
+        let events = SplashMusicDirector.events(for: session)
+        let plan = SplashPerformancePlan(session: session, scoreEvents: events)
+        for event in events {
+            let scheduled = SplashScheduledPerformanceEvent(event: event, scheduledStartBeat: event.startBeat)
+            let key = plan.soundSource(for: scheduled)
+            let voice = PerformanceSynthVoice(event: event, source: key)
+            XCTAssertEqual(key.octaveOffset, event.octaveOffset)
+            XCTAssertEqual(voice.event, event)
+            XCTAssertEqual(voice.sample(at: (event.startBeat - 0.001) * voice.secondsPerBeat), 0)
+            XCTAssertEqual(voice.sample(at: (event.endBeat + 0.001) * voice.secondsPerBeat), 0)
+            let middle = event.startBeat + event.totalBeats * 0.5
+            XCTAssertEqual(SplashPerformanceScore.scheduledSample(for: event, scoreBeat: middle)?.envelope,
+                           event.sample(at: middle))
+            XCTAssertEqual(key, plan.soundSource(for: scheduled))
+        }
+    }
+
+    func testMusicRunnerRendersAudition() throws {
+        let session = PerformanceSession(duration: .oneMinute, randomSeed: 650_208)
+        let events = SplashMusicDirector.events(for: session)
+        let plan = SplashPerformancePlan(session: session, scoreEvents: events)
+        let voices = events.map { PerformanceSynthVoice(event: $0,
+            source: plan.soundSource(for: .init(event: $0, scheduledStartBeat: $0.startBeat))) }
+        let rate = 22050.0
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("splash-synth-audition.wav")
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024))
+        var peak = 0.0
+        var energy = 0.0
+        let frameCount = Int(session.duration.timeInterval * rate)
+        for blockStart in stride(from: 0, to: frameCount, by: 1024) {
+            let count = min(1024, frameCount - blockStart)
+            buffer.frameLength = AVAudioFrameCount(count)
+            let active = voices.filter {
+                $0.event.endBeat * $0.secondsPerBeat > Double(blockStart) / rate
+                    && $0.event.startBeat * $0.secondsPerBeat < Double(blockStart + count) / rate
+            }
+            let data = try XCTUnwrap(buffer.floatChannelData?[0])
+            for frame in 0..<count {
+                let time = Double(blockStart + frame) / rate
+                let value = tanh(active.reduce(0.0) { $0 + $1.sample(at: time) }) * 0.65
+                XCTAssertTrue(value.isFinite)
+                data[frame] = Float(value)
+                peak = max(peak, abs(value))
+                energy += value * value
+            }
+            try file.write(from: buffer)
+        }
+        XCTAssertGreaterThan(peak, 0.02)
+        XCTAssertLessThan(peak, 0.7)
+        XCTAssertGreaterThan(sqrt(energy / Double(frameCount)), 0.005)
+        print("Synth audition peak=\(peak), RMS=\(sqrt(energy / Double(frameCount))), events=\(events.count)")
+        let attachment = XCTAttachment(contentsOfFile: url)
+        attachment.name = "splash-synth-audition.wav"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+
     func testStoryChooserKeepsSmallSquarePreviewsAcrossDevices() {
         let phone = StoryChooserLayout(
             size: CGSize(width: 430, height: 932),

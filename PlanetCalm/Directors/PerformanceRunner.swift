@@ -7,6 +7,8 @@ struct PerformanceSession: Equatable, Codable, Sendable {
     let duration: FocusDuration
     let startedAt: Date
     let randomSeed: UInt64
+    private(set) var pausedAt: Date? = nil
+    private(set) var accumulatedPause: TimeInterval = 0
 
     init(
         duration: FocusDuration,
@@ -27,11 +29,11 @@ struct PerformanceSession: Equatable, Codable, Sendable {
     }
 
     var endDate: Date {
-        startedAt.addingTimeInterval(duration.timeInterval)
+        startedAt.addingTimeInterval(duration.timeInterval + accumulatedPause)
     }
 
     func elapsedTime(at date: Date) -> TimeInterval {
-        min(max(date.timeIntervalSince(startedAt), 0), duration.timeInterval)
+        min(max((pausedAt ?? date).timeIntervalSince(startedAt) - accumulatedPause, 0), duration.timeInterval)
     }
 
     func progress(at date: Date) -> Double {
@@ -39,14 +41,27 @@ struct PerformanceSession: Equatable, Codable, Sendable {
     }
 
     func remainingTime(at date: Date) -> TimeInterval {
-        max(endDate.timeIntervalSince(date), 0)
+        max(duration.timeInterval - elapsedTime(at: date), 0)
+    }
+
+    var isPaused: Bool { pausedAt != nil }
+
+    mutating func pause(at date: Date) {
+        guard pausedAt == nil, progress(at: date) < 1 else { return }
+        pausedAt = max(date, startedAt)
+    }
+
+    mutating func resume(at date: Date) {
+        guard let pausedAt else { return }
+        accumulatedPause += max(date.timeIntervalSince(pausedAt), 0)
+        self.pausedAt = nil
     }
 
     func focusSession(for story: Story) -> FocusSession {
         FocusSession(
             story: story,
             duration: duration,
-            startedAt: startedAt,
+            startedAt: startedAt.addingTimeInterval(accumulatedPause),
             randomSeed: randomSeed
         )
     }

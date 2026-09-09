@@ -12,15 +12,17 @@ struct SunriseUniforms {
 /// A single opaque surface owns every sky pixel, including the safe areas.
 struct SunriseSkyView: UIViewRepresentable {
     let uniforms: SunriseUniforms
+    var drawsClouds = false
 
-    func makeCoordinator() -> SunriseRenderer { SunriseRenderer() }
+    func makeCoordinator() -> SunriseRenderer { SunriseRenderer(drawsClouds: drawsClouds) }
 
     func makeUIView(context: Context) -> MTKView {
         let view = MTKView(frame: .zero, device: context.coordinator.device)
         view.colorPixelFormat = .bgra8Unorm
-        view.isOpaque = true
-        view.backgroundColor = UIColor(red: 10 / 255, green: 17 / 255, blue: 36 / 255, alpha: 1)
-        view.clearColor = MTLClearColor(red: 0.039, green: 0.067, blue: 0.141, alpha: 1)
+        view.isOpaque = !drawsClouds
+        view.backgroundColor = drawsClouds ? .clear : UIColor(red: 10 / 255, green: 17 / 255, blue: 36 / 255, alpha: 1)
+        view.clearColor = drawsClouds ? MTLClearColorMake(0, 0, 0, 0)
+            : MTLClearColorMake(0.039, 0.067, 0.141, 1)
         view.enableSetNeedsDisplay = true
         view.isPaused = true
         view.autoResizeDrawable = false
@@ -34,7 +36,8 @@ struct SunriseSkyView: UIViewRepresentable {
         context.coordinator.uniforms = uniforms
         // The atmosphere has no fine image detail; paper grain is applied at native
         // resolution by SwiftUI. Cap this costly pass independently of wave drawing.
-        let scale = min(1, 720 / max(CGFloat(uniforms.viewport.x), CGFloat(uniforms.viewport.y)))
+        let scale = min(drawsClouds ? 2 : 1, (drawsClouds ? 1440 : 720)
+            / max(CGFloat(uniforms.viewport.x), CGFloat(uniforms.viewport.y)))
         let size = CGSize(width: max(1, (CGFloat(uniforms.viewport.x) * scale).rounded()),
                           height: max(1, (CGFloat(uniforms.viewport.y) * scale).rounded()))
         if view.drawableSize != size { view.drawableSize = size }
@@ -52,7 +55,10 @@ final class SunriseRenderer: NSObject, MTKViewDelegate {
     private var paperGrain: (any MTLTexture)?
     private var lastRendered: SunriseUniforms?
 
-    override init() {
+    private let drawsClouds: Bool
+
+    init(drawsClouds: Bool = false) {
+        self.drawsClouds = drawsClouds
         super.init()
         guard let device, let library = device.makeDefaultLibrary() else { return }
         do {
@@ -73,9 +79,10 @@ final class SunriseRenderer: NSObject, MTKViewDelegate {
             }
             let descriptor = MTLRenderPipelineDescriptor()
             descriptor.vertexFunction = library.makeFunction(name: "sunriseVertex")
-            descriptor.fragmentFunction = library.makeFunction(name: "sunriseFragment")
+            descriptor.fragmentFunction = library.makeFunction(name: drawsClouds ? "paperCloudFragment" : "sunriseFragment")
             descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
             pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+            if drawsClouds { return }
             let texture = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .rgba16Float, width: 256, height: 64, mipmapped: false)
             texture.usage = [.shaderRead, .shaderWrite]
@@ -105,7 +112,8 @@ final class SunriseRenderer: NSObject, MTKViewDelegate {
            lastRendered.viewport == uniforms.viewport,
            lastRendered.story == uniforms.story,
            lastRendered.optics == uniforms.optics { return }
-        guard let pipeline, let transmittance, let paperGrain,
+        guard drawsClouds || transmittance != nil else { return }
+        guard let pipeline, let paperGrain,
               let pass = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable,
               let command = queue?.makeCommandBuffer(),

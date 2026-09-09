@@ -5,8 +5,9 @@
 The splash tells a sunrise in the established cut-paper composition. The sun starts
 with roughly 10% of its diameter above the resting rear-wave horizon, then rises to
 the established daytime position. Warm light stays centered on that same sun and
-expands across the paper. Three restrained cloud strips interrupt the light and make
-soft rays. The waves, lotus choreography, score, and navigation keep their existing roles.
+expands across the paper. The current cloud study is one layered paper assembly;
+its depth-separated cutouts interrupt the light and make soft rays. The waves, lotus
+choreography, score, and navigation keep their existing roles.
 
 The yellow-paper reference is the daytime art target. An entirely yellow sky is not
 a physically literal clear daytime sky. The renderer therefore separates a physical
@@ -45,8 +46,10 @@ about texture streaks informs this implementation: only untextured cloud masks
 participate in visibility. Paper grain is excluded.
 
 The native implementation uses [MTKView](https://developer.apple.com/documentation/metalkit/mtkview)
-inside the SwiftUI scene. An opaque full-canvas Metal surface owns the sky, cloud masks,
-and rays. SwiftUI continues to render the paper sun, waves, lotuses, type, and controls.
+inside the SwiftUI scene. An opaque full-canvas Metal surface owns the sky and rays.
+A separate transparent Metal surface draws the paper cloud above the SwiftUI sun and
+below the waves. Both receive identical geometry and time. SwiftUI continues to render
+the sun, waves, lotuses, type, and controls.
 A 3D scene framework is unnecessary for this fixed-view paper scene.
 
 ## Ownership and shared time
@@ -151,16 +154,32 @@ values through floating-point color-space conversions.
 
 ## Clouds, rays, and grain
 
-Three deterministic signed-distance silhouettes describe elongated, tapered paper strips
-with several scales of contour variation. The exact same functions supply visible
-coverage and ray occlusion. The silhouettes are fixed authored parameters, not new random
-clouds each launch. Their drift is a slow bounded sinusoid; there is no frame-based randomness.
+The approved next step is a single-cloud construction study, not the final cloud
+arrangement. Three opaque paper sheets overlap at depths 0.13, 0.16, and 0.19
+in short-side units (increasing depth approaches the viewer). Each cutout has an
+independent center, width, height, and pigment. The broadest sheet is the lit upper
+face; two progressively smaller sheets step downward with slight lateral offsets.
+Rounded elliptical lobes form each
+continuous cut edge. This replaces the previous single-contour strips.
 
-Forty samples along the screen-space segment toward the sun estimate cloud obstruction.
-Visibility = exp(-12 * average obstruction) attenuates the aerosol contribution.
-A sin^2(pi * p) envelope makes the shafts quiet at the endpoints and more apparent
-during the middle of the sunrise. This approximates crepuscular rays in a fixed
-composition; it does not claim true volumetric cloud shadows.
+The symbolic solar source uses the existing screen-space sun center and depth -0.60.
+For a receiver at depth zr and a blocker at zb, the intersection is
+sun.xy + (receiver.xy - sun.xy) * (zb + 0.60) / (zr + 0.60).
+Only paper planes between the source and receiver can block it. The visible cutouts
+and blockers use the exact same coverage function; no independent ray artwork is used.
+
+Twenty-four samples through a shallow scattering slab (depths 0.22–0.85) average
+solar visibility. This modulates aerosol scattering and the paper finish locally.
+A sin^2(pi * p) envelope retains quiet endpoints. Unoccluded sky pixels retain the
+approved sunrise mapping. This is a 2.5D shadow/scattering approximation, not full
+volumetric cloud physics or glass refraction.
+
+Paper faces also query solar visibility against the other layers. Restrained contact
+shading supplies a separate studio-fill depth cue; it must not be presented as sunlight.
+Pigments move from slate/blue undersides and pale blue faces through lavender/peach
+to cream and muted blue. Each layer retains its own pigment and neutral local grain.
+The cloud drifts as one assembly using the existing shared progress; it does not
+regenerate random shapes or acquire a private clock.
 
 Cloud faces receive the existing NeutralPaperGrainV1 asset in their moving local
 coordinates, plus a restrained sun-facing edge. The grayscale source is explicitly
@@ -170,9 +189,11 @@ soft-light layer at a fixed point scale. It never enters the visibility calculat
 
 ## Performance, accessibility, and fallback
 
-The expensive sky pass is capped at 720 pixels on its longest edge. Paper artwork and
-background grain remain native-resolution SwiftUI layers. The transmittance texture is
-built once per renderer. Identical uniforms skip rendering, and a resize reallocates the
+The expensive sky pass is capped at 720 pixels on its longest edge. The inexpensive
+transparent cloud pass is capped independently at 1440 pixels (up to 2 pixels per point)
+so the cut edges remain sharp. It does not build an atmosphere lookup texture.
+Other paper artwork and background grain remain native-resolution SwiftUI layers.
+The transmittance texture is built once per sky renderer. Identical uniforms skip rendering, and a resize reallocates the
 drawable only when its pixel dimensions change.
 
 Reduce Motion freezes decorative cloud drift and keeps existing reduced-motion actor
@@ -192,6 +213,8 @@ supported iPhone/iPad hardware before a release performance claim.
 The DEBUG-only --sunrise-audit launch mode holds the actor pose and exposes an invisible,
 accessible next-state control. UI tests capture 0%, 5%, ..., 100% without repeatedly
 launching the app. Portrait and landscape are separate sessions in the same simulator.
+The audit asserts actual window dimensions; a requested device orientation is not proof
+that the app resized. The landscape audit also requests landscape from its window scene.
 Keep screenshot artifacts in temporary output, not production assets.
 
 Inspect all 21 frames for continuous growth, visible early light, sun attachment,
@@ -200,11 +223,17 @@ A successful screenshot test is not aesthetic approval: inspect the actual image
 The final screenshot also checks for substantial yellow sky coverage to detect a
 silently failed renderer.
 
-The September 9 implementation was inspected at every 5% on iPhone 17 portrait and
+The approved sunrise baseline (before the layered-cloud study) was inspected at every
+5% on iPhone 17 portrait and
 iPad A16 portrait/landscape (63 scene captures). A live one-minute runner capture also
 confirmed changing light and wave poses together. These are simulator checks, not
 physical-device performance certification. The release build additionally checks that
 shared score sampling remains available without DEBUG-only controls.
+
+The layered-cloud study has a separate verification checkpoint. iPhone and iPad portrait
+were inspected at every 5%; both portrait UI tests and the release build passed. The stricter landscape window-size assertion currently fails on
+the shared simulator despite device/scene rotation requests; do not label those captures
+as verified landscape or remove the assertion to obtain a passing test.
 
 Unit coverage checks the 10% initial exposure, rising geometry across four viewport
 shapes, agreement between manual and timed samples, exact pool endpoints, deterministic

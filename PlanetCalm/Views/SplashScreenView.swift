@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AVFoundation
 
 enum SplashSceneActorID: String, CaseIterable, Identifiable {
     case background
@@ -161,28 +162,28 @@ struct SplashWaveVoice: Equatable {
     let noteName: String
 }
 
-enum SplashPerformanceRole: String, CaseIterable, Equatable {
+enum SplashPerformanceRole: String, CaseIterable, Equatable, Sendable {
     case drone
     case pad
     case chime
     case melody
 }
 
-enum SplashEnvelopeStage: Equatable {
+enum SplashEnvelopeStage: Equatable, Sendable {
     case attack
     case decay
     case sustain
     case release
 }
 
-struct SplashEnvelopeSample: Equatable {
+struct SplashEnvelopeSample: Equatable, Sendable {
     let value: Double
     let lifecycleProgress: Double
     let localBeat: Double
     let stage: SplashEnvelopeStage
 }
 
-struct SplashADSREnvelope: Equatable {
+struct SplashADSREnvelope: Equatable, Sendable {
     let attackBeats: Double
     let decayBeats: Double
     let sustainLevel: Double
@@ -226,7 +227,7 @@ struct SplashADSREnvelope: Equatable {
     }
 }
 
-struct SplashWaveNoteEvent: Equatable {
+struct SplashWaveNoteEvent: Equatable, Sendable {
     let id: String
     let tonalSlot: Int
     let startBeat: Double
@@ -234,6 +235,8 @@ struct SplashWaveNoteEvent: Equatable {
     let envelope: SplashADSREnvelope
     let role: SplashPerformanceRole
     let intensity: Double
+    let isRepeating: Bool
+    let octaveOffset: Int
 
     init(
         id: String? = nil,
@@ -242,7 +245,9 @@ struct SplashWaveNoteEvent: Equatable {
         gateBeats: Double,
         envelope: SplashADSREnvelope,
         role: SplashPerformanceRole = .pad,
-        intensity: Double = 1
+        intensity: Double = 1,
+        isRepeating: Bool = true,
+        octaveOffset: Int = 0
     ) {
         self.id = id ?? "slot-\(tonalSlot)-beat-\(startBeat)"
         self.tonalSlot = tonalSlot
@@ -251,6 +256,8 @@ struct SplashWaveNoteEvent: Equatable {
         self.envelope = envelope
         self.role = role
         self.intensity = intensity
+        self.isRepeating = isRepeating
+        self.octaveOffset = octaveOffset
     }
 
     var endBeat: Double {
@@ -316,7 +323,8 @@ struct SplashPerformancePlan: Equatable {
             sessionSeed: session.randomSeed,
             tonalSlot: scheduledEvent.event.tonalSlot,
             role: soundRole(for: scheduledEvent.event.role),
-            atmosphere: atmosphere
+            atmosphere: atmosphere,
+            octaveOffset: scheduledEvent.event.octaveOffset
         )
     }
 
@@ -485,11 +493,14 @@ enum SplashPerformanceScore {
         let noteEvent = events.first {
             $0.tonalSlot == voice.tonalSlot
         }
-        let noteSample = noteEvent.flatMap {
+        let liveSamples = events.filter { $0.tonalSlot == voice.tonalSlot }.compactMap {
             scheduledSample(for: $0, scoreBeat: scoreBeat)?.envelope
         }
-
-        let packetProgress = CGFloat(noteSample?.lifecycleProgress ?? 0)
+        let noteSample = liveSamples.max { $0.value < $1.value }
+        // Blend simultaneous notes continuously; a new melody never steals a pad's packet.
+        let gainSum = liveSamples.reduce(0.0) { $0 + $1.value }
+        let packetProgress = CGFloat(gainSum > 0.000001
+            ? liveSamples.reduce(0.0) { $0 + $1.lifecycleProgress * $1.value } / gainSum : 0)
         let packetCenter = packetStart
             + (packetEnd - packetStart) * packetProgress
         // Every voice samples one continuous phase clock. Note events shape the
@@ -564,6 +575,9 @@ enum SplashPerformanceScore {
         for event: SplashWaveNoteEvent,
         scoreBeat: Double
     ) -> (scheduledStartBeat: Double, envelope: SplashEnvelopeSample)? {
+        if !event.isRepeating {
+            return event.sample(at: scoreBeat).map { (event.startBeat, $0) }
+        }
         let currentCycle = floor(scoreBeat / noteCycleBeats)
         for cycle in [currentCycle, currentCycle - 1] where cycle >= 0 {
             let startBeat = cycle * noteCycleBeats + event.startBeat
@@ -590,7 +604,7 @@ enum SplashPerformanceScore {
         var scheduled: [SplashScheduledPerformanceEvent] = []
 
         for cycle in firstCycle...lastCycle {
-            for event in events {
+            for event in events where event.isRepeating {
                 let scheduledEvent = SplashScheduledPerformanceEvent(
                     event: event,
                     scheduledStartBeat: Double(cycle) * noteCycleBeats + event.startBeat
@@ -600,6 +614,10 @@ enum SplashPerformanceScore {
                     scheduled.append(scheduledEvent)
                 }
             }
+        }
+
+        for event in events where !event.isRepeating && event.endBeat >= lowerBound && event.startBeat <= upperBound {
+            scheduled.append(.init(event: event, scheduledStartBeat: event.startBeat))
         }
 
         if let manualEvent {
@@ -627,7 +645,7 @@ enum SplashPerformanceScore {
             events: events
         ).filter { $0.scheduledStartBeat < totalBeats }
 
-        let activeCounts = stride(from: 0.0, through: totalBeats, by: 0.5).map {
+        let activeCounts = stride(from: 0.0, to: totalBeats, by: 0.5).map {
             sampleBeat in scheduled.filter { $0.sample(at: sampleBeat) != nil }.count
         }
         let averageActiveVoices = Double(activeCounts.reduce(0, +))
@@ -1197,7 +1215,7 @@ struct SplashSceneView: View {
                                     y: restingSunCenter.y + (1 - presentation.sunProgress) * 44)
 
             ZStack(alignment: .topLeading) {
-                SplashCanvasBackground(
+                SplashAtmosphereLayer(
                     atmosphere: atmosphere,
                     lightCenter: sunCenter,
                     horizon: layout.sunriseHorizon,
@@ -1213,6 +1231,16 @@ struct SplashSceneView: View {
                     .position(sunCenter)
                     .accessibilityIdentifier(SplashSceneActorID.sun.rawValue)
                     .accessibilityHidden(true)
+
+                SplashAtmosphereLayer(
+                    atmosphere: atmosphere,
+                    lightCenter: sunCenter,
+                    horizon: layout.sunriseHorizon,
+                    sunRadius: layout.sunDiameter / 2,
+                    drawsClouds: true
+                )
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
 
                 SplashWaveField(
                     layout: layout,
@@ -1249,15 +1277,7 @@ struct SplashSceneView: View {
                     .accessibilityHidden(true)
                 }
 
-                Text("Planet\nFocus")
-                    .font(PlanetFocusTypography.wordmark(size: layout.wordmarkFontSize))
-                    .foregroundStyle(atmosphere.sunrise.titleInk.color)
-                    .lineSpacing(-layout.wordmarkFontSize * 0.36)
-                    .fixedSize()
-                    .offset(x: layout.wordmarkLeading, y: layout.wordmarkTop)
-                    .opacity(presentation.wordmarkOpacity)
-                    .accessibilityIdentifier(SplashSceneActorID.wordmark.rawValue)
-                    .accessibilityAddTraits(.isHeader)
+                // Wordmark presentation is deferred while the scene animation is refined.
 
                 VStack(spacing: 0) {
                     Spacer(minLength: 0)
@@ -1286,12 +1306,13 @@ struct SplashSceneView: View {
     }
 }
 
-private struct SplashCanvasBackground: View {
+private struct SplashAtmosphereLayer: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var atmosphere: SplashAtmosphereSample = .night
     var lightCenter: CGPoint
     var horizon: CGFloat
     var sunRadius: CGFloat
+    var drawsClouds = false
 
     var body: some View {
         GeometryReader { proxy in
@@ -1305,14 +1326,16 @@ private struct SplashCanvasBackground: View {
                               Float(atmosphere.sunrise.exposure),
                               Float(atmosphere.sunrise.paperSpread),
                               Float(atmosphere.sunrise.paperAmount))
-            ))
+            ), drawsClouds: drawsClouds)
             .frame(width: proxy.size.width, height: proxy.size.height)
             .overlay {
-                Image("NeutralPaperGrainV1")
-                    .resizable(resizingMode: .tile)
-                    .blendMode(.softLight)
-                    .opacity(0.30)
-                    .allowsHitTesting(false)
+                if !drawsClouds {
+                    Image("NeutralPaperGrainV1")
+                        .resizable(resizingMode: .tile)
+                        .blendMode(.softLight)
+                        .opacity(0.30)
+                        .allowsHitTesting(false)
+                }
             }
             .clipped()
 #else
@@ -1356,6 +1379,11 @@ private enum PerformanceDeskContext {
 
 struct SplashScreenView: View {
     @Binding var selectedStory: Story
+    @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("splash.performance.session.v1") private var persistedPerformance = Data()
+    @State private var synthesizer = PerformanceSynthesizer()
+    @State private var auditionEnabled = true
+    @State private var runnerDuration: FocusDuration = .fiveMinutes
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selectedMenu: SplashMenuItem = .start
     @State private var stage: SplashScreenStage
@@ -1374,7 +1402,6 @@ struct SplashScreenView: View {
 #if DEBUG
     @State private var isPerformanceDeskVisible: Bool
     @State private var expandedPerformanceDeskSections: Set<PerformanceDeskSection>
-    @State private var runnerDuration: FocusDuration = .twoMinutes
     @State private var sunriseAuditIndex = 0
 #endif
 
@@ -1392,6 +1419,7 @@ struct SplashScreenView: View {
             initialValue: Self.debugAtmosphereProgress
         )
 #if DEBUG
+        _runnerDuration = State(initialValue: Self.isRunnerReview ? .oneMinute : .twoMinutes)
         _isPerformanceDeskVisible = State(
             initialValue: !Self.isAtmosphereReview
         )
@@ -1654,6 +1682,10 @@ struct SplashScreenView: View {
                     activePerformanceSession: activePerformanceSession,
                     onRun: runCurrentScene,
                     onStop: stopCurrentScene,
+                    onPauseResume: togglePerformancePause,
+                    auditionEnabled: $auditionEnabled,
+                    audioStatus: synthesizer.status + (synthesizer.outputLevel > 0.00001
+                        ? String(format: " · %.0f dB peak", 20 * log10(synthesizer.outputLevel)) : ""),
                     onHide: { isPerformanceDeskVisible = false }
                 )
                 .padding(.top, 10)
@@ -1674,9 +1706,87 @@ struct SplashScreenView: View {
 #endif
         }
         .background(PlanetFocusPalette.canvasInk.ignoresSafeArea())
+        .onAppear {
+            if let session = activePerformanceSession {
+                activeSplashScoreEvents = SplashMusicDirector.events(for: session)
+            } else if !Self.isAtmosphereReview,
+                      !ProcessInfo.processInfo.arguments.contains("--sunrise-audit"),
+                      let restored = try? JSONDecoder().decode(PerformanceSession.self, from: persistedPerformance),
+                      !PerformanceRunner(session: restored).sample(at: .now).isComplete {
+                activeSplashScoreEvents = SplashMusicDirector.events(for: restored)
+                activePerformanceSession = restored
+            }
+            synchronizeAudio()
+        }
+        .onChange(of: activePerformanceSession) { _, session in
+            persistedPerformance = (try? session.map { try JSONEncoder().encode($0) }) ?? Data()
+            synchronizeAudio()
+        }
+        .onChange(of: auditionEnabled) { _, _ in synchronizeAudio() }
+        .onChange(of: scenePhase) { _, _ in synchronizeAudio() }
+        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { notification in
+            if let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+               raw == AVAudioSession.InterruptionType.began.rawValue {
+                activePerformanceSession?.pause(at: .now)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { notification in
+            if let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+               raw == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue {
+                activePerformanceSession?.pause(at: .now)
+            }
+        }
+        .task(id: activePerformanceSession) {
+            guard let session = activePerformanceSession, !session.isPaused else { return }
+            try? await Task.sleep(for: .seconds(session.remainingTime(at: .now)))
+            guard !Task.isCancelled else { return }
+            synthesizer.fadeOut()
+        }
+        .onDisappear { synthesizer.fadeOut() }
+#if DEBUG
+        .onAppear {
+            if ProcessInfo.processInfo.arguments.contains("--sunrise-audit-landscape"),
+               let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeLeft)) { error in
+                    print("Sunrise landscape audit unavailable: \(error)")
+                }
+            }
+        }
+#endif
+    }
+
+    private func synchronizeAudio() {
+        guard scenePhase == .active, auditionEnabled,
+              ProcessInfo.processInfo.environment["SPLASH_AUDIO_DISABLED"] != "1",
+              let session = activePerformanceSession, !session.isPaused,
+              case .opening = stage else {
+            synthesizer.fadeOut()
+            return
+        }
+        synthesizer.play(session: session, events: splashScoreEvents + (manualEvent.map { [$0] } ?? []))
+    }
+
+    private func togglePerformancePause() {
+        guard var session = activePerformanceSession else { return }
+        if session.isPaused { session.resume(at: .now) }
+        else { session.pause(at: .now) }
+        activePerformanceSession = session
+    }
+
+    private func startSplashRun(_ duration: FocusDuration) {
+        let session = PerformanceSession(duration: duration, randomSeed: UInt64(max(scoreSeed, 0)))
+        motionTuning = SplashMotionTuning(amountMultiplier: motionTuning.amountMultiplier)
+        manualEvent = nil
+        activeSplashScoreEvents = SplashMusicDirector.events(for: session)
+        activePerformanceSession = session
     }
 
     private func selectMenu(_ item: SplashMenuItem) {
+        if item == .start, exitStartedAt == nil {
+            if activePerformanceSession == nil || activePerformanceSession?.progress(at: .now) == 1 { startSplashRun(runnerDuration) }
+            else { togglePerformancePause() }
+            return
+        }
         guard item == .stories, exitStartedAt == nil else { return }
         selectedMenu = item
         activePerformanceSession = nil
@@ -1755,24 +1865,37 @@ struct SplashScreenView: View {
     }
 
     private func triggerPerformanceEvent() {
-        let performanceElapsed = performanceClock.elapsed(at: Date())
+        guard activePerformanceSession?.isPaused != true else { return }
+        let performanceElapsed = activePerformanceSession?.elapsedTime(at: .now)
+            ?? performanceClock.elapsed(at: Date())
         let scoreBeat = SplashPerformanceScore.scoreBeat(
             for: performanceElapsed,
             tuning: motionTuning
         )
         manualEventSequence += 1
+        let attack = min(SplashPerformanceScore.noteEnvelope.attackBeats, manualGateBeats * 0.6)
+        let decay = min(SplashPerformanceScore.noteEnvelope.decayBeats, manualGateBeats - attack)
         manualEvent = SplashWaveNoteEvent(
             id: "manual-\(manualEventSequence)",
             tonalSlot: manualTonalSlot,
             startBeat: scoreBeat,
             gateBeats: manualGateBeats,
-            envelope: SplashPerformanceScore.noteEnvelope,
+            envelope: .init(attackBeats: attack, decayBeats: decay,
+                            sustainLevel: SplashPerformanceScore.noteEnvelope.sustainLevel,
+                            releaseBeats: SplashPerformanceScore.noteEnvelope.releaseBeats),
             role: .pad,
-            intensity: 1
+            intensity: 1,
+            isRepeating: false
         )
+        synchronizeAudio()
     }
 
     private func resetMotionTuning() {
+        if activePerformanceSession != nil {
+            motionTuning = .standard
+            resonanceTuning = .standard
+            return
+        }
         motionTuning.reset(
             performanceElapsed: performanceClock.elapsed(at: Date())
         )
@@ -1792,16 +1915,7 @@ struct SplashScreenView: View {
     private func runCurrentScene(_ duration: FocusDuration) {
         switch stage {
         case .opening:
-            // FocusSession currently names concrete stories. The splash uses the
-            // selected story as its future handoff while sharing this one clock.
-            let session = PerformanceSession(
-                duration: duration,
-                randomSeed: UInt64(max(scoreSeed, 0))
-            )
-            activePerformanceSession = session
-            activeSplashScoreEvents = SplashPerformanceScore.events(
-                seed: session.randomSeed
-            )
+            startSplashRun(duration)
         case .story:
             activePerformanceSession = PerformanceSession(
                 duration: duration,
@@ -1845,6 +1959,9 @@ private struct PerformanceDesk: View {
     let activePerformanceSession: PerformanceSession?
     let onRun: (FocusDuration) -> Void
     let onStop: () -> Void
+    let onPauseResume: () -> Void
+    @Binding var auditionEnabled: Bool
+    let audioStatus: String
     let onHide: () -> Void
 
     var body: some View {
@@ -1910,8 +2027,19 @@ private struct PerformanceDesk: View {
                         duration: $runnerDuration,
                         activeSession: activePerformanceSession,
                         onRun: onRun,
-                        onStop: onStop
+                        onStop: onStop,
+                        onPauseResume: context.isSplash ? onPauseResume : nil
                     )
+                    if context.isSplash {
+                        Toggle("Synth audition", isOn: $auditionEnabled)
+                            .font(.caption)
+                            .tint(PlanetFocusPalette.warmYellow)
+                        Text(audioStatus)
+                            .font(.caption2)
+                        Text("Temporary sounds—not the final recordings.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .padding(12)
@@ -2006,6 +2134,7 @@ private struct StoryRunnerControls: View {
     let activeSession: PerformanceSession?
     let onRun: (FocusDuration) -> Void
     let onStop: () -> Void
+    let onPauseResume: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -2027,6 +2156,12 @@ private struct StoryRunnerControls: View {
 
             if let activeSession {
                 StoryRunProgress(session: activeSession, contextTitle: contextTitle)
+                if let onPauseResume {
+                    Button(activeSession.isPaused ? "Resume" : "Pause", action: onPauseResume)
+                        .accessibilityIdentifier("performancePauseResume")
+                        .frame(maxWidth: .infinity)
+                        .buttonStyle(.bordered)
+                }
                 Button("End run", action: onStop)
                     .frame(maxWidth: .infinity)
                     .buttonStyle(.bordered)
@@ -2062,7 +2197,7 @@ private struct StoryRunProgress: View {
                     Text(
                         state.isComplete
                             ? "\(contextTitle) complete"
-                            : "Running \(contextTitle)"
+                            : (session.isPaused ? "Paused \(contextTitle)" : "Running \(contextTitle)")
                     )
                         .font(.caption.weight(.semibold))
                     Spacer()
@@ -2139,6 +2274,7 @@ private struct SplashTuningControls: View {
                 value: $speedMultiplier,
                 range: 0.25...4
             )
+            .disabled(isTransportDrivingLight)
             tuningRow(
                 label: "Amount",
                 value: $amountMultiplier,
@@ -2161,7 +2297,7 @@ private struct SplashTuningControls: View {
             .disabled(isTransportDrivingLight)
 
             if isTransportDrivingLight {
-                Text("The active runner now owns light and pool evolution.")
+                Text("The runner owns speed, light, and sound pools. Amount still adjusts visual strength.")
                     .font(.caption)
                     .foregroundStyle(PlanetFocusPalette.typePaleBlue.opacity(0.72))
             }
@@ -2252,6 +2388,7 @@ private struct SplashScoreMonitorContent: View {
 
     @State private var frozenScoreBeat: Double?
     @State private var reviewOffsetBeats = 0.0
+    @State private var cachedDiagnostics: SplashScoreDiagnostics?
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.15)) { context in
@@ -2313,7 +2450,7 @@ private struct SplashScoreMonitorContent: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("24-beat score roll")
                                 .font(.headline)
-                            Text("Every bar is a real score event. Its wave, ADSR, and future audio cue share this exact start and end.")
+                            Text("Every bar is a real score event. Its wave, ADSR, and synth voice share this exact start and end.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                             SplashScoreRoll(
@@ -2333,10 +2470,10 @@ private struct SplashScoreMonitorContent: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Fast review")
                                 .font(.headline)
-                            Text("Move through a deterministic ten-minute score without changing the live splash transport.")
+                            Text("Inspect the score without changing the live splash transport.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
-                            Slider(value: $reviewOffsetBeats, in: 0...650)
+                            Slider(value: $reviewOffsetBeats, in: 0...max((performanceSession?.duration.timeInterval ?? 600) / SplashPerformanceScore.tempo.secondsPerBeat, 1))
                                 .tint(PlanetFocusPalette.warmYellow)
                             Text(String(format: "+%.0f beats  |  +%.1f min", reviewOffsetBeats, reviewOffsetBeats * SplashPerformanceScore.tempo.secondsPerBeat / 60))
                                 .font(.footnote.monospacedDigit())
@@ -2369,7 +2506,7 @@ private struct SplashScoreMonitorContent: View {
                 Button(isFrozen ? "Resume live" : "Freeze", action: onFreezeToggle)
                     .buttonStyle(.bordered)
             }
-            Text(isFrozen ? "Monitor frozen; splash transport continues live." : "Live transport; score is silent until recorded assets arrive.")
+            Text(isFrozen ? "Monitor frozen; splash transport continues live." : "Live transport; synth audition is controlled in the runner.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             if let atmosphere {
@@ -2389,9 +2526,11 @@ private struct SplashScoreMonitorContent: View {
     }
 
     private var scoreDiagnostics: some View {
-        let diagnostics = SplashPerformanceScore.diagnostics(events: scoreEvents)
+        let diagnostics = cachedDiagnostics ?? SplashScoreDiagnostics(
+            averageActiveVoices: 0, longestSilentBeats: 0, averageEventDurationSeconds: 0,
+            eventsPerMinute: 0, participatingWaveCount: 0)
         return VStack(alignment: .leading, spacing: 8) {
-            Text("10-minute structural check")
+            Text(performanceSession == nil ? "10-minute structural check" : "Full-run structural check")
                 .font(.headline)
             HStack(spacing: 12) {
                 diagnostic("Avg voices", String(format: "%.1f", diagnostics.averageActiveVoices))
@@ -2401,6 +2540,11 @@ private struct SplashScoreMonitorContent: View {
                 diagnostic("Avg note", String(format: "%.1fs", diagnostics.averageEventDurationSeconds))
                 diagnostic("Wave coverage", "\(diagnostics.participatingWaveCount)/8")
             }
+        }
+        .task(id: "\(seed)-\(performanceSession?.duration.rawValue ?? 600)-\(scoreEvents.count)") {
+            cachedDiagnostics = SplashPerformanceScore.diagnostics(
+                durationMinutes: (performanceSession?.duration.timeInterval ?? 600) / 60,
+                events: scoreEvents)
         }
     }
 
@@ -2424,7 +2568,7 @@ private struct SplashScoreMonitorContent: View {
     ) -> some View {
         let sample = scheduledEvent.sample(at: scoreBeat)
         return HStack {
-            Text(SplashPerformanceScore.noteName(for: scheduledEvent.event.tonalSlot))
+            Text(SplashMusicDirector.noteName(for: scheduledEvent.event))
                 .font(.headline.monospaced())
                 .frame(width: 42, alignment: .leading)
             VStack(alignment: .leading) {
@@ -2456,7 +2600,7 @@ private struct SplashScoreMonitorContent: View {
             Text(String(format: "%.1f", scheduledEvent.scheduledStartBeat))
                 .font(.caption.monospacedDigit())
                 .frame(width: 42, alignment: .leading)
-            Text(SplashPerformanceScore.noteName(for: scheduledEvent.event.tonalSlot))
+            Text(SplashMusicDirector.noteName(for: scheduledEvent.event))
                 .font(.subheadline.monospaced())
                 .frame(width: 30, alignment: .leading)
             Text(SplashPerformanceScore.waveName(for: scheduledEvent.event.tonalSlot))

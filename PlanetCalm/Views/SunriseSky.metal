@@ -97,26 +97,56 @@ float noise21(float2 p) {
                mix(hash21(i + float2(0, 1)), hash21(i + 1), f.x), f.y);
 }
 
-// A thin cut-paper cloud. The signed distance is shared by artwork and ray occlusion.
-float cloudDistance(float2 point, float2 center, float width, float thickness, float seed) {
-    float x = (point.x - center.x) / width;
-    float taper = sqrt(max(0.0, 1.0 - x * x));
-    float contour = sin(x * 8 + seed) * 0.14 + sin(x * 19 - seed) * 0.08;
-    float y = point.y - center.y - thickness * (sin(x * 3 + seed) * 0.45);
-    float tornEdge = (noise21(point * 150 + seed) - 0.5) * 0.0013;
-    return max(abs(x) - 1, abs(y) - thickness * taper * (0.75 + contour)) + tornEdge;
+// One cloud study, assembled from three opaque paper sheets in shallow depth.
+// Coordinates and depths are short-side units; increasing z approaches the viewer.
+constant int paperCloudLayerCount = 3;
+constant float paperSunDepth = -0.60;
+struct PaperCloudLayer { float2 center; float2 size; float depth; float pigment; };
+
+PaperCloudLayer paperCloudLayer(int index, float aspect, float time) {
+    float drift = 0.025 * sin(time * 0.035);
+    // Balance the sun from the left; preserve the same lateral overlap as the
+    // viewport widens instead of centering a cloud directly above the disc.
+    float2 anchor = float2(aspect * 0.70 - 0.28 + drift, 0.40);
+    // Broad lit crown, with progressively smaller, offset sheets below it.
+    // Their lower edges remain exposed rather than hidden by the front sheet.
+    switch (index) {
+        case 0: return {anchor + float2( 0.014, 0.039), float2(0.205, 0.058), 0.13, 0.32};
+        case 1: return {anchor + float2(-0.013, 0.010), float2(0.240, 0.075), 0.16, 0.66};
+        default:return {anchor + float2( 0.002,-0.023), float2(0.275, 0.090), 0.19, 1.0};
+    }
 }
 
-float cloudSDF(float2 point, float aspect, float time) {
-    float drift = 0.035 * sin(time * 0.035);
-    float a = cloudDistance(point, float2(aspect * 0.65 + drift, 0.17), 0.29, 0.038, 2.4);
-    float b = cloudDistance(point, float2(aspect * 0.91 - drift * 0.7, 0.31), 0.25, 0.027, 5.1);
-    float c = cloudDistance(point, float2(aspect * 0.46 + drift * 0.5, 0.37), 0.19, 0.022, 8.7);
-    return min(a, min(b, c));
+// Elliptical paper lobes meet as one cut edge. No grain enters the occlusion mask.
+float cloudEllipse(float2 p, float2 center, float2 radii) {
+    return (length((p - center) / radii) - 1) * min(radii.x, radii.y);
+}
+float paperCloudDistance(float2 point, PaperCloudLayer layer) {
+    float2 p = (point - layer.center) / layer.size;
+    float d = cloudEllipse(p, float2(-0.72, 0.18), float2(0.29, 0.47));
+    d = min(d, cloudEllipse(p, float2(-0.43,-0.10), float2(0.37, 0.70)));
+    d = min(d, cloudEllipse(p, float2(-0.04,-0.25), float2(0.40, 0.83)));
+    d = min(d, cloudEllipse(p, float2( 0.37,-0.04), float2(0.37, 0.67)));
+    d = min(d, cloudEllipse(p, float2( 0.73, 0.22), float2(0.29, 0.42)));
+    return d * min(layer.size.x, layer.size.y);
+}
+float paperCloudAlpha(float2 point, PaperCloudLayer layer, float feather) {
+    return 1 - smoothstep(-feather, feather, paperCloudDistance(point, layer));
 }
 
-float cloudAlpha(float2 point, float aspect, float time, float feather) {
-    return 1 - smoothstep(-feather, feather, cloudSDF(point, aspect, time));
+// Intersect the source-to-receiver segment with each actual paper plane.
+// The same source x/y used by the sunrise determines every projected shadow.
+float paperSunVisibility(float2 receiver, float receiverDepth, float2 source,
+                         float aspect, float time, int ignoredLayer, float feather) {
+    float visibility = 1;
+    for (int j = 0; j < paperCloudLayerCount; ++j) {
+        PaperCloudLayer blocker = paperCloudLayer(j, aspect, time);
+        if (j == ignoredLayer || blocker.depth >= receiverDepth) continue;
+        float t = (blocker.depth - paperSunDepth) / (receiverDepth - paperSunDepth);
+        float2 intersection = mix(source, receiver, t);
+        visibility *= 1 - paperCloudAlpha(intersection, blocker, feather);
+    }
+    return visibility;
 }
 
 float3 toLab(float3 c) {
@@ -180,15 +210,14 @@ fragment half4 sunriseFragment(SkyVertex in [[stage_in]],
 
     float cloudTime = u.story.w;
     float aspect = size.x / shortSide;
-    float cloudCover = cloudAlpha(point, aspect, cloudTime, 0.0015);
-    // Screen-space approximation of volumetric visibility (GPU Gems 3, ch. 13).
-    // Integrate only the untextured mask so grain cannot streak into fake rays.
-    float occlusion = 0;
-    for (int i = 0; i < 40; ++i) {
-        float t = (float(i) + 0.5) / 40;
-        occlusion += cloudAlpha(mix(sunPoint, point, t), aspect, cloudTime, 0.008) / 40;
+    // A shallow scattering slab samples shadows cast by the separate paper planes.
+    // This is a 2.5D approximation, not a volume of simulated cloud droplets.
+    float visibility = 0;
+    for (int i = 0; i < 24; ++i) {
+        float receiverDepth = mix(0.22, 0.85, (float(i) + 0.5) / 24);
+        visibility += paperSunVisibility(point, receiverDepth, sunPoint,
+                                        aspect, cloudTime, -1, 0.005) / 24;
     }
-    float visibility = exp(-occlusion * 12);
     float rayWindow = sin(pi * p) * sin(pi * p);
     float3 radiance = (light.rayleigh + light.mie * mix(1.0, visibility, 0.7 * rayWindow)) * 12.0;
     float exposure = u.optics.y;
@@ -217,22 +246,65 @@ fragment half4 sunriseFragment(SkyVertex in [[stage_in]],
     // variation until the end; this does not determine the preceding sky colors.
     // The widening spatial field reaches the entire canvas continuously at 100%.
 
-    float3 cloudColor = warmPaperBlend(sRGBToLinear(float3(42, 44, 81) / 255.0),
-                            sRGBToLinear(float3(229, 157, 161) / 255.0), smoothstep(0.1, 0.85, p));
-    constexpr sampler paperSampler(coord::normalized, address::repeat, filter::linear);
-    float drift = 0.035 * sin(cloudTime * 0.035);
-    float cloudA = cloudDistance(point, float2(aspect * 0.65 + drift, 0.17), 0.29, 0.038, 2.4);
-    float cloudB = cloudDistance(point, float2(aspect * 0.91 - drift * 0.7, 0.31), 0.25, 0.027, 5.1);
-    float cloudC = cloudDistance(point, float2(aspect * 0.46 + drift * 0.5, 0.37), 0.19, 0.022, 8.7);
-    float cloudOffset = cloudA <= min(cloudB, cloudC) ? drift : cloudB <= cloudC ? -drift * 0.7 : drift * 0.5;
-    float2 cloudLocal = point - float2(cloudOffset, 0);
-    float paper = float(grain.sample(paperSampler, cloudLocal * shortSide / 380.0).r);
-    cloudColor *= 0.92 + paper * 0.16;
-    float rim = cloudAlpha(point + normalize(sunPoint - point + 0.0001) * 0.004, aspect, cloudTime, 0.003);
-    cloudColor += gold * (1 - rim) * 0.15 * sin(pi * p);
-    float cloudPresence = 0.80;
-    color = mix(color, cloudColor, cloudCover * cloudPresence);
+    // The paper finish receives the same projected shadow as the scattering slab.
+    // Keep uncovered pixels exactly on the approved sunrise's color path.
+    color *= 1 - (1 - visibility) * 0.24 * rayWindow;
+
     float3 output = linearToSRGB(clamp(color, 0.0, 1.0));
     output += (hash21(in.position.xy) - 0.5) / 255.0;
     return half4(half3(output), 1);
+}
+
+fragment half4 paperCloudFragment(SkyVertex in [[stage_in]],
+                                    constant SunriseUniforms &u [[buffer(0)]],
+                                    texture2d<half> grain [[texture(1)]]) {
+    float2 size = u.viewport.xy;
+    float shortSide = min(size.x, size.y);
+    float2 point = in.uv * size / shortSide;
+    float2 sunPoint = u.viewport.zw / shortSide;
+    float aspect = size.x / shortSide;
+    float cloudTime = u.story.w;
+    float p = saturate(u.story.x);
+    float3 gold = sRGBToLinear(float3(255, 206, 88) / 255.0);
+    float3 color = 0;
+    float alpha = 0;
+    constexpr sampler paperSampler(coord::normalized, address::repeat, filter::linear);
+    float dawn = smoothstep(0.05, 0.45, p);
+    float day = smoothstep(0.65, 1.0, p);
+    // Blue/slate backs and cream faces; sunrise light adds peach to exposed pieces.
+    float3 coolBack = sRGBToLinear(float3(49, 76, 111) / 255.0);
+    float3 coolFace = sRGBToLinear(float3(188, 205, 222) / 255.0);
+    float3 warmBack = sRGBToLinear(float3(151, 120, 169) / 255.0);
+    float3 warmFace = sRGBToLinear(float3(255, 218, 187) / 255.0);
+    float3 dayBack = sRGBToLinear(float3(99, 132, 162) / 255.0);
+    float3 dayFace = sRGBToLinear(float3(249, 244, 232) / 255.0);
+    float3 backPigment = mix(mix(coolBack, warmBack, dawn), dayBack, day);
+    float3 facePigment = mix(mix(coolFace, warmFace, dawn), dayFace, day);
+    for (int i = 0; i < paperCloudLayerCount; ++i) {
+        PaperCloudLayer layer = paperCloudLayer(i, aspect, cloudTime);
+        float cover = paperCloudAlpha(point, layer, 0.001);
+        // Contact shading makes the stacked paper thickness readable even in shade.
+        // It is a restrained studio-fill cue, separate from solar occlusion.
+        float contact = paperCloudAlpha(point - float2(0.001, 0.005), layer, 0.0035);
+        float shadowAlpha = contact * (1 - cover) * 0.22;
+        color *= 1 - shadowAlpha;
+        alpha = shadowAlpha + alpha * (1 - shadowAlpha);
+        if (cover <= 0) continue;
+        float direct = paperSunVisibility(point, layer.depth, sunPoint,
+                                          aspect, cloudTime, i, 0.003);
+        float3 pigment = mix(backPigment, facePigment, layer.pigment);
+        float3 face = pigment * (0.76 + 0.24 * direct);
+        float paper = float(grain.sample(paperSampler,
+            (point - layer.center) * shortSide / 240.0 + float2(i * 0.27, i * 0.13)).r);
+        face *= 0.88 + paper * 0.24;
+        float2 towardSun = normalize(sunPoint - point + float2(0.0001));
+        float edge = 1 - paperCloudAlpha(point + towardSun * 0.003, layer, 0.001);
+        face += gold * edge * 0.12 * sin(pi * p);
+        color = mix(color, face, cover);
+        alpha = cover + alpha * (1 - cover);
+    }
+
+    // UIKit composites the clear cloud surface over the separately drawn paper sun.
+    float3 straight = color / max(alpha, 0.00001);
+    return half4(half3(linearToSRGB(clamp(straight, 0.0, 1.0)) * alpha), half(alpha));
 }
