@@ -73,8 +73,10 @@ generic wellness-app cards, or default Apple styling as the visual direction.
 - Separate clock, story direction, rendering, audio, persistence, and navigation.
 - `StoryPlayer` combines the authoritative session clock, selected module, director,
   and session plan. `StoryDirector` owns only story-specific creative choices.
-- Use normalized session progress (`0...1`) from persisted start/end time. Do not use
-  animation-frame count as time; relaunch, backgrounding, and device lock must reconcile.
+- Use normalized session progress (`0...1`) from the in-memory start/end time, never
+  animation-frame count. Backgrounding and device lock keep the timer running;
+  cancellation or process termination discards it. No user-facing pause or restore.
+  Development playback tools belong exclusively inside Controls.
 - Represent synchronized visual/audio behavior as shared `StoryMoment` values. Visual
   and audio systems consume moments; they do not command each other directly.
 - Build the visual runtime before production audio. Keep audio cues in plans and use a

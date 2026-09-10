@@ -5,10 +5,10 @@ import SwiftUI
 struct StorySceneRenderContext: Equatable {
     let progress: Double
     let elapsedTime: TimeInterval
-    let referenceDate: Date
     let performance: StoryPerformance
     let reduceMotion: Bool
-    let showsFocusUI: Bool
+    var duration: TimeInterval = 120
+    var randomSeed: UInt64 = 42
 }
 
 @MainActor
@@ -17,14 +17,7 @@ enum StorySceneCatalog {
     static func scene(for story: Story, context: StorySceneRenderContext) -> some View {
         switch story {
         case .autumnTree:
-            AutumnTreeSceneView(
-                progress: context.progress,
-                elapsedTime: context.elapsedTime,
-                referenceDate: context.referenceDate,
-                performance: context.performance,
-                reduceMotion: context.reduceMotion,
-                showsFocusUI: context.showsFocusUI
-            )
+            AutumnBranchSnapshotView(context: context)
 
         case .contemporaryLotus:
             ContemporaryLotusStageView(context: context)

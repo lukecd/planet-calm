@@ -6,9 +6,6 @@ struct StoryPlayer {
     private let director: any StoryDirector
     private let plan: StoryPlan
 
-    /// Immutable schedule for renderer reconciliation, including past/future identities.
-    var scheduledMoments: [StoryMoment] { plan.moments }
-
     init(session: FocusSession, module: (any StoryModule)? = nil) {
         let resolvedModule = module ?? StoryCatalog.module(for: session.story)
         precondition(resolvedModule.story == session.story)
@@ -39,13 +36,4 @@ struct StoryPlayer {
         return director.performance(at: context, plan: plan)
     }
 
-    func moments(startingAfter previousDate: Date, through date: Date) -> [StoryMoment] {
-        let lowerBound = session.elapsedTime(at: previousDate)
-        let upperBound = session.elapsedTime(at: date)
-        guard upperBound >= lowerBound else { return [] }
-
-        return plan.moments.filter {
-            $0.startTime > lowerBound && $0.startTime <= upperBound
-        }
-    }
 }

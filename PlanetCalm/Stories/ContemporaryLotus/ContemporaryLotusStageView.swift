@@ -103,10 +103,10 @@ struct ContemporaryLotusReviewView: View {
             context: StorySceneRenderContext(
                 progress: session.progress(at: referenceDate),
                 elapsedTime: session.elapsedTime(at: referenceDate),
-                referenceDate: referenceDate,
                 performance: player.performance(at: referenceDate, reduceMotion: reduceMotion),
                 reduceMotion: reduceMotion,
-                showsFocusUI: false
+                duration: session.duration.timeInterval,
+                randomSeed: session.randomSeed
             )
         )
         .ignoresSafeArea()

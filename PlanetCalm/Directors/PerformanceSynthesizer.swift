@@ -49,6 +49,16 @@ final class PerformanceSynthesizer {
     private var runToken = UUID()
     private var engine: AVAudioEngine?
     private var fadeTask: Task<Void, Never>?
+    private(set) var volume: Float = 0.65
+    private(set) var isMuted = false
+    var effectiveVolume: Float { isMuted ? 0 : volume }
+
+    /// Output-only control: never rebuild the score or alter the shared transport.
+    func setOutput(volume: Double, isMuted: Bool) {
+        self.volume = volume.isFinite ? Float(min(1, max(0, volume))) : 0
+        self.isMuted = isMuted
+        engine?.mainMixerNode.outputVolume = effectiveVolume
+    }
 
     func play(session: PerformanceSession, events: [SplashWaveNoteEvent]) {
         stop()
@@ -104,7 +114,7 @@ final class PerformanceSynthesizer {
             }
             engine.attach(node)
             engine.connect(node, to: engine.mainMixerNode, format: format)
-            engine.mainMixerNode.outputVolume = 0.65
+            engine.mainMixerNode.outputVolume = effectiveVolume
             let token = UUID()
             runToken = token
             engine.mainMixerNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { @Sendable [weak self] buffer, _ in

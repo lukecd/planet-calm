@@ -1266,12 +1266,13 @@ private enum PerformanceDeskContext {
 struct SplashScreenView: View {
     @Binding var selectedStory: Story
     @Environment(\.scenePhase) private var scenePhase
-    @AppStorage("splash.performance.session.v1") private var persistedPerformance = Data()
-    @AppStorage("performance.activeStory.v1") private var persistedStory = ""
     @AppStorage("autumn.branch.record.v1") private var persistedAutumn = Data()
     @State private var autumnRecord = AutumnBranchRecord()
     @State private var synthesizer = PerformanceSynthesizer()
     @State private var auditionEnabled = true
+    @State private var sceneVolume = 0.65
+    @State private var sceneMuted = false
+    @State private var showsSceneSettings = false
     @State private var runnerDuration: FocusDuration = .fiveMinutes
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selectedMenu: SplashMenuItem = .start
@@ -1299,7 +1300,7 @@ struct SplashScreenView: View {
 #if DEBUG
         let initialStage: SplashScreenStage = ProcessInfo.processInfo.arguments.contains(
             "--story-chooser-review"
-        ) ? .chooser : ProcessInfo.processInfo.arguments.contains("--autumn-checkpoint") || ProcessInfo.processInfo.arguments.contains("--autumn-light-audit") ? .story(.autumnTree) : .opening
+        ) ? .chooser : ProcessInfo.processInfo.arguments.contains("--autumn-checkpoint") || ProcessInfo.processInfo.arguments.contains("--autumn-light-audit") || ProcessInfo.processInfo.arguments.contains("--session-ui-review") || ProcessInfo.processInfo.arguments.contains("--session-ending-review") || ProcessInfo.processInfo.arguments.contains("--deer-study") ? .story(.autumnTree) : .opening
 #else
         let initialStage: SplashScreenStage = .opening
 #endif
@@ -1310,7 +1311,7 @@ struct SplashScreenView: View {
 #if DEBUG
         _runnerDuration = State(initialValue: Self.isRunnerReview ? .oneMinute : .twoMinutes)
         _isPerformanceDeskVisible = State(
-            initialValue: !Self.isAtmosphereReview
+            initialValue: !Self.isAtmosphereReview && (Self.isRunnerReview || Self.isScoreMonitorReview || Self.isResonanceReview || ProcessInfo.processInfo.arguments.contains("--autumn-checkpoint") || ProcessInfo.processInfo.arguments.contains("--autumn-light-audit"))
         )
         _expandedPerformanceDeskSections = State(
             initialValue: Self.isScoreMonitorReview
@@ -1320,7 +1321,9 @@ struct SplashScreenView: View {
                     : [.splashTuning]
         )
         _activePerformanceSession = State(
-            initialValue: Self.isRunnerReview
+            initialValue: ProcessInfo.processInfo.arguments.contains("--session-ending-review")
+                ? PerformanceSession(duration: .oneMinute, startedAt: .now.addingTimeInterval(-58))
+                : Self.isRunnerReview
                 ? PerformanceSession(
                     duration: .oneMinute,
                     randomSeed: SplashPerformanceScore.defaultSeed
@@ -1527,14 +1530,21 @@ struct SplashScreenView: View {
                     story: story,
                     session: activePerformanceSession,
                     autumnRecord: autumnRecord,
+                    volume: $sceneVolume,
+                    isMuted: $sceneMuted,
+                    showsSettings: $showsSceneSettings,
                     onStart: { duration in
                         autumnRecord.manualGusts = []
+                        autumnRecord.bird?.flight = nil
+                        autumnRecord.deer?.encounter = nil
                         activeSplashScoreEvents = nil
-                        activePerformanceSession = PerformanceSession(duration: duration, randomSeed: UInt64(max(scoreSeed, 0)))
-                    },
-                    onPauseResume: togglePerformancePause
+                        activePerformanceSession = PerformanceSession(duration: duration)
+                    }
                 ) {
+                    showsSceneSettings = false
                     activePerformanceSession = nil
+                    activeSplashScoreEvents = nil
+                    autumnRecord = autumnRecord.settingsOnly
                     stage = .chooser
                 }
             }
@@ -1565,6 +1575,8 @@ struct SplashScreenView: View {
                         guard let session = activePerformanceSession, !session.isPaused else { return }
                         autumnRecord.manualGusts.append(session.elapsedTime(at: .now))
                     },
+                    onAutumnBird: triggerAutumnBird,
+                    onAutumnDeer: triggerAutumnDeer,
                     speedMultiplier: motionSpeedBinding,
                     amountMultiplier: motionAmountBinding,
                     atmosphereProgress: $atmosphereProgress,
@@ -1594,64 +1606,91 @@ struct SplashScreenView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             } else if performanceDeskContext != nil, !Self.isAtmosphereReview {
                 Button {
+                    showsSceneSettings = false
                     isPerformanceDeskVisible = true
                 } label: {
-                    Label("Controls", systemImage: "slider.horizontal.3")
+                    Label(stage == .opening ? "Controls" : "Dev controls", systemImage: "slider.horizontal.3")
                 }
+                .accessibilityIdentifier("developerControls")
                 .buttonStyle(.borderedProminent)
                 .tint(PlanetFocusPalette.canvasInk.opacity(0.92))
                 .padding(.top, 10)
                 .padding(.trailing, 16)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .padding(.bottom, 12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity,
+                    alignment: stage == .opening ? .topTrailing : .bottomTrailing)
             }
 #endif
         }
         .background(PlanetFocusPalette.canvasInk.ignoresSafeArea())
         .onAppear {
+            // Migrate away from resumable sessions. Only development settings survive
+            // process termination; backgrounding keeps the in-memory clock running.
+            UserDefaults.standard.removeObject(forKey: "splash.performance.session.v1")
+            UserDefaults.standard.removeObject(forKey: "performance.activeStory.v1")
             if !ProcessInfo.processInfo.arguments.contains("--autumn-light-audit"),
                !ProcessInfo.processInfo.arguments.contains("--autumn-fresh"),
                let record = try? JSONDecoder().decode(AutumnBranchRecord.self, from: persistedAutumn) {
-                autumnRecord = record
+                autumnRecord = record.settingsOnly
+                persistedAutumn = (try? JSONEncoder().encode(record.settingsOnly)) ?? Data()
             }
+#if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--autumn-encounter-review") {
+                // Exercise the production schedule, not the manual bird trigger.
+                let duration: FocusDuration = ProcessInfo.processInfo.arguments.contains("--encounter-long")
+                    ? FocusDuration(minutes: 55)! : .fiveMinutes
+                let plan = AutumnBranchPlan(duration: duration.timeInterval, seed: 42,
+                    tuning: .standard, isFullTree: true)
+                let onset = plan.encounters.birds.first?.startTime ?? 30
+                autumnRecord = .init()
+                stage = .story(.autumnTree)
+                activePerformanceSession = PerformanceSession(duration: duration,
+                    startedAt: .now.addingTimeInterval(-max(0, onset - 3)), randomSeed: 42)
+            }
+            if ProcessInfo.processInfo.arguments.contains("--deer-study") {
+                let prefix = "--deer-pose="
+                let pose = ProcessInfo.processInfo.arguments.first { $0.hasPrefix(prefix) }
+                    .flatMap { Double($0.dropFirst(prefix.count)) }
+                triggerAutumnDeer(pose)
+            }
+#endif
             if let session = activePerformanceSession {
                 activeSplashScoreEvents = SplashMusicDirector.events(for: session)
-            } else if !Self.isAtmosphereReview,
-                      !ProcessInfo.processInfo.arguments.contains("--sunrise-audit"),
-                      !ProcessInfo.processInfo.arguments.contains("--autumn-light-audit"),
-                      !ProcessInfo.processInfo.arguments.contains("--autumn-fresh"),
-                      let restored = try? JSONDecoder().decode(PerformanceSession.self, from: persistedPerformance),
-                      !PerformanceRunner(session: restored).sample(at: .now).isComplete {
-                if let story = Story(rawValue: persistedStory) {
-                    stage = .story(story)
-                    activeSplashScoreEvents = nil
-                } else {
-                    activeSplashScoreEvents = SplashMusicDirector.events(for: restored)
-                }
-                activePerformanceSession = restored
             }
             synchronizeAudio()
         }
         .onChange(of: autumnRecord) { _, record in
-            persistedAutumn = (try? JSONEncoder().encode(record)) ?? Data()
+            persistedAutumn = (try? JSONEncoder().encode(record.settingsOnly)) ?? Data()
         }
-        .onChange(of: activePerformanceSession) { _, session in
-            if case .story(let story) = stage { persistedStory = story.rawValue }
-            else { persistedStory = "" }
-            persistedPerformance = (try? session.map { try JSONEncoder().encode($0) }) ?? Data()
+        .onChange(of: activePerformanceSession) { _, _ in
             synchronizeAudio()
         }
         .onChange(of: auditionEnabled) { _, _ in synchronizeAudio() }
+        .onChange(of: sceneVolume) { _, _ in synchronizeSceneOutput() }
+        .onChange(of: sceneMuted) { _, _ in synchronizeSceneOutput() }
+#if DEBUG
+        .onChange(of: showsSceneSettings) { _, shown in
+            if shown { isPerformanceDeskVisible = false }
+        }
+        .onChange(of: isPerformanceDeskVisible) { _, shown in
+            if shown { showsSceneSettings = false }
+        }
+#endif
         .onChange(of: scenePhase) { _, _ in synchronizeAudio() }
         .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { notification in
             if let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                raw == AVAudioSession.InterruptionType.began.rawValue {
-                activePerformanceSession?.pause(at: .now)
+                synthesizer.fadeOut()
+            } else {
+                synchronizeAudio()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { notification in
             if let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
                raw == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue {
-                activePerformanceSession?.pause(at: .now)
+                // Losing headphones silences audio, never pauses a focus session.
+                auditionEnabled = false
+                synthesizer.fadeOut()
             }
         }
         .task(id: activePerformanceSession) {
@@ -1674,6 +1713,7 @@ struct SplashScreenView: View {
     }
 
     private func synchronizeAudio() {
+        synchronizeSceneOutput()
         guard scenePhase == .active, auditionEnabled,
               ProcessInfo.processInfo.environment["SPLASH_AUDIO_DISABLED"] != "1",
               let session = activePerformanceSession, !session.isPaused,
@@ -1684,12 +1724,18 @@ struct SplashScreenView: View {
         synthesizer.play(session: session, events: splashScoreEvents + (manualEvent.map { [$0] } ?? []))
     }
 
+    private func synchronizeSceneOutput() {
+        synthesizer.setOutput(volume: sceneVolume, isMuted: sceneMuted)
+    }
+
+#if DEBUG
     private func togglePerformancePause() {
         guard var session = activePerformanceSession else { return }
         if session.isPaused { session.resume(at: .now) }
         else { session.pause(at: .now) }
         activePerformanceSession = session
     }
+#endif
 
     private func startSplashRun(_ duration: FocusDuration) {
         let session = PerformanceSession(duration: duration, randomSeed: UInt64(max(scoreSeed, 0)))
@@ -1701,8 +1747,9 @@ struct SplashScreenView: View {
 
     private func selectMenu(_ item: SplashMenuItem) {
         if item == .start, exitStartedAt == nil {
-            if activePerformanceSession == nil || activePerformanceSession?.progress(at: .now) == 1 { startSplashRun(runnerDuration) }
-            else { togglePerformancePause() }
+            activePerformanceSession = nil
+            activeSplashScoreEvents = nil
+            stage = .story(selectedStory)
             return
         }
         guard item == .stories, exitStartedAt == nil else { return }
@@ -1836,6 +1883,8 @@ struct SplashScreenView: View {
             startSplashRun(duration)
         case .story:
             autumnRecord.manualGusts = []
+            autumnRecord.bird?.flight = nil
+            autumnRecord.deer?.encounter = nil
             activePerformanceSession = PerformanceSession(
                 duration: duration,
                 randomSeed: UInt64(max(scoreSeed, 0))
@@ -1844,6 +1893,36 @@ struct SplashScreenView: View {
         case .chooser:
             break
         }
+    }
+
+    private func triggerAutumnBird() {
+        var study = autumnRecord.bird ?? AutumnBirdStudy()
+        let prototype = AutumnOrigamiFlight(startTime: 0, seed: UInt64(max(scoreSeed, 0)), tuning: study.tuning)
+        // Near the end, start a fresh run so the finite study has time to finish.
+        if activePerformanceSession == nil ||
+            (activePerformanceSession?.remainingTime(at: .now) ?? 0) < prototype.duration + 1 {
+            runCurrentScene(runnerDuration)
+        }
+        guard var session = activePerformanceSession else { return }
+        if session.isPaused { session.resume(at: .now); activePerformanceSession = session }
+        study.flight = AutumnOrigamiFlight(startTime: session.elapsedTime(at: .now),
+            seed: session.randomSeed, tuning: study.tuning)
+        autumnRecord.bird = study
+    }
+
+    private func triggerAutumnDeer(_ poseTime: Double?) {
+        var study = autumnRecord.deer ?? AutumnDeerStudy()
+        let encounter = AutumnDeerEncounter.scheduled(duration:120,tuning:study.tuning)
+        var session = PerformanceSession(duration:.twoMinutes,
+            startedAt:.now.addingTimeInterval(-encounter.startTime-(poseTime ?? 0)),
+            randomSeed:UInt64(max(scoreSeed,0)))
+        if poseTime != nil { session.pause(at:.now) }
+        study.encounter = encounter
+        autumnRecord.deer = study
+        autumnRecord.bird?.flight = nil
+        autumnRecord.manualGusts = []
+        activePerformanceSession = session
+        activeSplashScoreEvents = nil
     }
 
     private func stopCurrentScene() {
@@ -1860,6 +1939,8 @@ private struct PerformanceDesk: View {
     let context: PerformanceDeskContext
     @Binding var autumnRecord: AutumnBranchRecord
     let onAutumnGust: () -> Void
+    let onAutumnBird: () -> Void
+    let onAutumnDeer: (Double?) -> Void
     @Binding var speedMultiplier: Double
     @Binding var amountMultiplier: Double
     @Binding var atmosphereProgress: Double
@@ -1912,7 +1993,8 @@ private struct PerformanceDesk: View {
                         )
                     } else if case .story(.autumnTree) = context {
                         AutumnBranchControls(record: $autumnRecord, seed: $scoreSeed,
-                            session: activePerformanceSession, onGust: onAutumnGust)
+                            session: activePerformanceSession, onGust: onAutumnGust, onBird: onAutumnBird,
+                            onDeer: onAutumnDeer)
                     } else {
                         Text("This section is reserved for controls published by the active story director. It does not alter the splash while \(context.title) is open.")
                             .font(.caption)
@@ -2077,6 +2159,7 @@ private struct StoryRunnerControls: View {
                     }
                 }
                 .pickerStyle(.menu)
+                .accessibilityIdentifier("storyRunnerLength")
             }
 
             if let activeSession {

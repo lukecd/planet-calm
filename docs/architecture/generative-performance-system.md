@@ -1,6 +1,6 @@
 # Generative Performance System
 
-**Status:** live splash integration with temporary synthesized audio · **Updated:** 2026-09-09
+**Status:** live splash integration with temporary synthesized audio · **Updated:** 2026-09-10
 
 One authoritative transport and one seeded score drive narrative motion and sound.
 The splash is the first integrated consumer. Autumn now has an integrated branch
@@ -18,7 +18,7 @@ migrated. See [Autumn branch checkpoint](autumn-branch-checkpoint.md).
 | `SplashAtmosphereDirector` | Progress-to-pool weights, semantic palette, and renderer-independent sunrise state. |
 | `SplashPerformanceScore` | Shared tempo, note envelopes, scheduled-event queries, and visual sampling. Its old repeating score is a calibration fixture only. |
 | `PerformanceSynthesizer` | Temporary native audio consumer of the same event plan. It does not invent note timing or random choices. |
-| `SplashScreenView` | Connect transport, plan, renderer, audition, lifecycle, persistence, and the nonblocking performance desk. |
+| `SplashScreenView` | Connect transport, plan, renderer, audition, session lifetime, settings persistence, and the nonblocking performance desk. |
 | `StoryPlayer` / `StoryDirector` / `StoryMoment` | Existing focus-story adapters and visual/audio moment contract. Preserve them when adapting other scenes. |
 
 Implementation lives in `PlanetCalm/Directors/`, with shared note/envelope/source contracts in
@@ -29,9 +29,22 @@ pool selector, ADSR implementation, or independently randomized audio schedule.
 ## Transport and lifecycle
 
 A run's selected duration is the complete darkness-to-daylight story length. Debug
-offers 1 and 2 minutes as well as the existing 5–50-minute choices. Start begins a
-splash run; the runner accordion exposes restart, pause/resume, end, and synth audition.
-The bottom Start control can also start or pause/resume the splash.
+offers 1 and 2 minutes exclusively in development Controls. Scene settings offers every whole
+minute from 5 to 55 before starting, using a slider with gentle five-minute detents and no typed entry. The shared
+`FocusDuration` value retains its integer-seconds serialization. The splash Start
+opens the selected story's setup. A handwritten duration / Tap to begin group at the
+top starts a fresh session with a fresh seed, then fades into a large handwritten
+countdown in the same position. End session opens the Exit
+confirmation. No public pause, replay, or restore exists. The development
+runner accordion retains restart, pause/resume, end, and synth audition.
+
+The non-blocking Scene settings panel locks duration while a session exists. Volume
+and mute stay live and only affect `PerformanceSynthesizer` mixer output; they do not
+pause transport, discard scheduled notes, or reset the story. Scene audio settings
+are in-memory UI state, not a new persistence service. Autumn currently has cue
+intents but no playable soundtrack, so settings explicitly report its silent status.
+Only Splash currently invokes synth playback. Preferred duration and app-wide audio
+preferences are deferred.
 
 Elapsed time is clamped to the duration and is calculated as:
 
@@ -41,19 +54,21 @@ elapsed = clamp(sampleDate - startedAt - accumulatedPause, 0, duration)
 progress = elapsed / duration
 ```
 
-Pause freezes all consumers at the same elapsed time. Resume adds the pause interval
+Development pause freezes all consumers at the same elapsed time. Resume adds the pause interval
 without resetting the seed, envelopes, or note identities. Restart creates a new
 session at zero using the selected seed, so repeated auditions are comparable.
 Change the seed between runs for another deterministic variation.
 
-The splash stores its transport in the app's local preferences. On relaunch, an
-unfinished run regenerates the same score and reconciles to its current time; a paused
-run remains paused. Background/inactive audio stops, while an unpaused story keeps
-wall-clock progress. Foreground playback resumes current note envelopes, never a
-burst of missed attacks. Audio interruptions and headphone disconnection explicitly
-pause the run and require resume. Background audio playback is not enabled.
+Active sessions are memory-only. Explicit cancellation or process termination
+discards them; relaunch does not restore progress, and legacy saved-session keys
+are removed. Only tuning settings persist, excluding manually triggered events.
+Screen lock, app backgrounding, and audio interruptions leave wall-clock progress
+running. Background/inactive audio stops; foreground playback reconciles current
+envelopes rather than bursting missed attacks. Headphone disconnection silences
+audition without pausing the timer. Background audio playback is not enabled.
 
-An ended/completed run has no future notes. Completion holds the final sunrise state.
+An ended/completed run has no future notes. Completion holds the final scene with
+Complete / Return to stories returning to the chooser; it never offers replay.
 The app does not start another musical cycle automatically. Calibration mode remains
 available when no finite run is active.
 
@@ -141,9 +156,9 @@ brightness. Gain is conservative and output is soft-limited. Resume/unmute has a
 short click-prevention ramp; pause/end fades output briefly. These are audition
 instruments, not an assertion that the final music is approved.
 
-The app uses an ambient, mixing audio session and respects silent mode. Existing
-focus-story `StoryAudioEngine` remains silent; it has not been silently switched to
-this splash audition.
+The app uses an ambient, mixing audio session and respects silent mode. Focus
+stories retain audio-cue data but are not wired to this splash audition. The unused
+silent dispatcher has been removed; it is not a second playback service to extend.
 
 Relevant Apple API contracts:
 [Source render callback](https://developer.apple.com/documentation/avfaudio/avaudiosourcenoderenderblock)
@@ -164,7 +179,8 @@ Do that as a separate scoped integration after the splash checkpoint is accepted
 
 ## Verification and limits
 
-Automated checks cover pause/resume persistence, deterministic seeds, finite endings,
+Automated checks cover development pause/resume, settings-only persistence,
+cancel/discard, background continuation, no relaunch restoration, deterministic seeds, finite endings,
 drone continuity, active-wave density, event/audio envelope identity, source-key
 stability, offline PCM output, live mixer output, and nonblocking playback controls.
 Use the one-minute rendered audition to evaluate musical structure, then audition
