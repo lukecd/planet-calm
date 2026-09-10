@@ -1,14 +1,865 @@
 import XCTest
+import simd
 import AVFoundation
 #if canImport(UIKit)
 import UIKit
-import SpriteKit
 import SwiftUI
 import CryptoKit
 #endif
 @testable import PlanetCalm
 
 final class PlanetCalmTests: XCTestCase {
+    func testAutomaticEncountersAcrossEveryDurationAndManySeeds() {
+        for minutes in 5...55 {
+            let duration = Double(minutes * 60)
+            for seed in 0..<100 {
+                let plan = AutumnBranchPlan(duration: duration, seed: UInt64(seed), tuning: .standard, isFullTree: true)
+                let schedule = plan.encounters
+                XCTAssertEqual(schedule, AutumnEncounterSchedule(duration: duration, seed: UInt64(seed), deer: plan.deerEnding))
+                XCTAssertGreaterThan(schedule.decisions.count, 0)
+                XCTAssertEqual(Set(schedule.birds.map { $0.moment.id }).count, schedule.birds.count)
+                XCTAssertLessThanOrEqual(plan.deerEnding.restingTime, duration - 8)
+                for flight in schedule.birds {
+                    XCTAssertGreaterThanOrEqual(flight.startTime, 22)
+                    XCTAssertLessThanOrEqual(flight.startTime + flight.duration, min(duration * 0.82, plan.deerEnding.startTime - 8))
+                    XCTAssertTrue((23...32).contains(flight.duration))
+                    XCTAssertEqual(schedule.bird(at: flight.startTime), flight)
+                    XCTAssertNil(schedule.bird(at: flight.startTime + flight.duration + 0.01))
+                    for breeze in plan.gusts {
+                        XCTAssertTrue(breeze.endTime + 6 <= flight.startTime || breeze.startTime >= flight.startTime + flight.duration + 8)
+                    }
+                }
+                for pair in zip(schedule.birds, schedule.birds.dropFirst()) {
+                    XCTAssertGreaterThanOrEqual(pair.1.startTime - (pair.0.startTime + pair.0.duration), 90)
+                }
+                for pair in zip(schedule.decisions, schedule.decisions.dropFirst()) {
+                    XCTAssertTrue((21.999...44.001).contains(pair.1.time - pair.0.time))
+                }
+                XCTAssertNil(schedule.bird(at: duration))
+                XCTAssertGreaterThan(plan.gusts.last!.startTime, duration * 0.85)
+                XCTAssertLessThan(plan.gusts.last!.startTime, duration)
+            }
+        }
+    }
+
+    func testEncounterPopulationIsVariedAndCalmAtFiveAndFiftyFiveMinutes() {
+        for minutes in [5, 55] {
+            var birdCounts: [Int] = []
+            var windCounts: [Int] = []
+            var firstTimes = Set<Double>()
+            var rightSources = 0
+            var totalSources = 0
+            var quietCount = 0
+            for seed in 0..<500 {
+                let plan = AutumnBranchPlan(duration: Double(minutes * 60), seed: UInt64(seed), tuning: .standard, isFullTree: true)
+                birdCounts.append(plan.encounters.birds.count)
+                windCounts.append(plan.gusts.count)
+                firstTimes.insert(plan.encounters.decisions.first!.time)
+                quietCount += plan.encounters.decisions.filter { $0.kind == .quiet }.count
+                rightSources += plan.windPassages.filter { $0.direction.x < 0 }.count
+                totalSources += plan.windPassages.count
+            }
+            let meanBirds = Double(birdCounts.reduce(0, +)) / 500
+            let meanWind = Double(windCounts.reduce(0, +)) / 500
+            print("ENCOUNTER PACING \(minutes)m: birds mean=\(meanBirds), range=\(birdCounts.min()!)...\(birdCounts.max()!); breezes mean=\(meanWind)")
+            XCTAssertGreaterThan(firstTimes.count, 490)
+            XCTAssertGreaterThan(Set(birdCounts).count, 1)
+            XCTAssertGreaterThan(quietCount, 500)
+            XCTAssertTrue((0.4...0.6).contains(Double(rightSources) / Double(totalSources)))
+            XCTAssertTrue(minutes == 5 ? (0.4...2).contains(meanBirds) : (6...16).contains(meanBirds))
+            XCTAssertTrue(minutes == 5 ? (2...6).contains(meanWind) : (25...60).contains(meanWind))
+        }
+    }
+
+    func testAutomaticEncounterDirectorAgreementAndManualOverride() throws {
+        let duration = 900.0
+        let plan = AutumnBranchPlan(duration: duration, seed: 42, tuning: .standard, isFullTree: true)
+        let directed = AutumnTreeDirector().makePlan(for: .init(duration: duration, randomSeed: 42))
+        XCTAssertEqual(Set(directed.moments.map(\.id)), Set((plan.gusts + plan.encounters.birds.map(\.moment) + [plan.deerEnding.moment]).map(\.id)))
+        let bird = try XCTUnwrap(plan.encounters.birds.first)
+        let manual = AutumnOrigamiFlight(startTime: bird.startTime - 5, seed: 99, tuning: .init())
+        XCTAssertEqual(plan.encounters.bird(at: bird.startTime, manual: manual), manual)
+        XCTAssertNil(plan.encounters.bird(at: manual.startTime + manual.duration + 0.01, manual: manual))
+        // Skipping over a visit (background/lock) cannot queue or replay it later.
+        XCTAssertNil(plan.encounters.bird(at: bird.startTime + bird.duration + 1))
+        XCTAssertNil(plan.encounters.bird(at: duration))
+    }
+
+    func testAutomaticEncountersRespectLongGustTuning() {
+        var tuning = AutumnBranchTuning.standard
+        tuning.gustDuration = 15
+        for seed in 0..<100 {
+            let plan = AutumnBranchPlan(duration: 3300, seed: UInt64(seed), tuning: tuning, isFullTree: true)
+            XCTAssertLessThanOrEqual(plan.gusts.last!.endTime + 6, plan.duration)
+            for flight in plan.encounters.birds {
+                for breeze in plan.gusts {
+                    XCTAssertTrue(breeze.endTime + 6 <= flight.startTime || breeze.startTime >= flight.startTime + flight.duration + 8)
+                }
+            }
+        }
+    }
+
+    func testFiftyFiveMinuteRandomizedStoryRetainsGroundedLeafBed() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        for seed: UInt64 in [0, 42, 499] {
+            let plan = AutumnBranchPlan(duration: 3300, seed: seed, tuning: .standard, isFullTree: true)
+            let simulation = AutumnBranchSimulation(plan: plan, reference: reference)
+            let end = simulation.sample(at: 3300)
+            XCTAssertTrue(end.leaves.allSatisfy { $0.phase == .landed || $0.phase == .settled })
+            let retained = end.leaves.filter { (-80...820).contains($0.x) }.count
+            print("55 MINUTE CARPET seed=\(seed): \(retained)/\(end.leaves.count)")
+            XCTAssertGreaterThanOrEqual(Double(retained) / Double(end.leaves.count), 0.85)
+        }
+    }
+
+
+    func testDeerEndingGuaranteedAcrossDurationsAndTuning() {
+        let stage = AutumnDeerEncounter.Stage(left:-80,right:820)
+        for minutes in [1,2,5,17,25,50,55] {
+            for speed in [0.7,1.0,1.3] {
+                var tuning = AutumnDeerTuning()
+                tuning.speed=speed; tuning.settlingSeconds=12
+                let duration=Double(minutes*60)
+                let deer=AutumnDeerEncounter.scheduled(duration:duration,tuning:tuning)
+                XCTAssertGreaterThanOrEqual(deer.startTime,0)
+                XCTAssertLessThanOrEqual(deer.restingTime,duration-8)
+                XCTAssertNil(deer.sample(at:deer.startTime-0.01,stage:stage))
+                XCTAssertEqual(deer.sample(at:duration,stage:stage)?.phase,.resting)
+                XCTAssertEqual(deer.sample(at:duration+100,stage:stage)?.root,
+                    deer.sample(at:duration,stage:stage)?.root)
+                XCTAssertEqual(deer.sample(at:duration,stage:stage,reduceMotion:true)?.phase,.resting)
+            }
+        }
+    }
+
+    func testDeerHoovesStayPlantedAndGeometryFinite() {
+        let deer=AutumnDeerEncounter(startTime:0,tuning:.init())
+        for stage in [AutumnDeerEncounter.Stage(left:-80,right:820),.init(left:-400,right:1300)] {
+            var contacts=0
+            for t in stride(from:0.0,through:deer.duration+2,by:1.0/30) {
+                let pose=deer.sample(at:t,stage:stage)!
+                let next=deer.sample(at:t+0.001,stage:stage)!
+                for leg in 0..<4 where pose.hooves[leg].planted && next.hooves[leg].planted {
+                    XCTAssertLessThan(simd_distance(pose.hooves[leg].point,next.hooves[leg].point),0.0001)
+                    contacts += 1
+                }
+                XCTAssertLessThan(abs(next.root-pose.root),0.3)
+                for face in AutumnDeerMesh.faces(pose) {
+                    for v in face.vertices {
+                        XCTAssertTrue(v.x.isFinite && v.y.isFinite && v.z.isFinite)
+                        XCTAssertGreaterThan(v.y,-1.5,"Paper must clear the floor throughout lowering, not only at rest.")
+                    }
+                }
+            }
+            XCTAssertGreaterThan(contacts,200)
+        }
+    }
+
+    func testDeerStudyDoesNotPersistPerformance() throws {
+        var record=AutumnBranchRecord()
+        record.deer = AutumnDeerStudy()
+        record.deer?.encounter = .init(startTime:30,tuning:.init())
+        let data=try JSONEncoder().encode(record.settingsOnly)
+        let restored=try JSONDecoder().decode(AutumnBranchRecord.self,from:data)
+        XCTAssertNil(restored.deer?.encounter)
+        XCTAssertNotNil(restored.deer)
+    }
+
+    func testDeerLegsReachTheirContactsAcrossTuningLimits() {
+        for size in [0.75,1.0,1.2] {
+            for speed in [0.7,1.3] {
+                for position in [0.56,0.76] {
+                    var tuning=AutumnDeerTuning()
+                    tuning.size=size;tuning.speed=speed;tuning.restingPosition=position
+                    let deer=AutumnDeerEncounter(startTime:0,tuning:tuning)
+                    for stage in [AutumnDeerEncounter.Stage(left:-80,right:820),.init(left:-400,right:1300)] {
+                        var worst=0.0
+                        for t in stride(from:0.0,through:deer.duration,by:1.0/30) {
+                            let pose=deer.sample(at:t,stage:stage)!
+                            for leg in 0..<4 {
+                                let front=leg<2
+                                let root=SIMD3<Double>(front ? -44 : 43,front ? pose.shoulder : pose.hip,0)
+                                let hoof=SIMD3<Double>((pose.hooves[leg].point.x-pose.root)/size,
+                                    pose.hooves[leg].point.y/size+3,0)
+                                let upper=front ? 47.0 : 53.0,lower=front ? 51.0 : 52.0
+                                let knee=AutumnDeerMesh.knee(root:root,foot:hoof,upper:upper,lower:lower,bend:front ? -1 : 1)
+                                worst=max(worst,abs(simd_distance(knee,hoof)-lower))
+                            }
+                        }
+                        XCTAssertLessThan(worst,0.05,"Limb stretch: size \(size), speed \(speed), position \(position), stage \(stage.width)")
+                    }
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func testDeerNativePosesAndReducedMotionAcrossViewports() throws {
+        let plan=AutumnBranchPlan(duration:120,seed:42,tuning:.standard,isFullTree:true)
+        let simulation=AutumnBranchSimulation(plan:plan,reference:try LeafGravityLabConfiguration.gate3Bundled.get())
+        let encounter=plan.deerEnding
+        for size in [CGSize(width:393,height:852),CGSize(width:820,height:1180),CGSize(width:1180,height:820)] {
+            for localTime in [12.0,20,23,25,31] {
+                let time=encounter.startTime+localTime
+                let scene=AutumnBranchCanvas(includesAtmosphere:false,size:size,
+                    frame:simulation.sample(at:time),progress:time/120,tuning:.standard,reduceMotion:false,
+                    elapsedTime:time,birdPlan:plan,deerEncounter:encounter)
+                let renderer=ImageRenderer(content:scene)
+                let image=try XCTUnwrap(renderer.uiImage)
+                let attachment=XCTAttachment(image:image)
+                attachment.name="deer-native-\(Int(size.width))-\(Int(localTime))"
+                attachment.lifetime = .keepAlways;add(attachment)
+            }
+        }
+        let stage=AutumnDeerEncounter.Stage(left:-80,right:820)
+        XCTAssertNil(encounter.sample(at:encounter.startTime+1,stage:stage,reduceMotion:true))
+        let rest=try XCTUnwrap(encounter.sample(at:120,stage:stage,reduceMotion:true))
+        XCTAssertEqual(rest.phase,.resting)
+        for face in AutumnDeerMesh.faces(rest) {
+            for v in face.vertices { XCTAssertGreaterThan(v.y,-1.5,"Folded paper must not sink beneath its ground plane.") }
+        }
+        let shared=AutumnTreeDirector().makePlan(for:.init(duration:120,randomSeed:42))
+        XCTAssertEqual(shared.moments.first { $0.id == encounter.moment.id },encounter.moment)
+    }
+
+    @MainActor
+    func testSceneVolumeAndMuteOnlyAffectOutput() {
+        let synth = PerformanceSynthesizer()
+        synth.setOutput(volume: 0.3, isMuted: false)
+        XCTAssertEqual(synth.effectiveVolume, 0.3, accuracy: 0.0001)
+        synth.setOutput(volume: 0.3, isMuted: true)
+        XCTAssertEqual(synth.effectiveVolume, 0)
+        XCTAssertEqual(synth.volume, 0.3, accuracy: 0.0001)
+        synth.setOutput(volume: 0.8, isMuted: true)
+        XCTAssertEqual(synth.effectiveVolume, 0)
+        synth.setOutput(volume: 0.8, isMuted: false)
+        XCTAssertEqual(synth.effectiveVolume, 0.8, accuracy: 0.0001)
+        synth.setOutput(volume: 2, isMuted: false)
+        XCTAssertEqual(synth.effectiveVolume, 1)
+        synth.setOutput(volume: -1, isMuted: false)
+        XCTAssertEqual(synth.effectiveVolume, 0)
+        synth.setOutput(volume: .nan, isMuted: false)
+        XCTAssertEqual(synth.effectiveVolume, 0)
+    }
+
+    func testWholeMinuteDurationsAndSliderMapping() throws {
+        for minutes in FocusDuration.minuteRange {
+            let duration = try XCTUnwrap(FocusDuration(minutes: minutes))
+            XCTAssertEqual(duration.rawValue, minutes * 60)
+            XCTAssertEqual(duration.minutes, minutes)
+            XCTAssertEqual(FocusDuration(rawValue: minutes * 60), duration)
+            XCTAssertEqual(FocusDuration.minutes(at: Double(minutes - 5) / 50), minutes)
+            XCTAssertEqual(try JSONDecoder().decode(FocusDuration.self,
+                from: JSONEncoder().encode(duration)), duration)
+        }
+        for invalid in [-1, 0, 4, 56, Int.max] {
+            XCTAssertNil(FocusDuration(minutes: invalid))
+        }
+        XCTAssertNil(FocusDuration(rawValue: 3301))
+        XCTAssertThrowsError(try JSONDecoder().decode(FocusDuration.self, from: Data("3301".utf8)))
+        XCTAssertEqual(try JSONDecoder().decode(FocusDuration.self, from: Data("1500".utf8)), .twentyFiveMinutes)
+        XCTAssertEqual(FocusDuration.minutes(at: -1), 5)
+        XCTAssertEqual(FocusDuration.minutes(at: 2), 55)
+        XCTAssertEqual(FocusDuration.minutes(at: .nan), 5)
+        for stop in stride(from: 10, through: 50, by: 5) {
+            for delta in [-0.65, 0.65] {
+                XCTAssertEqual(FocusDuration.minutes(at: (Double(stop) + delta - 5) / 50), stop)
+            }
+            for delta in [-1, 1] {
+                XCTAssertEqual(FocusDuration.minutes(at: Double(stop + delta - 5) / 50), stop + delta)
+            }
+        }
+        let duration = try XCTUnwrap(FocusDuration(minutes: 17))
+        let start = Date(timeIntervalSince1970: 1000)
+        let session = PerformanceSession(duration: duration, startedAt: start, randomSeed: 42)
+        XCTAssertEqual(session.remainingTime(at: start), 1020)
+        XCTAssertEqual(session.progress(at: start.addingTimeInterval(510)), 0.5)
+        XCTAssertEqual(session.progress(at: start.addingTimeInterval(1020)), 1)
+    }
+
+    private var origamiStage: AutumnBirdStage {
+        AutumnBirdStage(camera: AutumnBirdCamera(center: SIMD2(350, 420)),
+            left: -120, right: 900, sun: SIMD2(720, 360))
+    }
+
+    func testAutumnPersistsSettingsWithoutSessionEvents() throws {
+        var record = AutumnBranchRecord()
+        record.tuning.windStrength = 0.7
+        record.manualGusts = [10, 20]
+        record.bird = AutumnBirdStudy(tuning: .init(),
+            flight: AutumnOrigamiFlight(startTime: 12, seed: 42, tuning: .init()))
+        let saved = try JSONDecoder().decode(AutumnBranchRecord.self,
+            from: JSONEncoder().encode(record.settingsOnly))
+        XCTAssertEqual(saved.tuning, record.tuning)
+        XCTAssertEqual(saved.bird?.tuning, record.bird?.tuning)
+        XCTAssertTrue(saved.manualGusts.isEmpty)
+        XCTAssertNil(saved.bird?.flight)
+        XCTAssertNotNil(record.bird?.flight)
+    }
+
+    func testOrigamiApprovedDeparture() throws {
+        let flight = AutumnOrigamiFlight(startTime: 0, seed: 42, tuning: .init())
+        // Golden poses recorded before the entrance refinement: position, yaw,
+        // pitch, bank, wing root, tip fold. Include wind and the takeoff boundary.
+        let expected: [[Double]] = [
+            [14, 626.95352390816, 471.1507935499891, 0, 0.32, 0, 0, 0.78, 0.12],
+            [14.5, 626.5935212304759, 475.8630668945984, 5.800512897246634,
+             -0.05579727474057722, 0.07200241088867188, -0.004689980275183604, 0.711692833868121, 0.1422531209354835],
+            [16, 623.1767624777244, 528.7489325812933, 74.30796540737369,
+             -1.5918282627667006, 0.4, 0.0688358842591385, -0.23030390558915204, -0.05269648824875167],
+            [20, 785.6275829818198, 647.8675171257858, 334.48548020027306,
+             -0.6316049206267196, 0.04404864691239153, 0.022088701500144126, 0.3340304564829871, 0.018364354788892298],
+            [24, 1233.719038358092, 611.5310635951438, 604.9725079654074,
+             -0.48008265504927744, -0.16510094651621623, 0.07889834359379089, 0.8723764974524965, 0.22988220503976398],
+            [26, 1521.1348533123683, 552.6648896948018, 749.6470641784249,
+             -0.46306865250497803, -0.18715703280686002, 0.13159157106695163, 0.7623512581747254, 0.29269648824875344]]
+        for row in expected {
+            let time = row[0]
+            let pose = try XCTUnwrap(flight.sample(at: time, frame: AutumnCanopy.frame(),
+                stage: origamiStage, wind: SIMD2(0.3, -0.2)))
+            let actual = [pose.position.x, pose.position.y, pose.position.z,
+                          pose.yaw, pose.pitch, pose.bank, pose.wingAngle, pose.tipFold]
+            for (value, baseline) in zip(actual, row.dropFirst()) {
+                XCTAssertEqual(value, baseline, accuracy: 1e-9, "Departure changed at \(time)")
+            }
+            XCTAssertEqual(pose.legFold, 0)
+        }
+    }
+
+    func testOrigamiEntranceDepthBrakingAndSettling() throws {
+        for speed in [0.5, 1, 1.5] {
+            for depth in [0.0, 1, 1.5] {
+                var tuning = AutumnBirdTuning()
+                tuning.speed = speed
+                tuning.depth = depth
+                let flight = AutumnOrigamiFlight(startTime: 0, seed: 42, tuning: tuning)
+                func pose(_ u: Double) throws -> AutumnBirdPose {
+                    try XCTUnwrap(flight.sample(at: u * flight.approachDuration,
+                        frame: AutumnCanopy.frame(), stage: origamiStage, wind: .zero))
+                }
+                let distant = try pose(0.25), near = try pose(0.76), landed = try pose(1)
+                XCTAssertGreaterThan(distant.position.z, 300 * depth - 0.01)
+                XCTAssertEqual(near.position.z, -105 * depth, accuracy: 0.01)
+                XCTAssertEqual(landed.position, AutumnOrigamiFlight.perch(in: AutumnCanopy.frame()))
+                XCTAssertEqual(landed.legFold, 0)
+                XCTAssertLessThan(distant.legFold, -1)
+                XCTAssertEqual(try pose(0.96).wingAngle, 0.10, accuracy: 1e-9)
+                if depth > 0 {
+                    XCTAssertGreaterThan(origamiStage.camera.magnification(at: near.position.z),
+                        origamiStage.camera.magnification(at: distant.position.z))
+                    // Far panels really render behind the tree; near panels in front.
+                    for (sample, behind) in [(distant, true), (near, false)] {
+                        for face in AutumnOrigamiMesh.faces(wing: sample.wingAngle,
+                            tipFold: sample.tipFold, legFold: sample.legFold) {
+                            let vertices = [sample.transform(face.a), sample.transform(face.b), sample.transform(face.c)]
+                            XCTAssertEqual(AutumnOrigamiMesh.clipped(vertices, behindTree: behind).count, 3)
+                        }
+                    }
+                }
+                // No positional or velocity discontinuity at either route join.
+                for join in [0.45, 0.76, 1.0] {
+                    let h = 0.00001
+                    let left = try pose(join - h).position
+                    let center = try pose(join).position
+                    let right = try pose(join + h).position
+                    let v0 = (center - left) / (h * flight.approachDuration)
+                    let v1 = (right - center) / (h * flight.approachDuration)
+                    XCTAssertLessThan(simd_distance(v0, v1), 0.15)
+                }
+                for u in stride(from: 0.0, through: 1.0, by: 0.01) {
+                    let p = try pose(u)
+                    XCTAssertTrue([p.position.x, p.position.y, p.position.z, p.yaw,
+                                   p.pitch, p.bank, p.wingAngle, p.legFold].allSatisfy(\.isFinite))
+                }
+                let settled = try XCTUnwrap(flight.sample(at: flight.approachDuration + 1.1,
+                    frame: AutumnCanopy.frame(), stage: origamiStage, wind: .zero))
+                XCTAssertEqual(settled.wingAngle, 0.78)
+                XCTAssertEqual(settled.pitch, 0)
+            }
+        }
+    }
+
+    func testOrigamiPerspectiveAndFiniteStoryEvent() throws {
+        let camera = origamiStage.camera
+        XCTAssertEqual(camera.magnification(at: 0), 1, accuracy: 1e-12)
+        XCTAssertLessThan(camera.magnification(at: 600), 0.70)
+        for z in [0.0, 200, 800] {
+            let point = SIMD2(610.0, 400)
+            XCTAssertLessThan(simd_length(camera.project(camera.unproject(point, z: z)) - point), 1e-9)
+        }
+        let flight = AutumnOrigamiFlight(startTime: 4, seed: 42, tuning: .init())
+        let frame = AutumnCanopy.frame()
+        XCTAssertNil(flight.sample(at: 3.99, frame: frame, stage: origamiStage, wind: .zero))
+        XCTAssertNil(flight.sample(at: flight.moment.endTime, frame: frame, stage: origamiStage, wind: .zero))
+        let perched = try XCTUnwrap(flight.sample(at: 14, frame: frame, stage: origamiStage, wind: .zero))
+        let distant = try XCTUnwrap(flight.sample(at: 27, frame: frame, stage: origamiStage, wind: .zero))
+        XCTAssertEqual(perched.phase, .perched)
+        XCTAssertEqual(perched.position.z, 0)
+        XCTAssertGreaterThan(distant.position.z, 300)
+        XCTAssertLessThan(camera.magnification(at: distant.position.z), 0.8)
+    }
+
+    func testOrigamiLandingTracksBranchAndTransitionIsContinuous() throws {
+        let flight = AutumnOrigamiFlight(startTime: 0, seed: 42, tuning: .init())
+        var frame = AutumnCanopy.frame()
+        let a = try XCTUnwrap(flight.sample(at: 10, frame: frame, stage: origamiStage, wind: SIMD2(1, 1)))
+        XCTAssertEqual(a.position, AutumnOrigamiFlight.perch(in: frame))
+        frame.limbAngles[0] = 0.03
+        frame.canopyCurves = AutumnCanopy.curves(angles: frame.limbAngles)
+        let b = try XCTUnwrap(flight.sample(at: 10, frame: frame, stage: origamiStage, wind: .zero))
+        XCTAssertEqual(b.position, AutumnOrigamiFlight.perch(in: frame))
+        XCTAssertGreaterThan(simd_distance(a.position, b.position), 5)
+        for boundary in [flight.approachDuration,
+                         flight.approachDuration + flight.perchDuration] {
+            let before = try XCTUnwrap(flight.sample(at: boundary - 0.001, frame: frame, stage: origamiStage, wind: .zero))
+            let after = try XCTUnwrap(flight.sample(at: boundary + 0.001, frame: frame, stage: origamiStage, wind: .zero))
+            XCTAssertLessThan(simd_distance(before.position, after.position), 0.01)
+            XCTAssertEqual(before.wingAngle, after.wingAngle, accuracy: 0.001)
+        }
+    }
+
+    func testOrigamiWindPausePersistenceAndReducedMotion() throws {
+        let flight = AutumnOrigamiFlight(startTime: 0, seed: 42, tuning: .init())
+        let frame = AutumnCanopy.frame()
+        let calm = try XCTUnwrap(flight.sample(at: 4, frame: frame, stage: origamiStage, wind: .zero))
+        let windy = try XCTUnwrap(flight.sample(at: 4, frame: frame, stage: origamiStage, wind: SIMD2(0.8, 0.1)))
+        XCTAssertGreaterThan(simd_distance(calm.position, windy.position), 5)
+        let restored = try JSONDecoder().decode(AutumnOrigamiFlight.self, from: JSONEncoder().encode(flight))
+        XCTAssertEqual(calm, restored.sample(at: 4, frame: frame, stage: origamiStage, wind: .zero))
+        var clock = PerformanceSession(duration: .fiveMinutes, startedAt: .distantPast, randomSeed: 42)
+        clock.pause(at: Date.distantPast.addingTimeInterval(4))
+        XCTAssertEqual(clock.elapsedTime(at: .now), 4)
+        XCTAssertEqual(calm, flight.sample(at: clock.elapsedTime(at: .now), frame: frame, stage: origamiStage, wind: .zero))
+        XCTAssertNil(flight.sample(at: 4, frame: frame, stage: origamiStage, wind: .zero, reduceMotion: true))
+        let reduced = flight.sample(at: 9, frame: frame, stage: origamiStage, wind: .zero, reduceMotion: true)
+        XCTAssertEqual(reduced, flight.sample(at: 12, frame: frame, stage: origamiStage, wind: SIMD2(1, 0), reduceMotion: true))
+        let oldRecord = AutumnBranchRecord(tuning: .standard, manualGusts: [3])
+        let decoded = try JSONDecoder().decode(AutumnBranchRecord.self, from: JSONEncoder().encode(oldRecord))
+        XCTAssertEqual(decoded.manualGusts, [3])
+        XCTAssertNil(decoded.bird)
+    }
+
+    func testOrigamiPaperPanelsKeepTheirEdgeLengths() {
+        let triangle = [SIMD3(0.0, 0, -1), SIMD3(1.0, 0, 1), SIMD3(0.0, 1, 1)]
+        let front = AutumnOrigamiMesh.clipped(triangle, behindTree: false)
+        let back = AutumnOrigamiMesh.clipped(triangle, behindTree: true)
+        XCTAssertEqual(front.count, 3)
+        XCTAssertEqual(back.count, 4)
+        XCTAssertTrue(front.allSatisfy { $0.z <= 0 })
+        XCTAssertTrue(back.allSatisfy { $0.z >= 0 })
+        let baseline = AutumnOrigamiMesh.faces(wing: 0, tipFold: 0)
+        for angle in stride(from: -0.5, through: 1.1, by: 0.1) {
+            let mesh = AutumnOrigamiMesh.faces(wing: angle, tipFold: angle * 0.3, legFold: -abs(angle))
+            XCTAssertEqual(mesh.count, baseline.count)
+            for (a, b) in zip(baseline, mesh) {
+                XCTAssertEqual(simd_distance(a.a, a.b), simd_distance(b.a, b.b), accuracy: 1e-8)
+                XCTAssertEqual(simd_distance(a.b, a.c), simd_distance(b.b, b.c), accuracy: 1e-8)
+                XCTAssertEqual(simd_distance(a.c, a.a), simd_distance(b.c, b.a), accuracy: 1e-8)
+                XCTAssertGreaterThan(simd_length(simd_cross(b.b-b.a, b.c-b.a)), 0.01)
+            }
+        }
+    }
+
+    @MainActor
+    func testOrigamiNativeCompositionSnapshots() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let plan = AutumnBranchPlan(duration: 120, seed: 42, tuning: .standard, isFullTree: true)
+        let simulation = AutumnBranchSimulation(plan: plan, reference: reference)
+        let flight = AutumnOrigamiFlight(startTime: 0, seed: 42, tuning: .init())
+        for (name, size) in [("ipad-tall", CGSize(width: 820, height: 1180)),
+                             ("ipad-wide", CGSize(width: 1180, height: 820)),
+                             ("phone", CGSize(width: 393, height: 852))] {
+            for time in [3.0, 4, 5, 6, 7, 8, 9, 10, 20, 23] {
+                let scene = AutumnBranchCanvas(includesAtmosphere: false, size: size,
+                    frame: simulation.sample(at: time), progress: 0.3, tuning: .standard,
+                    reduceMotion: false, birdFlight: flight, elapsedTime: time, birdPlan: plan)
+                let renderer = ImageRenderer(content: scene)
+                renderer.scale = 1
+                let image = try XCTUnwrap(renderer.uiImage)
+                XCTAssertEqual(image.size, size)
+                let attachment = XCTAttachment(image: image)
+                attachment.name = "origami-\(name)-\(Int(time))"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            }
+        }
+    }
+    @MainActor
+    func testAutumnFullTreeWideLayoutSnapshot() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let simulation = AutumnBranchSimulation(
+            plan: .init(duration: 120, seed: 42, tuning: .standard, isFullTree: true), reference: reference)
+        let size = CGSize(width: 1180, height: 820)
+        let scene = AutumnBranchCanvas(includesAtmosphere: false, size: size, frame: simulation.sample(at: 12),
+            progress: 0.25, tuning: .standard, reduceMotion: false)
+            .background(Color(red: 0.15, green: 0.20, blue: 0.28))
+        let renderer = ImageRenderer(content: scene)
+        renderer.scale = 1
+        let snapshot = try XCTUnwrap(renderer.uiImage)
+        XCTAssertEqual(snapshot.size, size)
+        let attachment = XCTAttachment(image: snapshot)
+        attachment.name = "autumn-wide-native-layout-no-metal-sky"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testAutumnEveryLeafHasASeededReleaseAndTimeToLand() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        for duration in [60.0, 120, 900, 3000] {
+            let plan = AutumnBranchPlan(duration: duration, seed: 42, tuning: .standard, isFullTree: true)
+            XCTAssertEqual(plan.leafReleases.count, AutumnCanopy.shoots.count)
+            XCTAssertEqual(Set(plan.leafReleases.map(\.id)).count, AutumnCanopy.shoots.count)
+            XCTAssertEqual(plan.leafReleases,
+                AutumnBranchPlan(duration: duration, seed: 42, tuning: .standard, isFullTree: true).leafReleases)
+            let sorted = plan.leafReleases.map(\.startTime).sorted()
+            XCTAssertGreaterThan(sorted.first!, 0)
+            XCTAssertLessThan(sorted.last!, min(duration * 0.81, duration - 15))
+            XCTAssertLessThan(sorted.filter { $0 <= duration * 0.25 }.count, sorted.count / 3)
+            XCTAssertTrue(plan.gusts.contains { $0.startTime > sorted.last! },
+                          "Keep a ground-only breeze after the canopy empties.")
+            let simulation = AutumnBranchSimulation(plan: plan, reference: reference)
+            let start = Date()
+            let beforeLastBreeze = simulation.sample(at: duration * 0.86)
+            let end = simulation.sample(at: duration)
+            print("AUTUMN COMPLETE duration=\(duration), replaySeconds=\(Date().timeIntervalSince(start)), attached=\(end.leaves.filter { $0.phase == .attached }.count), airborne=\(end.leaves.filter { $0.phase == .falling }.count)")
+            XCTAssertTrue(end.leaves.allSatisfy { $0.phase == .landed || $0.phase == .settled })
+            XCTAssertTrue(end.leaves.allSatisfy { $0.releasedAt != nil })
+            for leaf in end.leaves {
+                XCTAssertEqual(leaf.releasedAt!, plan.leafReleases[leaf.id].startTime,
+                               accuracy: AutumnBranchSimulation.step + 1e-8)
+                XCTAssertEqual(leaf.y, leaf.groundLevel)
+            }
+            let grounded = beforeLastBreeze.leaves.filter { $0.phase == .landed || $0.phase == .settled }
+            let moved = grounded.filter { abs(end.leaves[$0.id].x - $0.x) > 0.5 }
+            print("LATE CARPET duration=\(duration): \(moved.count)/\(grounded.count) moved")
+            XCTAssertGreaterThan(moved.count, 0, "The final breeze must still move some grounded leaves.")
+            XCTAssertLessThan(moved.count, grounded.count, "A breeze must not move the entire carpet.")
+        }
+        let first = AutumnBranchPlan(duration: 900, seed: 42, tuning: .standard, isFullTree: true)
+        let other = AutumnBranchPlan(duration: 900, seed: 43, tuning: .standard, isFullTree: true)
+        XCTAssertNotEqual(first.leafReleases.map(\.startTime), other.leafReleases.map(\.startTime))
+        let manual = AutumnBranchPlan(duration: 900, seed: 42, tuning: .standard,
+                                      manualGusts: [20], isFullTree: true)
+        XCTAssertEqual(first.leafReleases, manual.leafReleases)
+    }
+
+    func testAutumnConnectedWindGroundFrictionAndSelectivity() {
+        var leaves = (0..<20).map { id in
+            var leaf = AutumnBranchLeaf(id: id)
+            leaf.x = 220 + Double(id) * 22
+            leaf.groundLevel = -Double(id % 5) * 8
+            leaf.y = leaf.groundLevel
+            leaf.phase = .settled
+            leaf.contactTime = 3
+            leaf.groundTilt = AutumnGroundContact.flatTilt
+            leaf.size = 0.6
+            return leaf
+        }
+        let initial = leaves
+        for _ in 0..<120 {
+            for id in leaves.indices { AutumnGroundContact.integrate(&leaves[id], wind: 0.045, dt: 1.0/120) }
+        }
+        XCTAssertEqual(leaves.map(\.x), initial.map(\.x), "Background air must not make flat paper crawl.")
+        for _ in 0..<720 {
+            for id in leaves.indices { AutumnGroundContact.integrate(&leaves[id], wind: 0.65, dt: 1.0/120) }
+        }
+        let moved = zip(initial, leaves).filter { abs($0.x - $1.x) > 5 }.count
+        print("GROUND WIND SELECTIVITY: \(moved)/\(leaves.count) moved")
+        XCTAssertGreaterThan(moved, 2)
+        XCTAssertLessThan(moved, leaves.count - 2)
+        XCTAssertTrue(leaves.contains { abs($0.angle) > 0.05 })
+        for _ in 0..<1200 {
+            for id in leaves.indices { AutumnGroundContact.integrate(&leaves[id], wind: 0, dt: 1.0/120) }
+        }
+        for leaf in leaves {
+            XCTAssertEqual(leaf.phase, .settled)
+            XCTAssertEqual(leaf.vx, 0)
+            XCTAssertEqual(leaf.y, leaf.groundLevel)
+            XCTAssertEqual(leaf.groundShadow(sunX: 700, sunHeight: 80).x, leaf.x)
+        }
+    }
+
+    func testAutumnConnectedWindTravelsAndReawakensGroundLeaves() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let plan = AutumnBranchPlan(duration: 120, seed: 42, tuning: .standard, isFullTree: true)
+        // Direction and spatial onset are covered by the passage tests.
+        let simulation = AutumnBranchSimulation(plan: plan, reference: reference)
+        let before = simulation.sample(at: 40)
+        let after = simulation.sample(at: 65)
+        let grounded = before.leaves.filter { $0.phase == .settled }
+        let moved = grounded.filter { abs(after.leaves[$0.id].x - $0.x) > 4 }
+        print("SECOND GUST: \(moved.count)/\(grounded.count) grounded leaves moved; distances=\(grounded.map { Int(after.leaves[$0.id].x - $0.x) })")
+        XCTAssertGreaterThan(grounded.count, 5)
+        XCTAssertGreaterThan(moved.count, 0)
+        XCTAssertLessThan(moved.count, grounded.count)
+        XCTAssertEqual(after, AutumnBranchSimulation(plan: plan, reference: reference).sample(at: 65))
+        XCTAssertEqual(simulation.sample(at: 40), before)
+        var quiet = AutumnBranchTuning.standard
+        quiet.windStrength = 0.15
+        let gentle = AutumnBranchSimulation(plan: .init(duration: 120, seed: 42, tuning: quiet, isFullTree: true), reference: reference)
+        XCTAssertGreaterThan(gentle.sample(at: 35).leaves.filter { $0.phase != .attached }.count, 0,
+                             "Seasonal release must still progress in gentle air.")
+    }
+
+    func testAutumnConnectedWindStrongGustsStayFiniteAndPause() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        var tuning = AutumnBranchTuning.standard
+        tuning.windStrength = 1.2
+        tuning.flexibility = 2
+        tuning.damping = 0.4
+        let simulation = AutumnBranchSimulation(plan: .init(duration: 120, seed: 901, tuning: tuning,
+            manualGusts: [10, 11, 12], isFullTree: true), reference: reference)
+        for time in stride(from: 0.0, through: 120, by: 0.25) {
+            let frame = simulation.sample(at: time)
+            XCTAssertEqual(frame.canopyCurves[0].start, SIMD2(350, 0))
+            for leaf in frame.leaves {
+                XCTAssertTrue(leaf.x.isFinite && leaf.y.isFinite && leaf.angle.isFinite)
+                XCTAssertGreaterThanOrEqual(leaf.y, leaf.groundLevel)
+                if leaf.phase == .landed || leaf.phase == .settled {
+                    XCTAssertEqual(leaf.y, leaf.groundLevel)
+                    XCTAssertLessThan(abs(leaf.vx), 300)
+                }
+            }
+        }
+        let start = Date(timeIntervalSince1970: 1000)
+        var session = PerformanceSession(duration: .twoMinutes, startedAt: start, randomSeed: 901)
+        session.pause(at: start.addingTimeInterval(52))
+        let paused = simulation.sample(at: session.elapsedTime(at: start.addingTimeInterval(60)))
+        XCTAssertEqual(paused, simulation.sample(at: session.elapsedTime(at: start.addingTimeInterval(100))))
+        let restored = try JSONDecoder().decode(PerformanceSession.self, from: JSONEncoder().encode(session))
+        XCTAssertEqual(paused, AutumnBranchSimulation(plan: simulation.plan, reference: reference)
+            .sample(at: restored.elapsedTime(at: start.addingTimeInterval(110))))
+    }
+
+    @MainActor
+    func testAutumnConnectedWindReducedMotionKeepsGroundLeavesStill() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let simulation = AutumnBranchSimulation(plan: .init(duration: 120, seed: 42,
+            tuning: .standard, isFullTree: true), reference: reference)
+        let before = simulation.sample(at: 40), after = simulation.sample(at: 65)
+        func canvas(_ frame: AutumnBranchFrame) -> AutumnBranchCanvas {
+            AutumnBranchCanvas(size: CGSize(width: 820, height: 1180), frame: frame,
+                progress: 0.5, tuning: .standard, reduceMotion: true)
+        }
+        for leaf in before.leaves where leaf.phase != .attached {
+            let a = canvas(before).renderLeaf(leaf)
+            let b = canvas(after).renderLeaf(after.leaves[leaf.id])
+            XCTAssertEqual(a.x, b.x)
+            XCTAssertEqual(a.y, b.y)
+            XCTAssertEqual(a.angle, b.angle)
+            XCTAssertEqual(b.vx, 0)
+            XCTAssertEqual(b.groundTilt, AutumnGroundContact.flatTilt)
+        }
+    }
+
+    func testAutumnSpatialWindVariesAndRetainsLeafCarpet() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        for seed: UInt64 in [42, 17, 901] {
+            let plan = AutumnBranchPlan(duration: 120, seed: seed, tuning: .standard, isFullTree: true)
+            XCTAssertEqual(plan, AutumnBranchPlan(duration: 120, seed: seed, tuning: .standard, isFullTree: true))
+            // Sources are independent random choices, not compulsory alternation.
+            XCTAssertFalse(plan.windPassages.isEmpty)
+            XCTAssertGreaterThan(Set(plan.windPassages.map(\.origin.y)).count, 1)
+            XCTAssertGreaterThan(Set(plan.gusts.map(\.duration)).count, 1)
+            for (passage, moment) in zip(plan.windPassages, plan.gusts) {
+                let near = passage.origin + passage.direction * 30
+                let far = passage.origin + passage.direction * 630
+                let onset = moment.startTime + 1.5
+                let early = passage.velocity(at: near, seconds: onset, moment: moment)
+                let late = passage.velocity(at: far, seconds: onset, moment: moment)
+                XCTAssertGreaterThan(hypot(early.x, early.y), hypot(late.x, late.y))
+                let end = moment.startTime + moment.duration + 10
+                XCTAssertEqual(passage.velocity(at: near, seconds: end, moment: moment), .zero)
+            }
+            let simulation = AutumnBranchSimulation(plan: plan, reference: reference)
+            let frame = simulation.sample(at: 120)
+            let ground = frame.leaves.filter { $0.phase == .landed || $0.phase == .settled }
+            XCTAssertEqual(ground.count, frame.leaves.count, "Every seeded tree must end fully grounded.")
+            // The narrow camera is 900 units wide around the 740-unit scaffold:
+            // its visible ground includes 80 units on either side, as in Canvas.
+            let retained = ground.filter { (-80...820).contains($0.x) }
+            print("CARPET seed \(seed): \(retained.count)/\(ground.count) retained; x=\(ground.map { Int($0.x) })")
+            XCTAssertGreaterThan(ground.count, 5)
+            XCTAssertGreaterThanOrEqual(Double(retained.count) / Double(max(1, ground.count)), 0.85)
+        }
+        let short = AutumnBranchPlan(duration: 300, seed: 42, tuning: .standard, isFullTree: true)
+        let long = AutumnBranchPlan(duration: 3000, seed: 42, tuning: .standard, isFullTree: true)
+        XCTAssertGreaterThan(long.gusts.count, short.gusts.count)
+        XCTAssertEqual(short.windPassages, Array(long.windPassages.prefix(short.gusts.count)))
+        XCTAssertTrue(long.gusts.allSatisfy { (6...11).contains($0.duration) })
+        let manual = AutumnBranchPlan(duration: 300, seed: 42, tuning: .standard, manualGusts: [30], isFullTree: true)
+        XCTAssertEqual(Array(manual.windPassages.prefix(short.gusts.count)), short.windPassages)
+        XCTAssertEqual(Array(manual.gusts.prefix(short.gusts.count)), short.gusts)
+        var loose = AutumnBranchLeaf(id: 5)
+        loose.phase = .settled; loose.x = 610; loose.size = 0.6
+        loose.contactTime = 3; loose.groundTilt = AutumnGroundContact.flatTilt
+        var sheltered = loose
+        for _ in 0..<720 {
+            AutumnGroundContact.integrate(&loose, wind: -0.75, dt: 1.0/120)
+            AutumnGroundContact.integrate(&sheltered, wind: -0.75, dt: 1.0/120, neighbours: 3)
+        }
+        XCTAssertLessThan(loose.x, 600, "Right-origin wind must push left.")
+        XCTAssertLessThan(abs(sheltered.x - 610), abs(loose.x - 610) * 0.3)
+    }
+
+    func testAutumnFullTreeHierarchyAndStemAttachments() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let plan = AutumnBranchPlan(duration: 120, seed: 42, tuning: .standard, isFullTree: true)
+        let simulation = AutumnBranchSimulation(plan: plan, reference: reference)
+        XCTAssertEqual(simulation.sample(at: 0).leaves.count, AutumnCanopy.shoots.count)
+        XCTAssertGreaterThan(AutumnCanopy.shoots.count, 150)
+        for time in stride(from: 0.0, through: 30, by: 0.1) {
+            let frame = simulation.sample(at: time)
+            XCTAssertEqual(frame.canopyCurves[0].start, SIMD2(350, 0))
+            for (index, limb) in AutumnCanopy.limbs.enumerated() {
+                XCTAssertGreaterThan(limb.width, limb.tipWidth)
+                guard let parent = limb.parent else { continue }
+                XCTAssertLessThan(parent, index)
+                XCTAssertEqual(frame.canopyCurves[index].start, frame.canopyCurves[parent].point(limb.at))
+            }
+            for leaf in frame.leaves where leaf.phase == .attached {
+                let tip = AutumnBranchSimulation.twigTip(id: leaf.id, frame: frame)
+                let stem = AutumnBranchLeafGeometry.stemOffset(id: leaf.artwork, angle: leaf.angle, turn: leaf.turn)
+                XCTAssertEqual(leaf.x + stem.x * leaf.size, tip.x, accuracy: 0.000001)
+                XCTAssertEqual(leaf.y + stem.y * leaf.size, tip.y, accuracy: 0.000001)
+            }
+        }
+    }
+
+    func testAutumnFullTreeReplayReleaseAndLandingDepth() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let plan = AutumnBranchPlan(duration: 120, seed: 42, tuning: .standard, isFullTree: true)
+        let simulation = AutumnBranchSimulation(plan: plan, reference: reference)
+        var previous = simulation.sample(at: 0)
+        var releases = 0
+        for tick in 1...3600 {
+            let frame = simulation.sample(at: Double(tick)/120)
+            for (before, after) in zip(previous.leaves, frame.leaves) {
+                XCTAssertTrue(after.x.isFinite && after.y.isFinite && after.angle.isFinite)
+                if before.phase == .attached && after.phase == .falling {
+                    releases += 1
+                    XCTAssertLessThan(hypot(after.x-before.x, after.y-before.y), 1)
+                    XCTAssertLessThan(abs(after.angle-before.angle), 0.1)
+                }
+                if after.phase == .settled {
+                    XCTAssertEqual(after.y, after.groundLevel)
+                    let shadow = after.groundShadow(sunX: 700, sunHeight: 80)
+                    XCTAssertEqual(shadow.x, after.x, accuracy: 0.000001)
+                    XCTAssertEqual(shadow.verticalScale, cos(after.groundTilt), accuracy: 0.000001)
+                }
+            }
+            previous = frame
+        }
+        XCTAssertGreaterThan(releases, 5)
+        XCTAssertLessThan(releases, previous.leaves.count / 3, "The first quarter should thin the canopy, not empty it.")
+        XCTAssertGreaterThan(Set(previous.leaves.filter { $0.phase == .settled }.map(\.groundLevel)).count, 5)
+        let direct = AutumnBranchSimulation(plan: plan, reference: reference)
+        XCTAssertEqual(previous, direct.sample(at: 30))
+        XCTAssertEqual(simulation.sample(at: 12), direct.sample(at: 12))
+    }
+
+    func testAutumnCheckpointDeterministicPhysicsAndSettling() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let plan = AutumnBranchPlan(duration: 120, seed: 42, tuning: .standard)
+        let stepped = AutumnBranchSimulation(plan: plan, reference: reference)
+        for time in stride(from: 0.0, through: 80, by: 0.1) { _ = stepped.sample(at: time) }
+        let direct = AutumnBranchSimulation(plan: plan, reference: reference)
+        XCTAssertEqual(stepped.sample(at: 80), direct.sample(at: 80))
+        let end = direct.sample(at: 120)
+        XCTAssertEqual(end.leaves.count, 6)
+        XCTAssertEqual(end.leaves.filter { $0.phase == .settled }.count, 3)
+        for leaf in end.leaves {
+            XCTAssertTrue(leaf.x.isFinite && leaf.y.isFinite && leaf.angle.isFinite)
+            XCTAssertGreaterThanOrEqual(leaf.y, 0)
+        }
+        XCTAssertEqual(direct.sample(at: 20),
+            AutumnBranchSimulation(plan: plan, reference: reference).sample(at: 20))
+    }
+
+    func testAutumnCheckpointStemStaysOnTwigDuringFlutter() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        for seed: UInt64 in [42, 17, 901] {
+            let simulation = AutumnBranchSimulation(
+                plan: .init(duration: 120, seed: seed, tuning: .standard), reference: reference)
+            for tick in 0...3600 {
+                let frame = simulation.sample(at: Double(tick) / 120)
+                for leaf in frame.leaves where leaf.phase == .attached {
+                    let joint = AutumnBranchSimulation.twigTip(id: leaf.id, frame: frame)
+                    let stem = AutumnBranchLeafGeometry.stemOffset(
+                        id: leaf.id, angle: leaf.angle, turn: leaf.turn)
+                    XCTAssertEqual(leaf.x + stem.x, joint.x, accuracy: 0.000001)
+                    XCTAssertEqual(leaf.y + stem.y, joint.y, accuracy: 0.000001)
+                }
+            }
+        }
+    }
+
+    func testAutumnCheckpointGroundContactAndShadow() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let simulation = AutumnBranchSimulation(
+            plan: .init(duration: 120, seed: 42, tuning: .standard), reference: reference)
+        var contacts = Set<Int>()
+        for tick in 0...3600 {
+            let frame = simulation.sample(at: Double(tick) / 120)
+            for leaf in frame.leaves where leaf.phase == .landed || leaf.phase == .settled {
+                contacts.insert(leaf.id)
+                XCTAssertEqual(leaf.y, 0, accuracy: 0.000001)
+                for sunX in [-400.0, 0, 600, 1200] {
+                    let shadow = leaf.groundShadow(sunX: sunX, sunHeight: 80)
+                    XCTAssertEqual(shadow.x, leaf.x, accuracy: 0.000001)
+                    if leaf.phase == .settled {
+                        // Same silhouette, yaw, roll, and flattened footprint as the paper.
+                        XCTAssertEqual(shadow.verticalScale, cos(leaf.groundTilt), accuracy: 0.000001)
+                    }
+                }
+            }
+        }
+        XCTAssertEqual(contacts, Set([1, 3, 5]))
+        var airborne = AutumnBranchLeaf(id: 1)
+        airborne.x = 300; airborne.y = 100
+        XCTAssertLessThan(airborne.groundShadow(sunX: 600, sunHeight: 200).x, airborne.x)
+        XCTAssertEqual(airborne.groundShadow(sunX: 600, sunHeight: 200).verticalScale, 0.25)
+    }
+
+    func testAutumnCheckpointReleaseContinuityAndPause() throws {
+        let reference = try LeafGravityLabConfiguration.gate3Bundled.get()
+        let simulation = AutumnBranchSimulation(plan: .init(duration: 120, seed: 42, tuning: .standard), reference: reference)
+        var previous = simulation.sample(at: 0)
+        var releases = 0
+        for tick in 1...3600 {
+            let frame = simulation.sample(at: Double(tick) / 120)
+            for (before, after) in zip(previous.leaves, frame.leaves) where before.phase == .attached && after.phase == .falling {
+                releases += 1
+                XCTAssertLessThan(hypot(after.x - before.x, after.y - before.y), 1)
+                XCTAssertLessThan(abs(after.angle - before.angle), 0.1)
+                XCTAssertEqual(after.releasedAt, frame.time)
+            }
+            previous = frame
+        }
+        XCTAssertEqual(releases, 3)
+        let start = Date(timeIntervalSince1970: 100)
+        var session = PerformanceSession(duration: .twoMinutes, startedAt: start, randomSeed: 42)
+        session.pause(at: start.addingTimeInterval(15))
+        let frozen = simulation.sample(at: session.elapsedTime(at: start.addingTimeInterval(20)))
+        XCTAssertEqual(frozen, simulation.sample(at: session.elapsedTime(at: start.addingTimeInterval(60))))
+        let restored = try JSONDecoder().decode(PerformanceSession.self, from: JSONEncoder().encode(session))
+        XCTAssertEqual(frozen, AutumnBranchSimulation(plan: simulation.plan, reference: reference)
+            .sample(at: restored.elapsedTime(at: start.addingTimeInterval(70))))
+    }
+
+    func testAutumnCheckpointWindDurationAndManualEvents() throws {
+        let short = AutumnBranchPlan(duration: 300, seed: 42, tuning: .standard)
+        let long = AutumnBranchPlan(duration: 3000, seed: 42, tuning: .standard)
+        XCTAssertEqual(short.gusts.map(\.duration), long.gusts.map(\.duration))
+        XCTAssertEqual(long.gusts[0].startTime, short.gusts[0].startTime * 10)
+        let manual = AutumnBranchPlan(duration: 120, seed: 42, tuning: .standard, manualGusts: [3])
+        XCTAssertEqual(manual.gusts.last?.startTime, 3)
+        XCTAssertNotNil(manual.gusts.last?.audioCue)
+        XCTAssertEqual(manual.gusts.last?.visualCue?.effect.rawValue, "autumn.wind")
+        let record = AutumnBranchRecord(tuning: .standard, manualGusts: [3])
+        XCTAssertEqual(record, try JSONDecoder().decode(AutumnBranchRecord.self, from: JSONEncoder().encode(record)))
+    }
+
     @MainActor
     func testMusicRunnerLiveAudioOutput() async throws {
         let synth = PerformanceSynthesizer()
@@ -1275,12 +2126,13 @@ final class PlanetCalmTests: XCTestCase {
         )
         let player = StoryPlayer(session: session)
 
+        let onset = AutumnDeerEncounter.scheduled(duration:session.duration.timeInterval).startTime
         let beforeReveal = player.performance(
-            at: start.addingTimeInterval(855),
+            at: start.addingTimeInterval(onset-0.01),
             reduceMotion: false
         )
         let duringReveal = player.performance(
-            at: start.addingTimeInterval(882),
+            at: start.addingTimeInterval(onset+0.01),
             reduceMotion: false
         )
 
@@ -1298,7 +2150,6 @@ final class PlanetCalmTests: XCTestCase {
         )
         let player = StoryPlayer(session: session)
 
-        XCTAssertTrue(player.scheduledMoments.isEmpty)
         XCTAssertEqual(
             player.performance(at: start.addingTimeInterval(750), reduceMotion: false).beat,
             .contemporaryLotusPondStill
@@ -1434,166 +2285,6 @@ final class PlanetCalmTests: XCTestCase {
             player.performance(at: midpoint, reduceMotion: true).visualState[.autumnLeafIntensity],
             0
         )
-    }
-
-    func testAutumnCastMomentsAreDeterministicContainedAndSeparated() throws {
-        let director = AutumnTreeDirector()
-        for duration in [60.0, 120, 300, 900, 1_500, 3_000] {
-            let context = StorySessionContext(duration: duration, randomSeed: 42)
-            let plan = director.makePlan(for: context)
-            XCTAssertEqual(plan, director.makePlan(for: context))
-            let bird = try XCTUnwrap(plan.moments.first { $0.visualCue?.effect == .autumnBirdFlock })
-            let rabbit = try XCTUnwrap(plan.moments.first { $0.visualCue?.effect == .autumnRabbitPeek })
-            XCTAssertEqual(plan.moments.filter { $0.visualCue?.effect == .autumnBirdFlock }.count, 1)
-            XCTAssertEqual(plan.moments.filter { $0.visualCue?.effect == .autumnRabbitPeek }.count, 1)
-            XCTAssertEqual(bird.duration, 18)
-            XCTAssertEqual(rabbit.duration, 8)
-            XCTAssertGreaterThanOrEqual(bird.startTime, duration * 0.35)
-            XCTAssertLessThanOrEqual(bird.endTime, duration * 0.65 + 1e-12)
-            XCTAssertGreaterThanOrEqual(rabbit.startTime, duration * 0.70)
-            XCTAssertLessThanOrEqual(rabbit.endTime, duration * 0.84 + 1e-12)
-            XCTAssertLessThanOrEqual(bird.endTime, rabbit.startTime)
-            XCTAssertLessThan(rabbit.endTime, duration * 0.96)
-        }
-        XCTAssertNotEqual(
-            director.makePlan(for: StorySessionContext(duration: 900, randomSeed: 41)),
-            director.makePlan(for: StorySessionContext(duration: 900, randomSeed: 42))
-        )
-    }
-
-    func testAutumnCastDebugDurationsStayRealTimeAndExpiredEventsDoNotReplay() throws {
-        let director = AutumnTreeDirector()
-        for duration in [60.0, 120] {
-            let plan = director.makePlan(for: StorySessionContext(duration: duration, randomSeed: 130_363))
-            let bird = try XCTUnwrap(plan.moments.first { $0.id == .autumnBirdFlock })
-            let rabbit = try XCTUnwrap(plan.moments.first { $0.id == .autumnRabbitPeek })
-            XCTAssertEqual(bird.duration, AutumnCastSchedule.birdDuration)
-            XCTAssertEqual(rabbit.duration, AutumnCastSchedule.rabbitDuration)
-            let active = director.performance(
-                at: StoryContext(
-                    progress: bird.startTime / duration,
-                    elapsedTime: bird.startTime + 7,
-                    duration: duration,
-                    reduceMotion: true
-                ),
-                plan: plan
-            )
-            XCTAssertTrue(active.activeMoments.contains { $0.id == .autumnBirdFlock })
-            let expired = director.performance(
-                at: StoryContext(
-                    progress: min(1, (bird.endTime + 0.1) / duration),
-                    elapsedTime: bird.endTime + 0.1,
-                    duration: duration,
-                    reduceMotion: false
-                ),
-                plan: plan
-            )
-            XCTAssertFalse(expired.activeMoments.contains { $0.id == .autumnBirdFlock })
-        }
-    }
-
-#if !SWIFT_PACKAGE
-    @MainActor
-    func testAutumnCastAssetsLoadWithAcceptedHashesAndRegistration() throws {
-        let images = try AutumnCastImages(bundle: .main)
-        XCTAssertEqual(images.rabbitFrames.count, 12)
-        XCTAssertEqual(images.birdFrames.count, 12)
-        for (family, frames, urls) in [
-            (images.resources.manifest.rabbit, images.rabbitFrames, images.resources.rabbitURLs),
-            (images.resources.manifest.bird, images.birdFrames, images.resources.birdURLs)
-        ] {
-            XCTAssertEqual(family.dimensions, [512, 512])
-            for index in frames.indices {
-                let cgImage = try XCTUnwrap(frames[index].cgImage)
-                XCTAssertEqual(cgImage.width, 512)
-                XCTAssertEqual(cgImage.height, 512)
-                XCTAssertNotEqual(cgImage.alphaInfo, .none)
-                XCTAssertFalse([.noneSkipFirst, .noneSkipLast].contains(cgImage.alphaInfo))
-                let hash = SHA256.hash(data: try Data(contentsOf: urls[index]))
-                    .map { String(format: "%02x", $0) }.joined()
-                XCTAssertEqual(hash, family.frames[index].sha256)
-            }
-        }
-
-        let rabbitPixels = try images.rabbitFrames.map(rgbaPixels)
-        let fixedBodyStart = 320 * 512 * 4
-        for pixels in rabbitPixels.dropFirst() {
-            XCTAssertEqual(Array(pixels[fixedBodyStart...]), Array(rabbitPixels[0][fixedBodyStart...]))
-        }
-    }
-#endif
-
-    func testRabbitPlaybackUsesAcceptedExposuresAndReducedMotionStill() {
-        XCTAssertEqual(RabbitPeekConfiguration.frameCount, 12)
-        XCTAssertEqual(RabbitPeekConfiguration.frameDuration, 0.2)
-        XCTAssertEqual(RabbitPeekConfiguration.gestureDuration, 2.4)
-        XCTAssertEqual(RabbitPeekConfiguration.appearance(at: -0.1, reduceMotion: false).opacity, 0)
-        XCTAssertEqual(RabbitPeekConfiguration.appearance(at: 1.80, reduceMotion: false).frameIndex, 0)
-        XCTAssertEqual(RabbitPeekConfiguration.appearance(at: 1.999, reduceMotion: false).frameIndex, 0)
-        XCTAssertEqual(RabbitPeekConfiguration.appearance(at: 2.00, reduceMotion: false).frameIndex, 1)
-        XCTAssertEqual(RabbitPeekConfiguration.appearance(at: 3.999, reduceMotion: false).frameIndex, 10)
-        XCTAssertEqual(RabbitPeekConfiguration.appearance(at: 4.199, reduceMotion: false).frameIndex, 11)
-        XCTAssertEqual(RabbitPeekConfiguration.appearance(at: 8, reduceMotion: false).opacity, 0)
-
-        for time in stride(from: 0.0, through: 8.0, by: 0.1) {
-            let still = RabbitPeekConfiguration.appearance(at: time, reduceMotion: true)
-            XCTAssertEqual(still.frameIndex, RabbitPeekConfiguration.stableFrameIndex)
-            XCTAssertEqual(still.horizontalOffset, time < 8 ? 0 : RabbitPeekConfiguration.hiddenHorizontalOffset)
-        }
-    }
-
-    func testFlockApprovedCountsSizesExitSeparationAndForwardHeadings() throws {
-        XCTAssertEqual(BirdFlockConfiguration.fixedStep, 1.0 / 60.0)
-        for count in BirdFlockConfiguration.approvedCounts {
-            for bodyLength in BirdFlockConfiguration.approvedBodyLengths {
-                let config = try BirdFlockConfiguration(
-                    count: count,
-                    seed: 130_363,
-                    bodyLength: bodyLength
-                )
-                let trajectory = BirdFlockTrajectory(configuration: config)
-                let complete = trajectory.sample(at: 18)
-                XCTAssertEqual(complete.agents.count, count)
-                XCTAssertTrue(complete.exited, "\(count) birds at \(bodyLength) pt")
-                XCTAssertGreaterThanOrEqual(trajectory.minimumSeparationEver, bodyLength * 1.18)
-                XCTAssertTrue(trajectory.samples.allSatisfy { sample in
-                    sample.agents.allSatisfy {
-                        [$0.x, $0.y, $0.velocityX, $0.velocityY].allSatisfy(\.isFinite)
-                            && $0.velocityX > 0
-                    }
-                })
-            }
-        }
-    }
-
-    func testFlockWingPhasesCorrectionsFollowersAndRelaunchSampling() throws {
-        let config = try BirdFlockConfiguration(seed: 130_363)
-        let trajectory = BirdFlockTrajectory(configuration: config)
-        let phaseFrames = Set(trajectory.sample(at: 1.25).agents.map { $0.wingFrame(at: 1.25) })
-        XCTAssertGreaterThanOrEqual(phaseFrames.count, 9)
-        XCTAssertEqual(trajectory.leaderCorrections.count, 2)
-        XCTAssertEqual(try BirdFlockTrajectory(configuration: BirdFlockConfiguration(seed: 230_003)).leaderCorrections.count, 1)
-        XCTAssertEqual(trajectory.leaderCorrections.reduce(0) { $0 + $1.offset(at: 5) }, 0)
-        XCTAssertEqual(trajectory.leaderCorrections.reduce(0) { $0 + $1.offset(at: 14) }, 0)
-
-        for correction in trajectory.leaderCorrections {
-            let corrected = BirdFlockSimulation.state(configuration: config, at: correction.peakTime)
-            let baseline = BirdFlockSimulation.state(
-                configuration: try BirdFlockConfiguration(seed: 130_363, leaderCorrectionScale: 0),
-                at: correction.peakTime
-            )
-            XCTAssertGreaterThan(abs(corrected.agents[0].y - baseline.agents[0].y), 1.2)
-            XCTAssertGreaterThan(abs(corrected.agents[1].y - baseline.agents[1].y), 0.2)
-            XCTAssertLessThan(
-                abs(corrected.agents[1].y - baseline.agents[1].y),
-                abs(corrected.agents[0].y - baseline.agents[0].y)
-            )
-        }
-
-        let restored = BirdFlockTrajectory(configuration: config)
-        for time in [0.0, 1, 7, 7.794125442193649, 11.150824238086381, 18] {
-            XCTAssertEqual(trajectory.sample(at: time), restored.sample(at: time))
-        }
     }
 
     func testGravityGateRejectsHorizontalOrUpwardGravity() {
@@ -1877,240 +2568,6 @@ final class PlanetCalmTests: XCTestCase {
     }
 
 #if !SWIFT_PACKAGE
-    func testGroupPlanReconstructsAndDifferentSeedsVary() throws {
-        let config = try LeafGroupConfiguration.bundled.get()
-        let reference = try LeafGravityLabConfiguration.gate4Bundled.get()
-        let first = try LeafGroupPlan(configuration: config, reference: reference, seed: 42)
-        XCTAssertEqual(first, try LeafGroupPlan(configuration: config, reference: reference, seed: 42))
-        XCTAssertNotEqual(first.members, try LeafGroupPlan(configuration: config, reference: reference, seed: 43).members)
-        XCTAssertEqual(first, try JSONDecoder().decode(LeafGroupPlan.self, from: JSONEncoder().encode(first)))
-        XCTAssertEqual(Set(first.members.map(\.id)).count, 6)
-    }
-
-    func testGroupSizeAreaMassAndReleaseBoundsAcrossSeeds() throws {
-        let config = try LeafGroupConfiguration.bundled.get()
-        let reference = try LeafGravityLabConfiguration.gate4Bundled.get()
-        let area = try XCTUnwrap(reference.stillAirDrag).referenceAreaSquareMeters
-        func contains(_ value: Double, _ range: WindParameterRange) -> Bool {
-            (range.minimum...range.maximum).contains(value)
-        }
-        for seed in UInt64(0)..<256 {
-            let plan = try LeafGroupPlan(configuration: config, reference: reference, seed: seed)
-            XCTAssertEqual(plan.members.count, 6)
-            var strata = Set<Int>()
-            for leaf in plan.members {
-                XCTAssertTrue(contains(leaf.linearScale, config.linearScale))
-                strata.insert(Int((leaf.linearScale - config.linearScale.minimum)
-                    / (config.linearScale.maximum - config.linearScale.minimum) * 6))
-                XCTAssertTrue(contains(leaf.arealDensityScale, config.arealDensityScale))
-                XCTAssertEqual(leaf.areaSquareMeters, area * pow(leaf.linearScale, 2), accuracy: 1e-12)
-                XCTAssertEqual(leaf.massKilograms, reference.mass * pow(leaf.linearScale, 2) * leaf.arealDensityScale, accuracy: 1e-12)
-                XCTAssertEqual(leaf.massKilograms / leaf.areaSquareMeters, reference.mass / area * leaf.arealDensityScale, accuracy: 1e-12)
-                XCTAssertTrue(contains(leaf.centerOfPressure.x, config.pressureX))
-                XCTAssertTrue(contains(leaf.centerOfPressure.y, config.pressureY))
-                XCTAssertTrue(contains(leaf.releasePoint.x, config.releaseX))
-                XCTAssertTrue(contains(leaf.releasePoint.y, config.releaseY))
-                XCTAssertTrue(contains(leaf.releaseSeconds, config.releaseSeconds))
-                XCTAssertTrue(contains(leaf.initialTiltRadians, config.initialTiltRadians))
-                XCTAssertTrue(contains(leaf.initialVelocityMetersPerSecond.x, config.initialVelocityX))
-                XCTAssertTrue(contains(leaf.initialVelocityMetersPerSecond.y, config.initialVelocityY))
-                XCTAssertEqual(leaf.initialAngularVelocity, 0)
-                XCTAssertTrue(config.assetIDs.contains(leaf.assetID))
-            }
-            XCTAssertEqual(strata.count, 6)
-        }
-    }
-
-    func testGroupAirIsSharedAndPreservesApprovedWindSeed() throws {
-        let reference = try LeafGravityLabConfiguration.gate4Bundled.get()
-        let config = try LeafGroupConfiguration.bundled.get()
-        let plan = try LeafGroupPlan(configuration: config, reference: reference, seed: 42)
-        let windConfig = try XCTUnwrap(reference.wind)
-        let field = plan.wind(reference: windConfig)
-        XCTAssertEqual(field, WindField(configuration: windConfig, seed: 42, mode: .gust))
-        for time in [0.0, 0.5, 1.5, 2, 3, 6] {
-            let expected = field.sample(at: .zero, elapsedTime: time)
-            for leaf in plan.members {
-                XCTAssertEqual(field.sample(at: PhysicsVector(x: leaf.releasePoint.x, y: leaf.releasePoint.y), elapsedTime: time), expected)
-            }
-        }
-    }
-
-    func testGroupAreaChangesForceAndDensityChangesAcceleration() throws {
-        let reference = try LeafGravityLabConfiguration.gate4Bundled.get()
-        let plan = try LeafGroupPlan(configuration: LeafGroupConfiguration.bundled.get(), reference: reference, seed: 42)
-        let drag = try XCTUnwrap(reference.stillAirDrag)
-        let flutter = try XCTUnwrap(reference.passiveFlutter)
-        var forcePerArea: Double?
-        var scaledAcceleration: Double?
-        for leaf in plan.members {
-            let sample = LeafAerodynamics.sample(airVelocity: PhysicsVector(x: 40, y: 0),
-                leafVelocity: PhysicsVector(x: 0, y: -150), angularVelocity: 0, rotation: 0.3,
-                position: .zero, leafSize: PhysicsVector(x: 100 * leaf.linearScale, y: 100 * leaf.linearScale),
-                centerOfMass: NormalizedPhysicsPoint(x: 0, y: 0), drag: leaf.drag(from: drag), flutter: leaf.flutter(from: flutter))
-            let magnitude = hypot(sample.forceNewtons.x, sample.forceNewtons.y)
-            let normalizedForce = magnitude / leaf.areaSquareMeters
-            let normalizedAcceleration = magnitude / leaf.massKilograms * leaf.arealDensityScale
-            if let forcePerArea { XCTAssertEqual(normalizedForce, forcePerArea, accuracy: 1e-12) }
-            if let scaledAcceleration { XCTAssertEqual(normalizedAcceleration, scaledAcceleration, accuracy: 1e-12) }
-            forcePerArea = normalizedForce
-            scaledAcceleration = normalizedAcceleration
-        }
-    }
-
-    func testInvalidGroupCountAndScaleAreRejected() throws {
-        let config = try LeafGroupConfiguration.bundled.get()
-        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(config)) as? [String: Any])
-        json["count"] = 5
-        var decoded = try JSONDecoder().decode(LeafGroupConfiguration.self, from: JSONSerialization.data(withJSONObject: json))
-        XCTAssertThrowsError(try decoded.validated())
-        json["count"] = 6
-        json["linearScale"] = ["minimum": -0.5, "maximum": 1.0]
-        decoded = try JSONDecoder().decode(LeafGroupConfiguration.self, from: JSONSerialization.data(withJSONObject: json))
-        XCTAssertThrowsError(try decoded.validated())
-    }
-
-    @MainActor
-    func testTerrainProfileMatchesBundledArtworkAndRejectsInvalidBounds() throws {
-        let config = try LeafTerrainConfiguration.bundled.get()
-        XCTAssertEqual(try config.validated(), config)
-        let url = try XCTUnwrap(AutumnTreeSceneResources.assetURL(named: config.assetID))
-        let data = try Data(contentsOf: url)
-        XCTAssertEqual(SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), config.sourceSHA256)
-        let image = try XCTUnwrap(UIImage(data: data)?.cgImage)
-        XCTAssertEqual(image.width, config.sourcePixelWidth)
-        XCTAssertEqual(image.height, config.sourcePixelHeight)
-        let width = image.width, height = image.height
-        var pixels = [UInt8](repeating: 0, count: width * height * 4)
-        pixels.withUnsafeMutableBytes { bytes in
-            let context = CGContext(data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8,
-                bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)!
-            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        }
-        var maximumError = 0.0
-        for x in 0..<width {
-            let y = try XCTUnwrap((0..<height).first { pixels[($0 * width + x) * 4 + 3] >= config.alphaThreshold })
-            let edge = 1 - Double(y) / Double(height - 1)
-            maximumError = max(maximumError, abs(edge - config.surfaceHeight(at: Double(x) / Double(width - 1))))
-        }
-        // < 2.2 scene points for the proof's 610-point viewport, including paper-edge texture.
-        XCTAssertLessThan(maximumError, 0.012)
-        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(config)) as? [String: Any])
-        for (key, value) in [("friction", -1.0), ("restitution", 0.8), ("quietContactSeconds", 0.0)] {
-            var invalid = object
-            invalid[key] = value
-            let decoded = try JSONDecoder().decode(LeafTerrainConfiguration.self, from: JSONSerialization.data(withJSONObject: invalid))
-            XCTAssertThrowsError(try decoded.validated())
-        }
-        object["surface"] = [["x": 1.0, "y": 0.5], ["x": 0.0, "y": 0.5]]
-        let reversed = try JSONDecoder().decode(LeafTerrainConfiguration.self, from: JSONSerialization.data(withJSONObject: object))
-        XCTAssertThrowsError(try reversed.validated())
-    }
-
-    func testSettlingRequiresContinuousQuietSupportAndResets() throws {
-        let config = try LeafTerrainConfiguration.bundled.get()
-        var state = LeafSettlingTracker()
-        XCTAssertFalse(state.update(touchingGround: false, linearSpeed: 0, angularSpeed: 0, deltaTime: 10, configuration: config))
-        XCTAssertFalse(state.hasTouchedGround)
-        XCTAssertFalse(state.update(touchingGround: true, linearSpeed: 0, angularSpeed: 0, deltaTime: 0.4, configuration: config))
-        XCTAssertTrue(state.hasTouchedGround)
-        XCTAssertFalse(state.update(touchingGround: true, linearSpeed: 0.2, angularSpeed: 0, deltaTime: 0.4, configuration: config))
-        XCTAssertEqual(state.quietSeconds, 0)
-        XCTAssertFalse(state.update(touchingGround: true, linearSpeed: 0, angularSpeed: 1, deltaTime: 1, configuration: config))
-        XCTAssertFalse(state.update(touchingGround: true, linearSpeed: .nan, angularSpeed: 0, deltaTime: 1, configuration: config))
-        XCTAssertFalse(state.update(touchingGround: true, linearSpeed: 0, angularSpeed: 0, deltaTime: 0.4, configuration: config))
-        XCTAssertFalse(state.update(touchingGround: false, linearSpeed: 0, angularSpeed: 0, deltaTime: 0.1, configuration: config))
-        XCTAssertEqual(state.quietSeconds, 0)
-        XCTAssertFalse(state.update(touchingGround: true, linearSpeed: 0, angularSpeed: 0, deltaTime: 0.4, configuration: config))
-        XCTAssertTrue(state.update(touchingGround: true, linearSpeed: 0, angularSpeed: 0, deltaTime: 0.3, configuration: config))
-        XCTAssertTrue(state.isSettled)
-        XCTAssertFalse(state.update(touchingGround: true, linearSpeed: 0, angularSpeed: 0, deltaTime: 1, configuration: config))
-        state = LeafSettlingTracker()
-        XCTAssertFalse(state.isSettled)
-        XCTAssertFalse(state.hasTouchedGround)
-    }
-
-    func testLeafCollidersMatchOpaqueArtworkAtEveryDegree() throws {
-        let catalog = try LeafCollisionCatalog.bundled.get()
-        XCTAssertEqual(Set(catalog.shapes.map(\.assetID)), Set(try LeafGroupConfiguration.bundled.get().assetIDs))
-        let oldHull = try LeafGravityLabConfiguration.gate4Bundled.get().collisionHull
-        var originalRedGap = 0.0
-        for shape in catalog.shapes {
-            let bitmap = try decodedBitmap(assetID: shape.assetID)
-            XCTAssertEqual(bitmap.width, shape.sourcePixelWidth)
-            XCTAssertEqual(bitmap.height, shape.sourcePixelHeight)
-            let url = try XCTUnwrap(AutumnTreeSceneResources.assetURL(named: shape.assetID))
-            XCTAssertEqual(SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined(), shape.sourceSHA256)
-            let boundary = opaqueBoundary(bitmap, threshold: catalog.alphaThreshold)
-            let aspect = Double(bitmap.height) / Double(bitmap.width)
-            // Every fitted vertex is an actual opaque pixel center, never padding.
-            for p in shape.hull {
-                let x = Int(((p.x + 0.5) * Double(bitmap.width) - 0.5).rounded())
-                let y = Int(((0.5 - p.y) * Double(bitmap.height) - 0.5).rounded())
-                XCTAssertGreaterThanOrEqual(Int(bitmap.pixels[(y * bitmap.width + x) * 4 + 3]), catalog.alphaThreshold)
-            }
-            for degrees in 0..<360 {
-                let angle = Double(degrees) * .pi / 180
-                func support(_ p: NormalizedPhysicsPoint) -> Double { p.x * sin(angle) + p.y * aspect * cos(angle) }
-                let visible = try XCTUnwrap(boundary.map(support).min())
-                let fitted = try XCTUnwrap(shape.hull.map(support).min())
-                XCTAssertEqual(visible, fitted, accuracy: 1e-10, "\(shape.assetID), angle \(degrees)")
-                if shape.assetID == "leaf-maple-red" {
-                    originalRedGap = max(originalRedGap, visible - (oldHull.map(support).min() ?? 0))
-                }
-            }
-        }
-        // The same measurement detects the reported defect in the previous collider.
-        XCTAssertGreaterThan(originalRedGap, 0.04)
-    }
-
-    func testLeafColliderCatalogRejectsMalformedShapes() throws {
-        let catalog = try LeafCollisionCatalog.bundled.get()
-        let original = try XCTUnwrap(catalog.shapes.first)
-        func shape(_ hull: [NormalizedPhysicsPoint]) -> LeafCollisionShape {
-            LeafCollisionShape(assetID: original.assetID, sourceSHA256: original.sourceSHA256,
-                sourcePixelWidth: original.sourcePixelWidth, sourcePixelHeight: original.sourcePixelHeight, hull: hull)
-        }
-        XCTAssertThrowsError(try shape(Array(original.hull.reversed())).validate())
-        XCTAssertThrowsError(try shape(Array(original.hull.prefix(2))).validate())
-        XCTAssertThrowsError(try shape([.init(x: -.infinity, y: 0)] + original.hull).validate())
-        XCTAssertThrowsError(try shape([.init(x: -0.4, y: -0.4), .init(x: 0.4, y: -0.4),
-                                      .init(x: 0, y: 0), .init(x: 0.4, y: 0.4), .init(x: -0.4, y: 0.4)]).validate())
-        XCTAssertThrowsError(try LeafCollisionCatalog(alphaThreshold: 128, contactInsetPoints: 2.5, shapes: [original, original]).validated())
-        XCTAssertThrowsError(try LeafCollisionCatalog(alphaThreshold: 0, contactInsetPoints: 2.5, shapes: [original]).validated())
-        XCTAssertThrowsError(try LeafCollisionCatalog(alphaThreshold: 128, contactInsetPoints: .nan, shapes: [original]).validated())
-        XCTAssertThrowsError(try catalog.shape(for: "missing-leaf"))
-    }
-
-    func testLeafCollisionCoreHasUniformScenePointInsetAtDifferentSizes() throws {
-        let catalog = try LeafCollisionCatalog.bundled.get()
-        for shape in catalog.shapes {
-            for width in [28.0, 55.0, 100.0, 150.0] {
-                let height = width * Double(shape.sourcePixelHeight) / Double(shape.sourcePixelWidth)
-                let core = try shape.collisionHull(width: width, height: height, inset: catalog.contactInsetPoints)
-                XCTAssertGreaterThanOrEqual(core.count, 3)
-                for p in core {
-                    let distances = shape.hull.indices.map { i -> Double in
-                        let a = shape.hull[i], b = shape.hull[(i + 1) % shape.hull.count]
-                        let dx = (b.x - a.x) * width, dy = (b.y - a.y) * height
-                        return (dx * (p.y - a.y) * height - dy * (p.x - a.x) * width) / hypot(dx, dy)
-                    }
-                    XCTAssertGreaterThanOrEqual(try XCTUnwrap(distances.min()), catalog.contactInsetPoints - 1e-8)
-                    XCTAssertEqual(try XCTUnwrap(distances.min()), catalog.contactInsetPoints, accuracy: 1e-8)
-                }
-            }
-            XCTAssertThrowsError(try shape.collisionHull(width: 1, height: 1, inset: catalog.contactInsetPoints))
-            XCTAssertThrowsError(try shape.collisionHull(width: .nan, height: 10, inset: catalog.contactInsetPoints))
-        }
-    }
-
-    private struct Bitmap {
-        let width: Int
-        let height: Int
-        let pixels: [UInt8]
-    }
-
     private func rgbaPixels(_ image: UIImage) throws -> [UInt8] {
         let cgImage = try XCTUnwrap(image.cgImage)
         var pixels = [UInt8](repeating: 0, count: cgImage.width * cgImage.height * 4)
@@ -2129,462 +2586,21 @@ final class PlanetCalmTests: XCTestCase {
         return pixels
     }
 
-    private func decodedBitmap(assetID: String) throws -> Bitmap {
-        let url = try XCTUnwrap(AutumnTreeSceneResources.assetURL(named: assetID))
-        let image = try XCTUnwrap(UIImage(contentsOfFile: url.path)?.cgImage)
-        var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
-        pixels.withUnsafeMutableBytes { bytes in
-            let context = CGContext(data: bytes.baseAddress, width: image.width, height: image.height, bitsPerComponent: 8,
-                bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)!
-            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
-        }
-        return Bitmap(width: image.width, height: image.height, pixels: pixels)
-    }
-
-    private func opaqueBoundary(_ bitmap: Bitmap, threshold: Int) -> [NormalizedPhysicsPoint] {
-        func opaque(_ x: Int, _ y: Int) -> Bool {
-            x >= 0 && x < bitmap.width && y >= 0 && y < bitmap.height
-                && bitmap.pixels[(y * bitmap.width + x) * 4 + 3] >= threshold
-        }
-        var points: [NormalizedPhysicsPoint] = []
-        for y in 0..<bitmap.height {
-            for x in 0..<bitmap.width where opaque(x, y) {
-                if !opaque(x-1, y) || !opaque(x+1, y) || !opaque(x, y-1) || !opaque(x, y+1) {
-                    points.append(.init(x: (Double(x) + 0.5) / Double(bitmap.width) - 0.5,
-                                        y: 0.5 - (Double(y) + 0.5) / Double(bitmap.height)))
-                }
-            }
-        }
-        return points
-    }
-
     @MainActor
-    func testTerrainNativeLandingAndReplayKeepSettledPoses() async throws {
-        let windowScene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let previous = windowScene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: windowScene)
-        let model = LeafGroupLabModel()
-        window.rootViewController = UIHostingController(rootView: LeafGroupLabView(model: model).environment(\.scenePhase, .active))
-        window.makeKeyAndVisible()
-        defer { window.isHidden = true; window.rootViewController = nil; previous?.makeKey() }
-        try await Task.sleep(for: .milliseconds(600))
-        let group = try LeafGroupConfiguration.bundled.get()
-        let catalog = try LeafCollisionCatalog.bundled.get()
-        var visibleBoundaries: [String: [NormalizedPhysicsPoint]] = [:]
-        for id in group.assetIDs { visibleBoundaries[id] = opaqueBoundary(try decodedBitmap(assetID: id), threshold: catalog.alphaThreshold) }
-        let ground = try decodedBitmap(assetID: "ground-base")
-        let groundTop = try (0..<ground.width).map { x -> Double in
-            let row = try XCTUnwrap((0..<ground.height).first { ground.pixels[($0 * ground.width + x) * 4 + 3] >= 128 })
-            return 1 - (Double(row) + 0.5) / Double(ground.height)
+    func testAutumnArtworkContainsOnlyCurrentMasks() throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: Bundle.main.bundleURL.appendingPathComponent("CastV1").path))
+        let expected = Set(AutumnArtwork.assetIDs.map { $0 + ".png" })
+        let folder = try XCTUnwrap(AutumnArtwork.assetURL(named: "leaf-maple-red")?.deletingLastPathComponent())
+        let bundled = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        XCTAssertEqual(Set(bundled), expected, "Retired plates/layouts must not ship in the app.")
+        for name in AutumnArtwork.assetIDs {
+            let image = try XCTUnwrap(AutumnArtworkCache.shared.image(named: name))
+            let pixels = try rgbaPixels(image)
+            let alpha = stride(from: 3, to: pixels.count, by: 4).map { pixels[$0] }
+            XCTAssertTrue(alpha.contains(0), "\(name) must retain genuine transparent cutout space")
+            XCTAssertTrue(alpha.contains { $0 > 200 }, "\(name) must retain opaque paper")
         }
-        for seed: UInt64 in [42, 43, 43, 44] {
-            if model.scene?.plan.seed == seed {
-                model.scene?.replay()
-            } else {
-                model.newTrial(seed: seed, reducedMotion: false, diagnostics: false, terrainEnabled: true)
-            }
-            let scene = try XCTUnwrap(model.scene)
-            let terrain = try XCTUnwrap(scene.terrain)
-            let nodes = scene.children.compactMap { $0 as? SKSpriteNode }.filter { $0.name?.hasPrefix("group-leaf-") == true }
-            XCTAssertEqual(nodes.count, 6)
-            for node in nodes {
-                XCTAssertTrue(node.physicsBody?.usesPreciseCollisionDetection == true)
-                XCTAssertEqual(try XCTUnwrap(node.physicsBody).friction, CGFloat(terrain.friction), accuracy: 1e-6)
-                XCTAssertEqual(try XCTUnwrap(node.physicsBody).restitution, CGFloat(terrain.restitution), accuracy: 1e-6)
-                XCTAssertEqual(node.physicsBody?.collisionBitMask, 2)
-            }
-            for _ in 0..<200 {
-                try await Task.sleep(for: .milliseconds(100))
-                if model.diagnostics.settled == 6 || model.diagnostics.failed { break }
-            }
-            XCTAssertTrue(scene.view?.scene === scene)
-            XCTAssertFalse(model.diagnostics.failed, "Trial \(seed): \(model.diagnostics)")
-            XCTAssertEqual(model.diagnostics.settled, 6, "Trial \(seed): \(model.diagnostics)")
-            for member in scene.plan.members {
-                let node = try XCTUnwrap(scene.childNode(withName: "group-leaf-\(member.id)") as? SKSpriteNode)
-                let points = try XCTUnwrap(visibleBoundaries[member.assetID])
-                let clearance = points.map { p -> Double in
-                    let x = p.x * node.size.width, y = p.y * node.size.height
-                    let worldX = node.position.x + x * cos(node.zRotation) - y * sin(node.zRotation)
-                    let worldY = node.position.y + x * sin(node.zRotation) + y * cos(node.zRotation)
-                    let column = min(ground.width - 1, max(0, Int(worldX / scene.size.width * Double(ground.width))))
-                    return worldY - groundTop[column] * scene.size.height * terrain.renderedHeightFraction
-                }.min() ?? .infinity
-                print("visible-contact,seed=\(seed),leaf=\(member.id),asset=\(member.assetID),gapPoints=\(clearance)")
-                XCTAssertLessThanOrEqual(clearance, 2.0, "Visible leaf must meet artwork, not just an invisible collider")
-                XCTAssertGreaterThanOrEqual(clearance, -2.0, "Visible leaf must not tunnel into artwork")
-            }
-            let poses = nodes.map { [$0.position.x, $0.position.y, $0.zRotation] }
-            scene.setDiagnosticsVisible(true)
-            try await Task.sleep(for: .milliseconds(700))
-            XCTAssertEqual(nodes.map { [$0.position.x, $0.position.y, $0.zRotation] }, poses)
-            for node in nodes {
-                XCTAssertFalse(node.isHidden)
-                XCTAssertEqual(node.physicsBody?.isDynamic, false)
-                XCTAssertEqual(node.physicsBody?.velocity, .zero)
-                XCTAssertEqual(node.physicsBody?.angularVelocity, 0)
-            }
-        }
-        model.scene?.reset()
-        XCTAssertEqual(model.diagnostics.settled, 0)
-        XCTAssertEqual(model.diagnostics.state, "ready")
-        model.scene?.setReducedMotion(true)
-        model.scene?.replay()
-        try await Task.sleep(for: .milliseconds(800))
-        XCTAssertEqual(model.diagnostics.released, 0)
-        XCTAssertEqual(model.diagnostics.state, "static preview")
-    }
-
-    @MainActor
-    func testGroupNativeHostKeepsNewTrialAndReplayRendering() async throws {
-        let windowScene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let previousKeyWindow = windowScene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: windowScene)
-        let model = LeafGroupLabModel()
-        window.rootViewController = UIHostingController(rootView: LeafGroupLabView(model: model, terrainEnabled: false).environment(\.scenePhase, .active))
-        window.makeKeyAndVisible()
-        defer {
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
-        }
-        try await Task.sleep(for: .milliseconds(600))
-        let first = try XCTUnwrap(model.scene)
-        XCTAssertTrue(first.view?.scene === first)
-        first.replay()
-        try await Task.sleep(for: .milliseconds(900))
-        XCTAssertGreaterThan(model.diagnostics.elapsed, 0.3)
-        XCTAssertEqual(model.diagnostics.released, 6)
-        for seed: UInt64 in [71, 72, 73] {
-            model.newTrial(seed: seed, reducedMotion: false, diagnostics: false)
-            let current = try XCTUnwrap(model.scene)
-            try await Task.sleep(for: .milliseconds(900))
-            XCTAssertTrue(current.view?.scene === current, "Trial \(seed) must be the displayed scene")
-            XCTAssertFalse(current.isPaused, "Trial \(seed) scene was paused by its host")
-            XCTAssertEqual(current.view?.isPaused, false)
-            XCTAssertGreaterThan(model.diagnostics.elapsed, 0.3, "New trial must receive real frame callbacks")
-            XCTAssertEqual(model.diagnostics.released, 6)
-            for member in current.plan.members {
-                let node = try XCTUnwrap(current.childNode(withName: "group-leaf-\(member.id)"))
-                XCTAssertLessThan(node.position.y, current.size.height * member.releasePoint.y,
-                                  "Each released leaf must physically descend")
-            }
-            current.replay()
-            try await Task.sleep(for: .milliseconds(900))
-            XCTAssertGreaterThan(model.diagnostics.elapsed, 0.3, "Replay must receive real frame callbacks")
-            XCTAssertEqual(model.diagnostics.released, 6)
-        }
-    }
-
-    @MainActor
-    func testGroupSceneResetDiagnosticsAndReducedMotionPreservePhysicalState() throws {
-        let config = try LeafGroupConfiguration.bundled.get()
-        let reference = try LeafGravityLabConfiguration.gate4Bundled.get()
-        let plan = try LeafGroupPlan(configuration: config, reference: reference, seed: 42)
-        var images: [String: UIImage] = [:]
-        for id in config.assetIDs {
-            let url = try XCTUnwrap(AutumnTreeSceneResources.assetURL(named: id))
-            images[id] = try XCTUnwrap(UIImage(contentsOfFile: url.path))
-        }
-        let scene = try LeafGroupScene(size: CGSize(width: 1000, height: 760), reference: reference, plan: plan, images: images)
-        let nodes = scene.children.compactMap { $0 as? SKSpriteNode }
-        XCTAssertEqual(nodes.count, 6)
-        let positions = nodes.map(\.position)
-        let rotations = nodes.map(\.zRotation)
-        scene.setDiagnosticsVisible(true)
-        scene.setDiagnosticsVisible(false)
-        XCTAssertEqual(nodes.map(\.position), positions)
-        XCTAssertEqual(nodes.map(\.zRotation), rotations)
-        for (node, leaf) in zip(nodes, plan.members) {
-            let body = try XCTUnwrap(node.physicsBody)
-            XCTAssertEqual(body.mass, leaf.massKilograms, accuracy: 1e-8)
-            XCTAssertEqual(body.angularVelocity, 0)
-            XCTAssertEqual(body.collisionBitMask, 0)
-            XCTAssertEqual(body.fieldBitMask, 0)
-            XCTAssertEqual(body.linearDamping, 0)
-            XCTAssertEqual(body.angularDamping, 0)
-        }
-        scene.setReducedMotion(true)
-        scene.replay()
-        scene.update(100)
-        scene.update(200)
-        XCTAssertFalse(scene.isRunning)
-        XCTAssertEqual(nodes.map(\.position), positions)
-        XCTAssertEqual(nodes.map(\.zRotation), rotations)
-        scene.setReducedMotion(false)
-        var released = 0
-        scene.diagnosticsHandler = { released = $0.released }
-        scene.replay()
-        for tick in 0...10 { scene.update(Double(tick) / 10); scene.didSimulatePhysics() }
-        XCTAssertEqual(released, 6)
-        scene.reset()
-        XCTAssertFalse(scene.isRunning)
-        XCTAssertEqual(nodes.map(\.position), positions)
-        XCTAssertEqual(nodes.map(\.zRotation), rotations)
-    }
-
-    func testAutumnReviewPlansKeepStableIdentitiesAndSharedMoments() throws {
-        let resources = try AutumnTreeSceneResources.bundled.get()
-        let reference = try LeafGravityLabConfiguration.gate4Bundled.get()
-        let three = AutumnLeafReviewDirector(layout: resources.leafLayout, count: 3, reference: reference)
-        let twelve = AutumnLeafReviewDirector(layout: resources.leafLayout, count: 12, reference: reference)
-        let context = StorySessionContext(duration: 60, randomSeed: 42)
-        XCTAssertEqual(three.selectedLeaves(seed: 42).map(\.id), Array(twelve.selectedLeaves(seed: 42).prefix(3)).map(\.id))
-        XCTAssertEqual(twelve.selectedLeaves(seed: 42).count, 12)
-        XCTAssertNotEqual(twelve.selectedLeaves(seed: 42).map(\.id), twelve.selectedLeaves(seed: 43).map(\.id))
-        let plan = twelve.makePlan(for: context)
-        XCTAssertEqual(plan, twelve.makePlan(for: context))
-        XCTAssertEqual(plan.moments.count, 13)
-        XCTAssertEqual(Set(plan.moments.map(\.id)).count, 13)
-        for moment in plan.moments {
-            XCTAssertNotNil(moment.visualCue)
-            XCTAssertNotNil(moment.audioCue)
-            XCTAssertGreaterThanOrEqual(moment.startTime, 6)
-            XCTAssertLessThanOrEqual(moment.startTime, 60 * AutumnLeafReview.endProgress)
-        }
-        let session = FocusSession(story: .autumnTree, duration: .oneMinute, startedAt: Date(), randomSeed: 42)
-        let player = StoryPlayer(session: session, module: AutumnLeafReviewModule(layout: resources.leafLayout, count: 12, reference: reference))
-        XCTAssertEqual(player.moments(startingAfter: session.startedAt, through: session.endDate), plan.moments)
-        let longer = twelve.makePlan(for: StorySessionContext(duration: 120, randomSeed: 42))
-        for (a, b) in zip(plan.moments, longer.moments) {
-            if a.visualCue?.effect.rawValue == "autumn-review.air" {
-                XCTAssertEqual(b.startTime - a.startTime, 6, accuracy: 1e-10)
-            } else { XCTAssertEqual(b.startTime, a.startTime * 2, accuracy: 1e-10) }
-            XCTAssertEqual(a.duration, b.duration)
-            XCTAssertEqual(a.id, b.id)
-        }
-        let productionPlan = AutumnTreeDirector().makePlan(for: context)
-        XCTAssertEqual(productionPlan.moments.filter { $0.id == .autumnBirdFlock }.count, 1)
-        XCTAssertEqual(productionPlan.moments.filter { $0.id == .autumnRabbitPeek }.count, 1)
-    }
-
-    func testAutumnDepthAndIrregularCadenceStaySeeded() throws {
-        let resources = try AutumnTreeSceneResources.bundled.get()
-        let director = try AutumnLeafReviewDirector(layout: resources.leafLayout, count: 12,
-            reference: LeafGravityLabConfiguration.gate4Bundled.get())
-        for seed in UInt64(40)...50 {
-            let leaves = director.selectedLeaves(seed: seed)
-            for depth in AutumnLeafDepth.allCases {
-                XCTAssertEqual(leaves.filter { depth.accepts($0) }.count, 4)
-            }
-            let back = leaves.filter { AutumnLeafDepth.back.accepts($0) }
-            let front = leaves.filter { AutumnLeafDepth.foreground.accepts($0) }
-            XCTAssertLessThan(back.map(\.scale).max()!, front.map(\.scale).min()!)
-            let times = director.releaseTimes(duration: 60, seed: seed, count: 12)
-            XCTAssertEqual(times, director.releaseTimes(duration: 60, seed: seed, count: 12))
-            XCTAssertEqual(times.first!, 6, accuracy: 1e-9)
-            XCTAssertEqual(times.last!, 46.8, accuracy: 1e-9)
-            let gaps = zip(times.dropFirst(), times).map(-)
-            XCTAssertEqual(gaps.filter { $0 < 2 }.count, 2)
-            XCTAssertGreaterThan(gaps.filter { $0 > 3 }.count, 6)
-            XCTAssertNotEqual(times, director.releaseTimes(duration: 60, seed: seed + 1, count: 12))
-        }
-    }
-
-    func testSheetTipsOnlyAfterContactAndProjectsAlongTerrain() {
-        var sheet = LeafSheetContact()
-        sheet.advance(supported: false, dt: 10, gravity: 1.2, heightMeters: 0.4, angle: 0)
-        XCTAssertEqual(sheet, LeafSheetContact(), "Airborne physics must have no sheet correction")
-        for _ in 0..<1200 {
-            sheet.advance(supported: true, dt: 1.0 / 120, gravity: 1.2, heightMeters: 0.4, angle: 0.15)
-        }
-        XCTAssertTrue(sheet.isFlat)
-        XCTAssertEqual(sheet.speed, 0)
-        for rotation in stride(from: 0.0, to: Double.pi * 2, by: 0.1) {
-            let point = CGPoint(x: 0, y: 20)
-            let projected = sheet.project(point: point, rotation: rotation)
-            let normal = -projected.x * sin(0.15) + projected.y * cos(0.15)
-            XCTAssertLessThanOrEqual(abs(normal), 20 * LeafSheetContact.flatProjection + 1e-9)
-        }
-    }
-
-    func testAutumnGroundWindIsBoundedSpatialAndUnchangedAloft() {
-        XCTAssertEqual(AutumnLeafReview.windScale(heightMeters: -1), 0)
-        XCTAssertEqual(AutumnLeafReview.windScale(heightMeters: 0), 0)
-        XCTAssertEqual(AutumnLeafReview.windScale(heightMeters: 0.125), 0.5)
-        XCTAssertEqual(AutumnLeafReview.windScale(heightMeters: 0.25), 1)
-        XCTAssertEqual(AutumnLeafReview.windScale(heightMeters: 1), 1)
-        let samples = (0...100).map { AutumnLeafReview.windScale(heightMeters: Double($0) / 100) }
-        XCTAssertTrue(zip(samples, samples.dropFirst()).allSatisfy { $0 <= $1 })
-        XCTAssertTrue(samples.allSatisfy { (0...1).contains($0) })
-    }
-
-    @MainActor
-    func testAutumnReviewGeometryAndLifecycleReconstruction() throws {
-        let resources = try AutumnTreeSceneResources.bundled.get()
-        let reference = try LeafGravityLabConfiguration.gate4Bundled.get()
-        let start = Date().addingTimeInterval(10)
-        let record = AutumnLeafReviewRecord(session: FocusSession(story: .autumnTree, duration: .oneMinute,
-            startedAt: start, randomSeed: 42), count: 12, savedAt: start)
-        for size in [CGSize(width: 390, height: 844), CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 690)] {
-            let scene = try AutumnLeafIntegrationScene(size: size, record: record, resources: resources, reference: reference, reduceMotion: false)
-            XCTAssertEqual(scene.bodies.count, 12)
-            for (id, body) in scene.bodies {
-                var identityCount = 0
-                scene.enumerateChildNodes(withName: "//\(id)") { _, _ in identityCount += 1 }
-                XCTAssertEqual(identityCount, 1, "No duplicate attached leaf")
-                let source = try XCTUnwrap(resources.leafLayout.canopy.first { $0.id == id })
-                let image = try XCTUnwrap(UIImage(contentsOfFile: XCTUnwrap(AutumnTreeSceneResources.assetURL(named: source.assetId)).path))
-                let pose = scene.geometry.leafPose(source, imageSize: image.size)
-                // SpriteKit stores transforms at float precision internally.
-                XCTAssertEqual(body.node.position.x, pose.position.x, accuracy: 0.0001)
-                XCTAssertEqual(body.node.position.y, pose.position.y, accuracy: 0.0001)
-                XCTAssertEqual(body.node.size.width, pose.size.width, accuracy: 0.00001)
-                XCTAssertEqual(body.node.size.height, pose.size.height, accuracy: 0.00001)
-                XCTAssertEqual(body.node.zRotation, pose.rotation, accuracy: 0.000001)
-                XCTAssertEqual(body.member.massKilograms, reference.mass * pow(body.member.linearScale, 2) * body.member.arealDensityScale, accuracy: 1e-12)
-                let position = body.node.position, rotation = body.node.zRotation
-                body.release()
-                XCTAssertEqual(body.node.position, position)
-                XCTAssertEqual(body.node.zRotation, rotation)
-                XCTAssertEqual(body.node.physicsBody?.angularVelocity, 0)
-            }
-            let liveDate = start.addingTimeInterval(49)
-            let saved = scene.checkpoint(at: liveDate)
-            XCTAssertEqual(try JSONDecoder().decode(AutumnLeafReviewRecord.self, from: JSONEncoder().encode(saved)), saved)
-            scene.reconcile(saved, at: liveDate.addingTimeInterval(0.1))
-            for (id, body) in scene.bodies {
-                let moment = try XCTUnwrap(scene.moments.first { $0.visualCue?.effect.rawValue == id })
-                XCTAssertTrue(body.released)
-                XCTAssertEqual(body.finished, !moment.isActive(at: 49.1))
-            }
-            for body in scene.bodies.values { body.node.zRotation += 0.7 }
-            scene.reconcile(saved, at: start.addingTimeInterval(80))
-            XCTAssertEqual(scene.reconstructedIDs.count, 12)
-            XCTAssertTrue(scene.bodies.values.allSatisfy { $0.finished && $0.node.physicsBody?.isDynamic == false })
-            for body in scene.bodies.values {
-                let actual = try XCTUnwrap(body.node.warpGeometry as? SKWarpGeometryGrid)
-                let expected = body.sheet.warp(size: body.node.size, rotation: body.node.zRotation)
-                for vertex in 0..<4 { XCTAssertEqual(actual.destPosition(at: vertex), expected.destPosition(at: vertex)) }
-            }
-            let settled = scene.checkpoint(at: start.addingTimeInterval(80))
-            scene.reconcile(settled, at: start.addingTimeInterval(85))
-            XCTAssertEqual(scene.checkpoint(at: start.addingTimeInterval(85)).bodies, settled.bodies)
-            let resized = try AutumnLeafIntegrationScene(size: CGSize(width: size.width + 40, height: size.height),
-                record: settled, resources: resources, reference: reference, reduceMotion: false)
-            resized.reconcile(settled, at: start.addingTimeInterval(85))
-            XCTAssertEqual(resized.reconstructedIDs.count, 12, "A changed viewport must not reuse old screen-space contact")
-            let reduced = try AutumnLeafIntegrationScene(size: size, record: saved, resources: resources, reference: reference, reduceMotion: true)
-            reduced.reconcile(saved, at: liveDate.addingTimeInterval(0.1))
-            XCTAssertTrue(reduced.bodies.values.allSatisfy(\.finished))
-        }
-    }
-
-    @MainActor
-    func testAutumnRetiredSceneCannotPublishIntoReplay() throws {
-        let suite = "gate6-retired-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let model = AutumnLeafIntegrationModel(defaults: defaults)
-        model.configure(size: CGSize(width: 1194, height: 690), reducedMotion: false, diagnostics: false)
-        let old = try XCTUnwrap(model.scene)
-        model.start(count: 12, seed: 43, reducedMotion: false, diagnostics: false)
-        let expected = model.record
-        let status = model.status
-        old.checkpointHandler?(old.checkpoint(at: Date().addingTimeInterval(70)))
-        old.statusHandler?("stale scene status")
-        XCTAssertEqual(model.record, expected)
-        XCTAssertEqual(model.status, status)
-        XCTAssertEqual(AutumnLeafIntegrationModel(defaults: defaults).record, expected)
-    }
-
-    @MainActor
-    func testAutumnStaticAccentsLieAlongTheirSurface() throws {
-        let resources = try AutumnTreeSceneResources.bundled.get()
-        let start = Date().addingTimeInterval(10)
-        let scene = try AutumnLeafIntegrationScene(size: CGSize(width: 1194, height: 690),
-            record: AutumnLeafReviewRecord(session: FocusSession(story: .autumnTree, duration: .oneMinute,
-                startedAt: start, randomSeed: 42), count: 3, savedAt: start), resources: resources,
-            reference: LeafGravityLabConfiguration.gate4Bundled.get(), reduceMotion: true)
-        for (id, asset, depth) in [("ground-oak-gold-02", "leaf-oak-gold", AutumnLeafDepth.foreground),
-                                   ("ground-settled-01", "leaf-settled", .middle)] {
-            let node = try XCTUnwrap(scene.childNode(withName: "//\(id)") as? SKSpriteNode)
-            let warp = try XCTUnwrap(node.warpGeometry as? SKWarpGeometryGrid)
-            let surface = try XCTUnwrap(scene.surfaces[depth])
-            let origin = warp.destPosition(at: 0), right = warp.destPosition(at: 1), top = warp.destPosition(at: 2)
-            let points = try opaqueBoundary(decodedBitmap(assetID: asset), threshold: 128).map { p in
-                let v = origin + Float(p.x + 0.5) * (right - origin) + Float(p.y + 0.5) * (top - origin)
-                let x = (Double(v.x) - 0.5) * node.size.width, y = (Double(v.y) - 0.5) * node.size.height
-                return CGPoint(x: x * cos(node.zRotation) - y * sin(node.zRotation),
-                               y: x * sin(node.zRotation) + y * cos(node.zRotation))
-            }
-            let width = points.map(\.x).max()! - points.map(\.x).min()!
-            let height = points.map(\.y).max()! - points.map(\.y).min()!
-            XCTAssertLessThan(height / width, 0.65, "The source defect was an upright/stem-balanced accent: \(id)")
-            let gap = points.map { node.position.y + $0.y - surface.height(at: node.position.x + $0.x) }.min()!
-            XCTAssertEqual(gap, 0, accuracy: 0.05)
-            XCTAssertEqual(node.zPosition, depth.zPosition)
-            if depth == .middle {
-                XCTAssertLessThan(node.size.width, scene.geometry.composition.width * scene.geometry.scale * 0.03,
-                                  "The distant completion maple must not retain its oversized foreground scale")
-            }
-        }
-    }
-
-    @MainActor
-    func testAutumnNativeThreeThenTwelveLandAndReplay() async throws {
-        let suite = "gate6-tests-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let model = AutumnLeafIntegrationModel(defaults: defaults)
-        let windowScene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let previous = windowScene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: windowScene)
-        window.rootViewController = UIHostingController(rootView: AutumnLeafIntegrationView(model: model).environment(\.scenePhase, .active))
-        window.makeKeyAndVisible()
-        defer { window.isHidden = true; window.rootViewController = nil; previous?.makeKey() }
-        try await Task.sleep(for: .seconds(2))
-        for (count, seed) in [(3, UInt64(42)), (12, UInt64(42)), (12, UInt64(43))] {
-            model.start(count: count, seed: seed, reducedMotion: false, diagnostics: false)
-            let scene = try XCTUnwrap(model.scene)
-            for _ in 0..<900 {
-                try await Task.sleep(for: .milliseconds(100))
-                if scene.failed || scene.bodies.values.allSatisfy(\.finished) { break }
-            }
-            XCTAssertTrue(scene.view?.scene === scene)
-            XCTAssertFalse(scene.failed, model.status)
-            XCTAssertEqual(scene.bodies.values.filter(\.finished).count, count, model.status)
-            XCTAssertTrue(scene.reconstructedIDs.isEmpty, "Normal moving proof must never use restored rest poses")
-            for (id, body) in scene.bodies {
-                XCTAssertTrue(body.sheet.isFlat, "A quiet upright leaf must never count as settled")
-                let surface = try XCTUnwrap(scene.surfaces[scene.depths[id]!])
-                XCTAssertEqual(body.node.zPosition, scene.depths[id]!.zPosition)
-                XCTAssertEqual(body.node.physicsBody?.collisionBitMask, scene.depths[id]!.collisionMask)
-                let bitmap = try decodedBitmap(assetID: body.member.assetID)
-                let boundary = opaqueBoundary(bitmap, threshold: 128)
-                let gap = boundary.map { p -> Double in
-                    let x = p.x * body.node.size.width, y = p.y * body.node.size.height
-                    let projected = body.sheet.project(point: CGPoint(x: x, y: y), rotation: body.node.zRotation)
-                    let worldX = body.node.position.x + projected.x
-                    let worldY = body.node.position.y + projected.y
-                    return worldY - surface.height(at: worldX)
-                }.min() ?? .infinity
-                print("gate6-contact,count=\(count),seed=\(seed),id=\(body.node.name ?? ""),gap=\(gap)")
-                XCTAssertLessThanOrEqual(gap, 2)
-                XCTAssertGreaterThanOrEqual(gap, -2)
-            }
-            let poses = scene.checkpoint(at: Date()).bodies
-            model.suspend()
-            try await Task.sleep(for: .milliseconds(500))
-            model.configure(size: scene.size, reducedMotion: false, diagnostics: false)
-            XCTAssertEqual(model.scene?.checkpoint(at: Date()).bodies, poses)
-            let relaunched = AutumnLeafIntegrationModel(defaults: defaults)
-            XCTAssertEqual(relaunched.record.session, model.record.session)
-            XCTAssertEqual(relaunched.record.bodies, poses)
-        }
-        for seed: UInt64 in [43, 43] {
-            model.start(count: 3, seed: seed, reducedMotion: false, diagnostics: false)
-            let scene = try XCTUnwrap(model.scene)
-            try await Task.sleep(for: .seconds(9))
-            XCTAssertTrue(scene.view?.scene === scene)
-            XCTAssertEqual(scene.bodies.values.filter(\.released).count, 1)
-            XCTAssertTrue(scene.reconstructedIDs.isEmpty)
-            for body in scene.bodies.values where body.released {
-                XCTAssertLessThan(body.node.position.y, body.member.releasePoint.y * scene.size.height)
-            }
-        }
-        model.suspend()
+        XCTAssertNil(Bundle.main.url(forResource: "terrain-adjustments", withExtension: "json", subdirectory: "SceneV2"))
     }
 
     func testBundledGateBaselinesAndGate3AreIsolated() throws {

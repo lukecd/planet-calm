@@ -42,4 +42,9 @@ enum PlanetFocusTypography {
     static func navigation(size: CGFloat) -> Font {
         .custom("SueEllenFrancisco", size: size, relativeTo: .body)
     }
+
+    /// Standard San Francisco for functional UI; handwriting belongs to story titles.
+    static func interface(_ style: Font.TextStyle, weight: Font.Weight = .regular) -> Font {
+        .system(style, design: .default).weight(weight)
+    }
 }

@@ -1,8 +1,10 @@
 import Foundation
 
 /// The scene-independent, authoritative transport for a generative performance.
-/// It owns only persistent timing and the seed. Directors own their creative plans;
+/// It owns only in-memory timing and the seed. Directors own their creative plans;
 /// renderers and audio schedulers sample the same state and never advance it.
+/// Pause/Codable support is for development controls and deterministic tests;
+/// production sessions are never saved or restored across process launches.
 struct PerformanceSession: Equatable, Codable, Sendable {
     let duration: FocusDuration
     let startedAt: Date

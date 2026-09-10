@@ -11,6 +11,7 @@ constant float betaMie = 0.003996;
 constant float mieExtinction = 0.004440;
 constant float pi = 3.14159265;
 
+// Autumn reuses the physical atmosphere integral, not the splash pigment progression.
 struct SunriseUniforms { float4 viewport; float4 story; float4 optics; };
 struct SkyVertex { float4 position [[position]]; float2 uv; };
 
@@ -307,4 +308,29 @@ fragment half4 paperCloudFragment(SkyVertex in [[stage_in]],
     // UIKit composites the clear cloud surface over the separately drawn paper sun.
     float3 straight = color / max(alpha, 0.00001);
     return half4(half3(linearToSRGB(clamp(straight, 0.0, 1.0)) * alpha), half(alpha));
+}
+
+// Fixed-view paper clearing: blue sky fill and a low, warm directional sun.
+fragment half4 autumnSkyFragment(SkyVertex in [[stage_in]],
+                                constant SunriseUniforms& u [[buffer(0)]],
+                                texture2d<half> transmittance [[texture(0)]],
+                                texture2d<half> paperGrain [[texture(1)]]) {
+    float2 pixel = in.uv * u.viewport.xy;
+    float p = saturate(u.story.x);
+    float2 solar = u.viewport.zw / u.viewport.xy;
+    float elevation = u.optics.x;
+    float3 sunDirection = normalize(float3(0, sin(elevation), cos(elevation)));
+    float azimuth = (in.uv.x - solar.x) * 1.5;
+    float viewElevation = max(0.002, elevation + (solar.y - in.uv.y) * 0.70);
+    float3 ray = normalize(float3(sin(azimuth), sin(viewElevation), cos(azimuth) * cos(viewElevation)));
+    ScatteredLight scattered = atmosphere(ray, sunDirection, transmittance);
+    float3 physical = 1 - exp(-(scattered.rayleigh + scattered.mie) * 10 * u.optics.y);
+    float distance = length((pixel - u.viewport.zw) / min(u.viewport.x, u.viewport.y));
+    float warm = exp(-distance * distance / 0.16) * (1 - 0.45 * p);
+    float3 coolPaper = mix(float3(0.29,0.43,0.59), float3(0.16,0.19,0.32), p);
+    float3 radiance = coolPaper * (0.6 + physical * 0.45)
+        + float3(1.0,0.53,0.23) * warm * u.optics.y * 0.55;
+    constexpr sampler grainSampler(coord::normalized, address::repeat, filter::linear);
+    float grain = float(paperGrain.sample(grainSampler, pixel / 420).r) - 0.5;
+    return half4(half3(saturate(radiance + grain * 0.045)), 1);
 }

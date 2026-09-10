@@ -2,25 +2,12 @@ import Foundation
 
 struct AutumnTreeDirector: StoryDirector {
     func makePlan(for session: StorySessionContext) -> StoryPlan {
-        StoryPlan(moments: [
-            authoredMoment(
-                id: .autumnBirdFlock,
-                effect: .autumnBirdFlock,
-                progressWindow: AutumnCastSchedule.birdProgressWindow,
-                duration: AutumnCastSchedule.birdDuration,
-                seedStream: "autumn-tree.bird-flock.v2",
-                session: session,
-                audioCue: StoryAudioCue(assetID: "autumn-bird-flock-intent", bus: .birds, gain: 0.18)
-            ),
-            authoredMoment(
-                id: .autumnRabbitPeek,
-                effect: .autumnRabbitPeek,
-                progressWindow: AutumnCastSchedule.rabbitProgressWindow,
-                duration: AutumnCastSchedule.rabbitDuration,
-                seedStream: "autumn-tree.rabbit-peek.v1",
-                session: session
-            )
-        ].compactMap { $0 })
+        let plan = AutumnBranchPlan(
+            duration: session.duration, seed: session.randomSeed,
+            tuning: .standard, isFullTree: true)
+        return StoryPlan(
+            moments: plan.gusts + plan.encounters.birds.map(\.moment)
+                + [plan.deerEnding.moment])
     }
 
     func performance(at context: StoryContext, plan: StoryPlan) -> StoryPerformance {
@@ -38,7 +25,8 @@ struct AutumnTreeDirector: StoryDirector {
         }
 
         let leafIntensity = context.reduceMotion ? 0 : leafIntensity(for: beat)
-        let showsDeer = beat == .autumnReveal || beat == .autumnResting
+        let ending = plan.moments.first { $0.id.rawValue == "autumn.deer.ending" }
+        let showsDeer = ending.map { context.elapsedTime >= $0.startTime } ?? false
         let visualState = StoryVisualState(
             channels: [.autumnLeafIntensity: leafIntensity],
             flags: showsDeer ? [.autumnDeerVisible] : []
@@ -62,49 +50,6 @@ struct AutumnTreeDirector: StoryDirector {
         }
     }
 
-    /// Required authored moments select a bounded onset, not a probability roll.
-    /// The latest possible onset subtracts the full event duration, so the
-    /// occurrence can never escape its narrative window.
-    private func authoredMoment(
-        id: StoryMomentID,
-        effect: StoryEffectID,
-        progressWindow: ClosedRange<Double>,
-        duration: TimeInterval,
-        seedStream: String,
-        session: StorySessionContext,
-        audioCue: StoryAudioCue? = nil
-    ) -> StoryMoment? {
-        guard session.duration > 0 else { return nil }
-        let windowStart = session.duration * progressWindow.lowerBound
-        let windowEnd = session.duration * progressWindow.upperBound
-        let latestStart = windowEnd - duration
-        guard latestStart >= windowStart else { return nil }
-
-        var random = SeededRandomNumberGenerator(
-            seed: session.randomSeed ^ StableSeed.hash(seedStream)
-        )
-        let onset = latestStart == windowStart
-            ? windowStart
-            : windowStart + (latestStart - windowStart) * random.unitInterval()
-        let eventSeed = random.next()
-        return StoryMoment(
-            id: id,
-            startTime: onset,
-            duration: duration,
-            intensity: 1,
-            randomSeed: eventSeed,
-            quantization: .none,
-            visualCue: StoryVisualCue(effect: effect),
-            audioCue: audioCue
-        )
-    }
-}
-
-enum AutumnCastSchedule {
-    static let birdProgressWindow = 0.35...0.65
-    static let birdDuration: TimeInterval = 18
-    static let rabbitProgressWindow = 0.70...0.84
-    static let rabbitDuration: TimeInterval = 8
 }
 
 extension StoryBeatID {
@@ -125,12 +70,88 @@ extension StoryVisualFlagID {
     static let autumnDeerVisible = StoryVisualFlagID(rawValue: "autumn-tree.deer-visible")
 }
 
-extension StoryEffectID {
-    static let autumnRabbitPeek = StoryEffectID(rawValue: "autumn-tree.rabbit-peek")
-    static let autumnBirdFlock = StoryEffectID(rawValue: "autumn-tree.bird-flock")
-}
+/// Creative policy on top of the shared random scheduler. Decisions are made once
+/// per session, never on render frames. Quiet is a real outcome, not a retry loop.
+struct AutumnEncounterSchedule: Equatable {
+    enum Kind: String { case breeze, bird, quiet }
+    struct Decision: Equatable {
+        let time: Double
+        let kind: Kind
+    }
+    let decisions: [Decision]
+    let breezeTimes: [Double]
+    let birds: [AutumnOrigamiFlight]
 
-extension StoryMomentID {
-    static let autumnRabbitPeek = StoryMomentID(rawValue: "autumn-tree.rabbit-peek")
-    static let autumnBirdFlock = StoryMomentID(rawValue: "autumn-tree.bird-flock")
+    init(duration: Double, seed: UInt64, deer: AutumnDeerEncounter, gustDuration: Double = 8) {
+        // Short development previews compress decision spacing, never animal motion.
+        let previewScale = min(1, max(0.25, duration / 300))
+        let opportunities = RandomMomentScheduler().moments(
+            for: RandomMomentRule(
+                id: "autumn.encounters.v1", progressWindow: 0...1,
+                evaluationInterval: (22 * previewScale)...(44 * previewScale),
+                triggerChance: 1, cooldown: 0...0, duration: 1...1, intensity: 1...1),
+            session: StorySessionContext(duration: duration, randomSeed: seed))
+        var random = SeededRandomNumberGenerator(seed: seed ^ StableSeed.hash("autumn.choices.v1"))
+        var choices: [Decision] = []
+        var breezes: [Double] = []
+        var flights: [AutumnOrigamiFlight] = []
+        var nextBird = 0.0
+        var nextAction = 0.0
+        let breezeClearance = max(18, gustDuration * 1.3 + 6)
+        // No bird can trespass into the closing act, including its departure.
+        let birdDeadline = min(duration * 0.82, deer.startTime - 8)
+        for opportunity in opportunities {
+            let time = opportunity.startTime
+            let roll = random.unitInterval()
+            var kind = Kind.quiet
+            if time >= nextAction && time < deer.startTime - breezeClearance {
+                if roll < 0.50 {
+                    kind = .breeze
+                    breezes.append(time)
+                    // Includes the spatial gust's travel across the tree.
+                    nextAction = time + breezeClearance
+                } else if roll < 0.72 && time >= nextBird {
+                    var tuning = AutumnBirdTuning()
+                    tuning.speed = random.value(in: 0.92...1.08)
+                    tuning.wingbeat = random.value(in: 1.4...1.7)
+                    tuning.depth = random.value(in: 0.9...1.15)
+                    tuning.perchSeconds = random.value(in: 4...9)
+                    let flight = AutumnOrigamiFlight(
+                        startTime: time, seed: random.next(), tuning: tuning)
+                    if time + flight.duration <= birdDeadline {
+                        kind = .bird
+                        flights.append(flight)
+                        nextAction = time + flight.duration + 8
+                        nextBird = time + flight.duration + random.value(in: 90...170)
+                    }
+                }
+            }
+            choices.append(Decision(time: time, kind: kind))
+        }
+        // One quiet closing breeze is authored, like the deer: randomness must not
+        // erase the leaf-bed ending. In short previews it overlaps the final rest;
+        // normal sessions have enough time for its full spatial passage to fade.
+        let closingJitter = random.value(in: 0...min(2, max(0, duration * 0.005)))
+        let latestBreeze =
+            duration >= 300 ? duration - breezeClearance : duration - 10 + closingJitter
+        let lastBreeze = min(latestBreeze, max(duration * 0.88, deer.restingTime) + closingJitter)
+        breezes.append(max(0, lastBreeze))
+        decisions = choices
+        breezeTimes = breezes
+        birds = flights
+    }
+
+    func bird(at time: Double, manual: AutumnOrigamiFlight? = nil) -> AutumnOrigamiFlight? {
+        if let manual, manual.moment.isActive(at: time) { return manual }
+        return birds.first { flight in
+            guard flight.moment.isActive(at: time) else { return false }
+            // A manual study replaces an overlapping visit completely; do not
+            // materialize halfway through that automatic flight afterward.
+            if let manual {
+                return flight.startTime >= manual.startTime + manual.duration + 8
+                    || flight.startTime + flight.duration + 8 <= manual.startTime
+            }
+            return true
+        }
+    }
 }

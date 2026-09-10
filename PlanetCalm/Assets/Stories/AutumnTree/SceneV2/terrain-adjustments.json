@@ -1,9 +1,0 @@
-{
-  "schemaVersion": 1,
-  "parentComposition": "SceneV1/compositions.json",
-  "groundVerticalOverlap": {
-    "iphone": 48,
-    "ipadPortrait": 48,
-    "ipadLandscape": 64
-  }
-}

@@ -53,6 +53,33 @@ it is paper thickness, not a standalone accent color.
 
 ## Typography
 
+### Session controls — September 10 in-app trial
+
+The unobstructed scene shows only the selected duration and “Tap to begin” at the
+top, in warm cream Sue Ellen Francisco (56 and 36 points). This is one large button,
+without a card or button-shaped background. Beginning starts the clock immediately
+and fades this group into a handwritten countdown in the same position, with a
+readable “End session” confirmation trigger. Setup fades out over 0.3 seconds; the
+countdown fades in over 0.45 seconds after a 0.25-second delay. Reduce Motion removes
+these transitions. The tree and other artwork are not resized or repositioned.
+Portrait keeps this group top-center. Landscape places both start and countdown in
+the open sky to the left of the tree, balancing the sun on the right. The group stays
+in the same position when the session begins; neither state has a surrounding card.
+
+“Scene settings” at the upper right opens a dismissible, non-blocking ink panel.
+Use standard San Francisco (not Rounded), semantic Dynamic Type styles, cream text,
+and generous touch targets for these functional controls. Duration is slider-only,
+5–55 whole minutes, with wider landing zones within 0.7 minutes of each five-minute
+mark. It locks after starting. Volume and mute remain adjustable without pausing the
+timer. The panel scrolls in smaller windows and closes with Done or its entry button.
+Development controls are separate at the bottom right and are absent in release
+builds. The rejected bottom setup row and cream Begin rectangle are removed.
+
+The current starting duration remains five minutes until app preferences are built.
+Autumn audio is not connected yet; the panel explicitly says so. Volume/mute values
+are connected to the shared synth output but do not create an Autumn soundtrack.
+Review the real native rendering before treating this trial as the final brand kit.
+
 | Role | Typeface | Status |
 | --- | --- | --- |
 | Stories, Stats, and Settings navigation labels | Sue Ellen Francisco Regular | Approved |

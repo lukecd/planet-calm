@@ -6,9 +6,6 @@ struct StoryPlayer {
     private let director: any StoryDirector
     private let plan: StoryPlan
 
-    /// Immutable schedule for renderer reconciliation, including past/future identities.
-    var scheduledMoments: [StoryMoment] { plan.moments }
-
     init(session: FocusSession, module: (any StoryModule)? = nil) {
         let resolvedModule = module ?? StoryCatalog.module(for: session.story)
         precondition(resolvedModule.story == session.story)
@@ -25,9 +22,13 @@ struct StoryPlayer {
     }
 
     func performance(at date: Date, reduceMotion: Bool) -> StoryPerformance {
-        let elapsedTime = session.elapsedTime(at: date)
+        performance(atElapsedTime: session.elapsedTime(at: date), reduceMotion: reduceMotion)
+    }
+
+    /// Shared-transport entry point; never reconstruct a second date-based clock.
+    func performance(atElapsedTime elapsedTime: Double, reduceMotion: Bool) -> StoryPerformance {
         let context = StoryContext(
-            progress: session.progress(at: date),
+            progress: min(max(elapsedTime / session.duration.timeInterval, 0), 1),
             elapsedTime: elapsedTime,
             duration: session.duration.timeInterval,
             reduceMotion: reduceMotion
@@ -35,13 +36,4 @@ struct StoryPlayer {
         return director.performance(at: context, plan: plan)
     }
 
-    func moments(startingAfter previousDate: Date, through date: Date) -> [StoryMoment] {
-        let lowerBound = session.elapsedTime(at: previousDate)
-        let upperBound = session.elapsedTime(at: date)
-        guard upperBound >= lowerBound else { return [] }
-
-        return plan.moments.filter {
-            $0.startTime > lowerBound && $0.startTime <= upperBound
-        }
-    }
 }
