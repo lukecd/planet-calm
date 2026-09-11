@@ -48,6 +48,8 @@ final class PerformanceSynthesizer {
     private(set) var outputLevel: Float = 0
     private var runToken = UUID()
     private var engine: AVAudioEngine?
+    private var playingSessionID: UUID?
+    private var playingEvents: [SplashWaveNoteEvent] = []
     private var fadeTask: Task<Void, Never>?
     private(set) var volume: Float = 0.65
     private(set) var isMuted = false
@@ -61,8 +63,9 @@ final class PerformanceSynthesizer {
     }
 
     func play(session: PerformanceSession, events: [SplashWaveNoteEvent]) {
-        stop()
         guard !session.isPaused, session.progress(at: .now) < 1 else { return }
+        guard playingSessionID != session.id || playingEvents != events || engine == nil else { return }
+        stop()
         do {
             let audioSession = AVAudioSession.sharedInstance()
             try audioSession.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
@@ -129,6 +132,8 @@ final class PerformanceSynthesizer {
             }
             try engine.start()
             self.engine = engine
+            playingSessionID = session.id
+            playingEvents = events
             status = "Synth audition · drone, pads + melody"
         } catch {
             status = "Audio unavailable: \(error.localizedDescription)"
@@ -139,6 +144,8 @@ final class PerformanceSynthesizer {
         fadeTask?.cancel()
         guard let fadingEngine = engine else { status = "Sound off"; return }
         engine = nil
+        playingSessionID = nil
+        playingEvents = []
         status = "Sound off"
         outputLevel = 0
         fadeTask = Task {
@@ -156,6 +163,8 @@ final class PerformanceSynthesizer {
         fadeTask?.cancel()
         engine?.stop()
         engine = nil
+        playingSessionID = nil
+        playingEvents = []
         outputLevel = 0
         status = "Sound off"
     }

@@ -277,6 +277,905 @@ final class PlanetCalmTests: XCTestCase {
         XCTAssertEqual(session.progress(at: start.addingTimeInterval(1020)), 1)
     }
 
+    func testSessionLedgerCommitsCompletionOnceAndCreditsOnlyCompletion() async throws {
+        let persistence = MemoryLedgerPersistence()
+        let ledger = SessionLedgerStore(persistence: persistence)
+        let start = Date(timeIntervalSince1970: 10_000)
+        let attempt = SessionAttempt(
+            storyID: "retired-story",
+            plannedSeconds: 300,
+            startedAt: start,
+            randomSeed: 42
+        )
+
+        _ = try await ledger.create(attempt)
+        let first = try await ledger.terminalize(id: attempt.id, event: .completed)
+        let second = try await ledger.terminalize(
+            id: attempt.id,
+            event: .cancelled(occurredAt: start.addingTimeInterval(301))
+        )
+
+        XCTAssertEqual(first.outcome, .completed)
+        XCTAssertEqual(first.terminalAt, start.addingTimeInterval(300))
+        XCTAssertEqual(first.creditedSeconds, 300)
+        XCTAssertEqual(second, first)
+        let attempts = try await ledger.attempts()
+        XCTAssertEqual(attempts.count, 1)
+    }
+
+    func testSessionLedgerPreservesTerminalResultAgainstLateDistraction() async throws {
+        let ledger = SessionLedgerStore(persistence: MemoryLedgerPersistence())
+        let start = Date(timeIntervalSince1970: 20_000)
+        let attempt = SessionAttempt(
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: start,
+            randomSeed: 7
+        )
+        _ = try await ledger.create(attempt)
+        let distractedBeforeCompletion = try await ledger.terminalize(
+            id: attempt.id,
+            event: .distracted(
+                occurredAt: start.addingTimeInterval(299),
+                observedAt: start.addingTimeInterval(299)
+            )
+        )
+        XCTAssertEqual(distractedBeforeCompletion.outcome, .distracted)
+        XCTAssertEqual(distractedBeforeCompletion.creditedSeconds, 0)
+
+        let completedAttempt = SessionAttempt(
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: start.addingTimeInterval(1_000),
+            randomSeed: 8
+        )
+        _ = try await ledger.create(completedAttempt)
+        _ = try await ledger.terminalize(id: completedAttempt.id, event: .completed)
+
+        let lateDistraction = try await ledger.terminalize(
+            id: completedAttempt.id,
+            event: .distracted(
+                occurredAt: completedAttempt.startedAt.addingTimeInterval(299),
+                observedAt: completedAttempt.startedAt.addingTimeInterval(305)
+            )
+        )
+
+        XCTAssertEqual(lateDistraction.outcome, .completed)
+        XCTAssertEqual(lateDistraction.terminalAt, completedAttempt.scheduledEndAt)
+        XCTAssertEqual(lateDistraction.creditedSeconds, 300)
+    }
+
+    func testSessionLedgerReconcilesOrphansReloadsAndDoesNotResurrectDeletion() async throws {
+        let persistence = MemoryLedgerPersistence()
+        let firstStore = SessionLedgerStore(persistence: persistence)
+        let attempt = SessionAttempt(
+            storyID: "future-story",
+            plannedSeconds: 600,
+            startedAt: Date(timeIntervalSince1970: 30_000),
+            randomSeed: 99
+        )
+        _ = try await firstStore.create(attempt)
+
+        let reloadedStore = SessionLedgerStore(persistence: persistence)
+        let reconciled = try await reloadedStore.reconcileOrphanedAttempts(
+            observedAt: Date(timeIntervalSince1970: 30_010)
+        )
+        XCTAssertEqual(reconciled.first?.storyID, "future-story")
+        XCTAssertEqual(reconciled.first?.outcome, .interrupted)
+        XCTAssertNil(reconciled.first?.terminalAt)
+        XCTAssertEqual(reconciled.first?.creditedSeconds, 0)
+
+        try await reloadedStore.delete(ids: [attempt.id])
+        do {
+            _ = try await reloadedStore.terminalize(id: attempt.id, event: .completed)
+            XCTFail("A late callback must not recreate a deleted record")
+        } catch let error as SessionLedgerError {
+            XCTAssertEqual(error, .attemptNotFound)
+        }
+    }
+
+    func testTerminalHistoryExportPreservesExistingLedgerAndExcludesRunningAttempts() async throws {
+        let persistence = MemoryLedgerPersistence()
+        let writer = SessionLedgerStore(persistence: persistence)
+        let terminal = SessionAttempt(
+            storyID: "retired-story",
+            plannedSeconds: 300,
+            startedAt: Date(timeIntervalSince1970: 31_000),
+            randomSeed: 1
+        )
+        _ = try await writer.create(terminal)
+        _ = try await writer.terminalize(id: terminal.id, event: .completed)
+
+        let running = SessionAttempt(
+            storyID: "future-story",
+            plannedSeconds: 600,
+            startedAt: Date(timeIntervalSince1970: 32_000),
+            randomSeed: 2
+        )
+        _ = try await writer.create(running)
+
+        // A fresh storage owner reads the existing v1 ledger without migration.
+        let reader = SessionLedgerStore(persistence: persistence)
+        let exported = try await reader.exportTerminalHistory()
+
+        XCTAssertEqual(exported.records.count, 1)
+        XCTAssertEqual(exported.records.first?.id, terminal.id)
+        XCTAssertEqual(exported.records.first?.storyID, "retired-story")
+        XCTAssertEqual(exported.records.first?.startedAt, terminal.startedAt)
+        XCTAssertEqual(exported.records.first?.scheduledEndAt, terminal.scheduledEndAt)
+        XCTAssertEqual(exported.records.first?.outcome, .completed)
+        XCTAssertEqual(exported.records.first?.creditedSeconds, 300)
+        XCTAssertFalse(exported.records.contains(where: { $0.id == running.id }))
+    }
+
+    func testTerminalHistoryMigratesV1LedgerWithoutChangingItsTerminalFacts() async throws {
+        var terminal = SessionAttempt(
+            storyID: "retired-story",
+            plannedSeconds: 300,
+            startedAt: Date(timeIntervalSince1970: 32_500),
+            randomSeed: 12
+        )
+        terminal.outcome = .completed
+        terminal.terminalAt = terminal.scheduledEndAt
+        terminal.creditedSeconds = terminal.plannedSeconds
+        let legacyData = try JSONEncoder().encode(LegacyLedgerEnvelope(
+            schemaVersion: 1,
+            attempts: [terminal],
+            deletedAttemptIDs: []
+        ))
+
+        let ledger = SessionLedgerStore(persistence: MemoryLedgerPersistence(initialData: legacyData))
+        let exported = try await ledger.exportTerminalHistory()
+        let migratedAttempts = try await ledger.attempts()
+
+        XCTAssertEqual(exported.records, [try XCTUnwrap(TerminalSessionHistoryRecord(terminal))])
+        XCTAssertEqual(migratedAttempts, [terminal])
+    }
+
+    func testTerminalHistoryImportIsIdempotentAndDoesNotScheduleHealthWork() async throws {
+        let source = SessionLedgerStore(persistence: MemoryLedgerPersistence())
+        let attempt = SessionAttempt(
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: Date(timeIntervalSince1970: 33_000),
+            randomSeed: 3,
+            healthWriteRequested: true
+        )
+        _ = try await source.create(attempt)
+        _ = try await source.terminalize(id: attempt.id, event: .completed)
+        let exported = try await source.exportTerminalHistory()
+
+        let destination = SessionLedgerStore(persistence: MemoryLedgerPersistence())
+        _ = try await destination.mergeTerminalHistory(exported)
+        _ = try await destination.mergeTerminalHistory(exported)
+
+        let importedAttempts = try await destination.attempts()
+        let imported = try XCTUnwrap(importedAttempts.first)
+        XCTAssertEqual(importedAttempts.count, 1)
+        XCTAssertEqual(imported.id, attempt.id)
+        XCTAssertEqual(imported.outcome, .completed)
+        XCTAssertEqual(imported.creditedSeconds, 300)
+        XCTAssertFalse(imported.healthWriteRequested)
+        XCTAssertEqual(imported.healthSyncState, .notRequested)
+    }
+
+    func testTerminalHistoryImportPreservesLocalActiveAndConflictingTerminalAttempts() async throws {
+        let id = UUID()
+        let startedAt = Date(timeIntervalSince1970: 34_000)
+        let local = SessionLedgerStore(persistence: MemoryLedgerPersistence())
+        let active = SessionAttempt(
+            id: id,
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: startedAt,
+            randomSeed: 4,
+            healthWriteRequested: true
+        )
+        _ = try await local.create(active)
+
+        let conflictingRecord = TerminalSessionHistoryRecord(
+            id: id,
+            storyID: Story.contemporaryLotus.rawValue,
+            plannedSeconds: 600,
+            startedAt: startedAt,
+            scheduledEndAt: startedAt.addingTimeInterval(600),
+            timeZoneIdentifier: TimeZone.current.identifier,
+            calendarIdentifier: String(describing: Calendar.current.identifier),
+            randomSeed: 5,
+            outcome: .cancelled,
+            terminalAt: startedAt.addingTimeInterval(20),
+            observedAt: startedAt.addingTimeInterval(20),
+            creditedSeconds: 0
+        )
+        _ = try await local.mergeTerminalHistory(.init(records: [conflictingRecord], deletedAttemptIDs: []))
+
+        let activeAttempts = try await local.attempts()
+        let preservedActive = try XCTUnwrap(activeAttempts.first)
+        XCTAssertEqual(preservedActive, active)
+        XCTAssertTrue(preservedActive.healthWriteRequested)
+        XCTAssertEqual(preservedActive.healthSyncState, .pending)
+
+        _ = try await local.terminalize(id: id, event: .completed)
+        _ = try await local.mergeTerminalHistory(.init(records: [conflictingRecord], deletedAttemptIDs: []))
+
+        let terminalAttempts = try await local.attempts()
+        let preservedTerminal = try XCTUnwrap(terminalAttempts.first)
+        XCTAssertEqual(preservedTerminal.outcome, .completed)
+        XCTAssertEqual(preservedTerminal.creditedSeconds, 300)
+        XCTAssertTrue(preservedTerminal.healthWriteRequested)
+        XCTAssertEqual(preservedTerminal.healthSyncState, .pending)
+    }
+
+    func testTerminalHistoryDeletionMarkerDefeatsStaleImportedRecord() async throws {
+        let source = SessionLedgerStore(persistence: MemoryLedgerPersistence())
+        let attempt = SessionAttempt(
+            storyID: "future-story",
+            plannedSeconds: 300,
+            startedAt: Date(timeIntervalSince1970: 35_000),
+            randomSeed: 6
+        )
+        _ = try await source.create(attempt)
+        _ = try await source.terminalize(id: attempt.id, event: .cancelled(occurredAt: attempt.startedAt))
+        let staleExport = try await source.exportTerminalHistory()
+
+        let destination = SessionLedgerStore(persistence: MemoryLedgerPersistence())
+        _ = try await destination.mergeTerminalHistory(staleExport)
+        try await destination.delete(ids: [attempt.id])
+        _ = try await destination.mergeTerminalHistory(staleExport)
+
+        let remainingAttempts = try await destination.attempts()
+        XCTAssertTrue(remainingAttempts.isEmpty)
+        let result = try await destination.exportTerminalHistory()
+        XCTAssertTrue(result.deletedAttemptIDs.contains(attempt.id))
+        XCTAssertFalse(result.records.contains(where: { $0.id == attempt.id }))
+    }
+
+    func testTerminalHistoryImportRejectsMalformedAndConflictingTransportRecords() async throws {
+        let startedAt = Date(timeIntervalSince1970: 36_000)
+        let malformedCredit = TerminalSessionHistoryRecord(
+            id: UUID(),
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: startedAt,
+            scheduledEndAt: startedAt.addingTimeInterval(300),
+            timeZoneIdentifier: TimeZone.current.identifier,
+            calendarIdentifier: String(describing: Calendar.current.identifier),
+            randomSeed: 7,
+            outcome: .completed,
+            terminalAt: startedAt.addingTimeInterval(300),
+            observedAt: nil,
+            creditedSeconds: 1
+        )
+        let malformedOutcome = TerminalSessionHistoryRecord(
+            id: UUID(),
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: startedAt,
+            scheduledEndAt: startedAt.addingTimeInterval(300),
+            timeZoneIdentifier: TimeZone.current.identifier,
+            calendarIdentifier: String(describing: Calendar.current.identifier),
+            randomSeed: 8,
+            outcome: .running,
+            terminalAt: nil,
+            observedAt: nil,
+            creditedSeconds: 0
+        )
+        let conflictID = UUID()
+        let validConflict = TerminalSessionHistoryRecord(
+            id: conflictID,
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: startedAt,
+            scheduledEndAt: startedAt.addingTimeInterval(300),
+            timeZoneIdentifier: TimeZone.current.identifier,
+            calendarIdentifier: String(describing: Calendar.current.identifier),
+            randomSeed: 9,
+            outcome: .completed,
+            terminalAt: startedAt.addingTimeInterval(300),
+            observedAt: nil,
+            creditedSeconds: 300
+        )
+        let conflictingCopy = TerminalSessionHistoryRecord(
+            id: conflictID,
+            storyID: Story.contemporaryLotus.rawValue,
+            plannedSeconds: 300,
+            startedAt: startedAt,
+            scheduledEndAt: startedAt.addingTimeInterval(300),
+            timeZoneIdentifier: TimeZone.current.identifier,
+            calendarIdentifier: String(describing: Calendar.current.identifier),
+            randomSeed: 9,
+            outcome: .completed,
+            terminalAt: startedAt.addingTimeInterval(300),
+            observedAt: nil,
+            creditedSeconds: 300
+        )
+
+        let ledger = SessionLedgerStore(persistence: MemoryLedgerPersistence())
+        let result = try await ledger.mergeTerminalHistory(.init(
+            records: [malformedCredit, malformedOutcome, validConflict, conflictingCopy],
+            deletedAttemptIDs: []
+        ))
+
+        XCTAssertEqual(result.ignoredRecordIDs, [malformedCredit.id, malformedOutcome.id, conflictID])
+        let attempts = try await ledger.attempts()
+        XCTAssertTrue(attempts.isEmpty)
+    }
+
+    func testTerminalHistoryDefersActiveDeletionAcrossRestartThenAppliesIt() async throws {
+        let persistence = MemoryLedgerPersistence()
+        let id = UUID()
+        let startedAt = Date(timeIntervalSince1970: 37_000)
+        let active = SessionAttempt(
+            id: id,
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: startedAt,
+            randomSeed: 10
+        )
+        let firstStore = SessionLedgerStore(persistence: persistence)
+        _ = try await firstStore.create(active)
+
+        let deferred = try await firstStore.mergeTerminalHistory(.init(
+            records: [],
+            deletedAttemptIDs: [id]
+        ))
+        XCTAssertEqual(deferred.deferredDeletionIDs, [id])
+        let activeAttempts = try await firstStore.attempts()
+        XCTAssertTrue(activeAttempts.contains(where: { $0.id == id && !$0.isTerminal }))
+
+        let reloadedStore = SessionLedgerStore(persistence: persistence)
+        _ = try await reloadedStore.reconcileOrphanedAttempts(observedAt: startedAt.addingTimeInterval(20))
+
+        let reconciledAttempts = try await reloadedStore.attempts()
+        XCTAssertTrue(reconciledAttempts.isEmpty)
+        let exported = try await reloadedStore.exportTerminalHistory()
+        XCTAssertTrue(exported.deletedAttemptIDs.contains(id))
+
+        let replayResult = try await reloadedStore.mergeTerminalHistory(.init(
+            records: [],
+            deletedAttemptIDs: [id]
+        ))
+        XCTAssertTrue(replayResult.deferredDeletionIDs.isEmpty)
+        let replayedAttempts = try await reloadedStore.attempts()
+        XCTAssertTrue(replayedAttempts.isEmpty)
+    }
+
+    func testTerminalHistoryImportAllowsWallClockAdjustedUnfinishedOutcome() async throws {
+        let startedAt = Date(timeIntervalSince1970: 38_000)
+        let clockAdjustedCancellation = TerminalSessionHistoryRecord(
+            id: UUID(),
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: startedAt,
+            scheduledEndAt: startedAt.addingTimeInterval(300),
+            timeZoneIdentifier: TimeZone.current.identifier,
+            calendarIdentifier: String(describing: Calendar.current.identifier),
+            randomSeed: 11,
+            outcome: .cancelled,
+            terminalAt: startedAt.addingTimeInterval(-60),
+            observedAt: startedAt.addingTimeInterval(-60),
+            creditedSeconds: 0
+        )
+
+        let ledger = SessionLedgerStore(persistence: MemoryLedgerPersistence())
+        let result = try await ledger.mergeTerminalHistory(.init(
+            records: [clockAdjustedCancellation],
+            deletedAttemptIDs: []
+        ))
+        let attempts = try await ledger.attempts()
+
+        XCTAssertTrue(result.ignoredRecordIDs.isEmpty)
+        XCTAssertEqual(attempts.first?.id, clockAdjustedCancellation.id)
+        XCTAssertEqual(attempts.first?.outcome, .cancelled)
+        XCTAssertEqual(attempts.first?.creditedSeconds, 0)
+    }
+
+    func testHistoryOwnershipPreventsAImportAndOfflineASessionFromEnteringB() async throws {
+        let accountA = SessionHistoryAccountKey(userRecordName: "account-A")
+        let accountB = SessionHistoryAccountKey(userRecordName: "account-B")
+        let startedAt = Date(timeIntervalSince1970: 39_000)
+        let importedA = TerminalSessionHistoryRecord(
+            id: UUID(),
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: startedAt,
+            scheduledEndAt: startedAt.addingTimeInterval(300),
+            timeZoneIdentifier: TimeZone.current.identifier,
+            calendarIdentifier: String(describing: Calendar.current.identifier),
+            randomSeed: 12,
+            outcome: .completed,
+            terminalAt: startedAt.addingTimeInterval(300),
+            observedAt: nil,
+            creditedSeconds: 300
+        )
+        let ledger = SessionLedgerStore(persistence: MemoryLedgerPersistence())
+        try await ledger.prepareHistoryAccount(accountA)
+        let importedResult = try await ledger.mergeTerminalHistory(
+            .init(records: [importedA], deletedAttemptIDs: []),
+            for: accountA
+        )
+        XCTAssertTrue(importedResult.rejectedOwnershipIDs.isEmpty)
+
+        // The app records this while A is known but sync is disabled. Creation
+        // assigns A immediately; no later UI callback is required to claim it.
+        let offlineA = SessionAttempt(
+            storyID: Story.contemporaryLotus.rawValue,
+            plannedSeconds: 300,
+            startedAt: startedAt.addingTimeInterval(1_000),
+            randomSeed: 13
+        )
+        _ = try await ledger.create(offlineA)
+        _ = try await ledger.terminalize(id: offlineA.id, event: .completed)
+
+        try await ledger.prepareHistoryAccount(accountB)
+        let bClaim = try await ledger.claimUnownedHistory(for: accountB)
+        let bExport = try await ledger.exportTerminalHistory(for: accountB)
+        let replayToB = try await ledger.mergeTerminalHistory(
+            .init(records: [importedA], deletedAttemptIDs: []),
+            for: accountB
+        )
+
+        XCTAssertTrue(bClaim.acceptedIDs.isEmpty)
+        XCTAssertEqual(bClaim.rejectedIDs, [importedA.id, offlineA.id])
+        XCTAssertTrue(bExport.records.isEmpty)
+        XCTAssertEqual(replayToB.rejectedOwnershipIDs, [importedA.id])
+        let aExport = try await ledger.exportTerminalHistory(for: accountA)
+        XCTAssertEqual(
+            Set(aExport.records.map(\.id)),
+            [importedA.id, offlineA.id]
+        )
+    }
+
+    @MainActor
+    func testSessionRuntimeUsesContinuousElapsedNotWallDate() {
+        let start = Date(timeIntervalSince1970: 40_000)
+        let clock = ContinuousClock()
+        let startedInstant = clock.now
+        let runtime = SessionRuntime(session: PerformanceSession(
+            duration: .fiveMinutes,
+            startedAt: start,
+            randomSeed: 5
+        ), startedInstant: startedInstant)
+
+        let stable = runtime.sample(at: startedInstant.advanced(by: .seconds(120)))
+        XCTAssertEqual(stable.elapsedTime, 120)
+        XCTAssertEqual(stable.progress, 0.4)
+        XCTAssertEqual(stable.remainingTime, 180)
+        XCTAssertFalse(stable.isComplete)
+        XCTAssertEqual(runtime.sample(at: startedInstant.advanced(by: .seconds(301))).elapsedTime, 300)
+    }
+
+    @MainActor
+    func testLifecycleRejectsConcurrentStartAndDoesNotClaimStorageSuccess() async throws {
+        let persistence = MemoryLedgerPersistence()
+        let lifecycle = SessionLifecycle(ledger: SessionLedgerStore(persistence: persistence))
+        await lifecycle.prepareForLaunch(observedAt: Date(timeIntervalSince1970: 50_000))
+        XCTAssertTrue(lifecycle.isReady)
+
+        let first = try await lifecycle.begin(
+            story: .autumnTree,
+            duration: .fiveMinutes,
+            startedAt: Date(timeIntervalSince1970: 50_001)
+        )
+        XCTAssertEqual(first.session.duration, .fiveMinutes)
+        do {
+            _ = try await lifecycle.begin(story: .autumnTree, duration: .fiveMinutes)
+            XCTFail("A second window must not start an overlapping session")
+        } catch let error as SessionLedgerError {
+            XCTAssertEqual(error, .activeSessionExists)
+        }
+
+        let failingPersistence = ToggleFailingLedgerPersistence()
+        let failing = SessionLifecycle(ledger: SessionLedgerStore(persistence: failingPersistence))
+        await failing.prepareForLaunch()
+        XCTAssertTrue(failing.isReady)
+        await failingPersistence.failWrites()
+        do {
+            _ = try await failing.begin(story: .autumnTree, duration: .fiveMinutes)
+            XCTFail("A failed durable write must not start a visible session")
+        } catch {
+            XCTAssertNil(failing.activeRuntime)
+        }
+    }
+
+    @MainActor
+    func testLifecycleRetriesFailedCancellationWithItsOriginalEventTime() async throws {
+        let persistence = ToggleFailingLedgerPersistence()
+        let lifecycle = SessionLifecycle(ledger: SessionLedgerStore(persistence: persistence))
+        let start = Date(timeIntervalSince1970: 60_000)
+        await lifecycle.prepareForLaunch(observedAt: start)
+        let runtime = try await lifecycle.begin(story: .autumnTree, duration: .fiveMinutes, startedAt: start)
+
+        await persistence.failWrites()
+        do {
+            _ = try await lifecycle.cancel(id: runtime.id, at: start.addingTimeInterval(10))
+            XCTFail("The cancelled result must not be shown when its save fails")
+        } catch {
+            XCTAssertNotNil(lifecycle.activeRuntime)
+            XCTAssertTrue(lifecycle.hasPendingTerminalEvent)
+        }
+
+        await persistence.allowWrites()
+        let retried = try await lifecycle.cancel(id: runtime.id, at: start.addingTimeInterval(400))
+        XCTAssertEqual(retried.outcome, .cancelled)
+        XCTAssertEqual(retried.terminalAt, start.addingTimeInterval(10))
+        XCTAssertEqual(retried.creditedSeconds, 0)
+        XCTAssertFalse(lifecycle.hasPendingTerminalEvent)
+    }
+
+    func testRepeatedTerminalReadDoesNotRequireAnotherWrite() async throws {
+        let persistence = ToggleFailingLedgerPersistence()
+        let ledger = SessionLedgerStore(persistence: persistence)
+        let attempt = SessionAttempt(
+            storyID: Story.autumnTree.rawValue,
+            plannedSeconds: 300,
+            startedAt: Date(timeIntervalSince1970: 70_000),
+            randomSeed: 4
+        )
+        _ = try await ledger.create(attempt)
+        let completed = try await ledger.terminalize(id: attempt.id, event: .completed)
+        await persistence.failWrites()
+        let repeated = try await ledger.terminalize(
+            id: attempt.id,
+            event: .cancelled(occurredAt: attempt.scheduledEndAt)
+        )
+        XCTAssertEqual(repeated, completed)
+    }
+
+    @MainActor
+    func testLifecycleSerializesOverlappingTerminalCallsBeforeReturningWaiters() async throws {
+        let persistence = SuspendedLedgerPersistence()
+        let lifecycle = SessionLifecycle(ledger: SessionLedgerStore(persistence: persistence))
+        let start = Date(timeIntervalSince1970: 80_000)
+        await lifecycle.prepareForLaunch(observedAt: start)
+        let runtime = try await lifecycle.begin(story: .autumnTree, duration: .fiveMinutes, startedAt: start)
+        await persistence.suspendNextSave()
+
+        let cancellation = Task { @MainActor in
+            let attempt = try await lifecycle.cancel(id: runtime.id, at: start.addingTimeInterval(10))
+            return (attempt, lifecycle.activeOutcome)
+        }
+        await persistence.waitUntilSaveSuspended()
+        let distraction = Task { @MainActor in
+            let attempt = try await lifecycle.recordDistraction(
+                id: runtime.id,
+                occurredAt: start.addingTimeInterval(9),
+                observedAt: start.addingTimeInterval(11)
+            )
+            return (attempt, lifecycle.activeOutcome)
+        }
+        await persistence.releaseSave()
+
+        let first = try await cancellation.value
+        let second = try await distraction.value
+        XCTAssertEqual(first.0.outcome, .cancelled)
+        XCTAssertEqual(second.0, first.0)
+        XCTAssertEqual(first.1, .cancelled)
+        XCTAssertEqual(second.1, .cancelled)
+        XCTAssertEqual(lifecycle.activeOutcome, .cancelled)
+        XCTAssertEqual(lifecycle.activeRuntime?.id, runtime.id)
+
+        lifecycle.dismissActivePresentation(id: runtime.id)
+        let replacement = try await lifecycle.begin(story: .autumnTree, duration: .fiveMinutes)
+        do {
+            _ = try await lifecycle.cancel(id: runtime.id)
+            XCTFail("A stale scene action must not change the replacement session")
+        } catch let error as SessionLedgerError {
+            XCTAssertEqual(error, .attemptNotFound)
+        }
+        XCTAssertEqual(lifecycle.activeRuntime?.id, replacement.id)
+    }
+
+    @MainActor
+    func testPreferencesFallBackSafelyAndPersistSessionChoices() {
+        let suite = "PlanetCalmTests.preferences.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.set("missing-story", forKey: "preferences.selected-story.v1")
+        defaults.set("missing-appearance", forKey: "preferences.interface-appearance.v1")
+        defaults.set(1, forKey: "preferences.duration-seconds.v1")
+        defaults.set(3.0, forKey: "preferences.volume.v1")
+
+        let preferences = AppPreferences(defaults: defaults)
+        XCTAssertEqual(preferences.selectedStory, .autumnTree)
+        XCTAssertEqual(preferences.lastDuration, .fiveMinutes)
+        XCTAssertEqual(preferences.volume, 1)
+        XCTAssertEqual(preferences.interfaceAppearance, .system)
+
+        preferences.selectedStory = .contemporaryLotus
+        preferences.lastDuration = .twentyFiveMinutes
+        preferences.volume = 0.35
+        preferences.isMuted = true
+        preferences.interfaceAppearance = .dark
+
+        let reloaded = AppPreferences(defaults: defaults)
+        XCTAssertEqual(reloaded.selectedStory, .contemporaryLotus)
+        XCTAssertEqual(reloaded.lastDuration, .twentyFiveMinutes)
+        XCTAssertEqual(reloaded.volume, 0.35)
+        XCTAssertTrue(reloaded.isMuted)
+        XCTAssertEqual(reloaded.interfaceAppearance, .dark)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    @MainActor
+    func testLifecycleRejectsHistoryDeletionDuringActiveSessionAndDeletesTerminalHistory() async throws {
+        let persistence = MemoryLedgerPersistence()
+        let lifecycle = SessionLifecycle(ledger: SessionLedgerStore(persistence: persistence))
+        let start = Date(timeIntervalSince1970: 90_000)
+        await lifecycle.prepareForLaunch(observedAt: start)
+        let runtime = try await lifecycle.begin(story: .autumnTree, duration: .fiveMinutes, startedAt: start)
+
+        do {
+            try await lifecycle.deleteHistory()
+            XCTFail("An active session must prevent history deletion")
+        } catch let error as SessionLedgerError {
+            XCTAssertEqual(error, .activeSessionExists)
+        }
+
+        _ = try await lifecycle.cancel(id: runtime.id, at: start.addingTimeInterval(5))
+        lifecycle.dismissActivePresentation(id: runtime.id)
+        try await lifecycle.deleteHistory()
+
+        let reader = SessionLedgerStore(persistence: persistence)
+        let remaining = try await reader.attempts()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    @MainActor
+    func testIdleTimerCoordinatorKeepsOtherWindowRequestWhenOneWindowLeaves() {
+        let coordinator = FocusIdleTimerCoordinator()
+        let firstWindow = UUID()
+        let secondWindow = UUID()
+
+        coordinator.update(requestID: firstWindow, isEligible: true)
+        coordinator.update(requestID: secondWindow, isEligible: true)
+        coordinator.update(requestID: secondWindow, isEligible: false)
+        XCTAssertTrue(coordinator.keepsScreenAwake)
+
+        coordinator.remove(requestID: firstWindow)
+        XCTAssertFalse(coordinator.keepsScreenAwake)
+    }
+
+    @MainActor
+    func testLiveActivityCoordinatorUpdatesOneSessionAndCleansStaleActivities() async {
+        let driver = LiveActivityDriverSpy(availability: .available)
+        let coordinator = LiveActivitySessionCoordinator(driver: driver)
+        let descriptor = PlanetFocusCountdownDescriptor(
+            sessionID: UUID(),
+            storyTitle: "Autumn Tree",
+            scheduledEndAt: Date(timeIntervalSince1970: 100_300)
+        )
+
+        await coordinator.synchronize(descriptor: descriptor, isEnabled: true)
+        await coordinator.synchronize(descriptor: descriptor, isEnabled: true)
+
+        XCTAssertEqual(driver.endedExcept, [descriptor.sessionID, descriptor.sessionID])
+        XCTAssertEqual(driver.started, [descriptor, descriptor])
+        XCTAssertEqual(coordinator.status, .active(descriptor.sessionID))
+
+        await coordinator.reconcile(activeDescriptor: nil, isEnabled: true)
+        XCTAssertEqual(driver.endAllCount, 1)
+        XCTAssertEqual(coordinator.status, .inactive)
+    }
+
+    @MainActor
+    func testLiveActivityCoordinatorDoesNotTreatUnavailableDisplayAsSessionFailure() async {
+        let descriptor = PlanetFocusCountdownDescriptor(
+            sessionID: UUID(),
+            storyTitle: "Autumn Tree",
+            scheduledEndAt: Date(timeIntervalSince1970: 100_300)
+        )
+        let systemDisabled = LiveActivityDriverSpy(availability: .disabledBySystem)
+        let disabledCoordinator = LiveActivitySessionCoordinator(driver: systemDisabled)
+
+        await disabledCoordinator.synchronize(descriptor: descriptor, isEnabled: true)
+        XCTAssertEqual(disabledCoordinator.status, .disabledBySystem)
+        XCTAssertTrue(systemDisabled.started.isEmpty)
+        XCTAssertEqual(systemDisabled.endAllCount, 0)
+
+        let preferenceDisabled = LiveActivityDriverSpy(availability: .available)
+        let preferenceCoordinator = LiveActivitySessionCoordinator(driver: preferenceDisabled)
+        await preferenceCoordinator.synchronize(descriptor: descriptor, isEnabled: false)
+        XCTAssertEqual(preferenceCoordinator.status, .disabledByPreference)
+        XCTAssertEqual(preferenceDisabled.endAllCount, 1)
+        XCTAssertTrue(preferenceDisabled.started.isEmpty)
+    }
+
+    func testCountdownDisplayRangeRejectsExpiredAndAcceptsFutureEndDates() {
+        let now = Date(timeIntervalSince1970: 100_000)
+
+        XCTAssertNil(
+            PlanetFocusCountdownDisplay.timerInterval(
+                endingAt: now.addingTimeInterval(-1),
+                now: now
+            )
+        )
+        XCTAssertNil(PlanetFocusCountdownDisplay.timerInterval(endingAt: now, now: now))
+        XCTAssertEqual(
+            PlanetFocusCountdownDisplay.timerInterval(
+                endingAt: now.addingTimeInterval(1),
+                now: now
+            ),
+            now...now.addingTimeInterval(1)
+        )
+    }
+
+    @MainActor
+    func testLaterDisabledIntentPreventsDelayedOlderRequest() async {
+        let driver = DelayedEndAllExceptDriver()
+        let coordinator = LiveActivitySessionCoordinator(driver: driver)
+        let descriptor = PlanetFocusCountdownDescriptor(
+            sessionID: UUID(),
+            storyTitle: "Autumn Tree",
+            scheduledEndAt: Date(timeIntervalSince1970: 100_300)
+        )
+
+        let first = Task {
+            await coordinator.synchronize(descriptor: descriptor, isEnabled: true)
+        }
+        await driver.waitUntilEndAllExceptIsSuspended()
+
+        let second = Task {
+            await coordinator.synchronize(descriptor: nil, isEnabled: false)
+        }
+        await Task.yield()
+        await driver.resumeBarrier()
+        await first.value
+        await second.value
+
+        let snapshot = await driver.snapshot()
+        XCTAssertTrue(snapshot.started.isEmpty)
+        XCTAssertEqual(snapshot.endAllCount, 1)
+        XCTAssertEqual(coordinator.status, .disabledByPreference)
+    }
+
+    private struct LegacyLedgerEnvelope: Codable {
+        let schemaVersion: Int
+        let attempts: [SessionAttempt]
+        let deletedAttemptIDs: Set<UUID>
+    }
+
+    private actor MemoryLedgerPersistence: SessionLedgerPersistence {
+        private var data: Data?
+
+        init(initialData: Data? = nil) {
+            self.data = initialData
+        }
+
+        func load() -> Data? { data }
+
+        func save(_ data: Data) {
+            self.data = data
+        }
+    }
+
+    private final class LiveActivityDriverSpy: LiveActivityDriving, @unchecked Sendable {
+        var availability: LiveActivityAvailability
+        private(set) var started: [PlanetFocusCountdownDescriptor] = []
+        private(set) var ended: [UUID] = []
+        private(set) var endedExcept: [UUID] = []
+        private(set) var endAllCount = 0
+
+        init(availability: LiveActivityAvailability) {
+            self.availability = availability
+        }
+
+        func startOrUpdate(_ descriptor: PlanetFocusCountdownDescriptor) async throws {
+            started.append(descriptor)
+        }
+
+        func end(sessionID: UUID) async {
+            ended.append(sessionID)
+        }
+
+        func endAll() async {
+            endAllCount += 1
+        }
+
+        func endAll(except sessionID: UUID) async {
+            endedExcept.append(sessionID)
+        }
+    }
+
+    private actor DelayedEndAllExceptDriver: LiveActivityDriving {
+        nonisolated let availability: LiveActivityAvailability = .available
+        private var started: [PlanetFocusCountdownDescriptor] = []
+        private var endAllCount = 0
+        private var reachedBarrier = false
+        private var barrierWaiter: CheckedContinuation<Void, Never>?
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+        func startOrUpdate(_ descriptor: PlanetFocusCountdownDescriptor) async throws {
+            started.append(descriptor)
+        }
+
+        func end(sessionID: UUID) async {}
+
+        func endAll() async {
+            endAllCount += 1
+        }
+
+        func endAll(except sessionID: UUID) async {
+            reachedBarrier = true
+            barrierWaiter?.resume()
+            barrierWaiter = nil
+            await withCheckedContinuation { continuation in
+                releaseContinuation = continuation
+            }
+        }
+
+        func waitUntilEndAllExceptIsSuspended() async {
+            if reachedBarrier { return }
+            await withCheckedContinuation { continuation in
+                barrierWaiter = continuation
+            }
+        }
+
+        func resumeBarrier() {
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+
+        func snapshot() -> (started: [PlanetFocusCountdownDescriptor], endAllCount: Int) {
+            (started, endAllCount)
+        }
+    }
+
+    private actor ToggleFailingLedgerPersistence: SessionLedgerPersistence {
+        private var shouldFailWrites = false
+
+        func load() -> Data? { nil }
+
+        func save(_ data: Data) throws {
+            guard shouldFailWrites else { return }
+            throw CocoaError(.fileWriteOutOfSpace)
+        }
+
+        func failWrites() {
+            shouldFailWrites = true
+        }
+
+        func allowWrites() {
+            shouldFailWrites = false
+        }
+    }
+
+    private actor SuspendedLedgerPersistence: SessionLedgerPersistence {
+        private var data: Data?
+        private var suspendsNextSave = false
+        private var saveContinuation: CheckedContinuation<Void, Never>?
+        private var enteredContinuation: CheckedContinuation<Void, Never>?
+
+        func load() -> Data? { data }
+
+        func save(_ data: Data) async {
+            if suspendsNextSave {
+                suspendsNextSave = false
+                await withCheckedContinuation { continuation in
+                    saveContinuation = continuation
+                    enteredContinuation?.resume()
+                    enteredContinuation = nil
+                }
+            }
+            self.data = data
+        }
+
+        func suspendNextSave() {
+            suspendsNextSave = true
+        }
+
+        func releaseSave() {
+            saveContinuation?.resume()
+            saveContinuation = nil
+        }
+
+        func waitUntilSaveSuspended() async {
+            guard saveContinuation == nil else { return }
+            await withCheckedContinuation { continuation in
+                enteredContinuation = continuation
+            }
+        }
+    }
+
     private var origamiStage: AutumnBirdStage {
         AutumnBirdStage(camera: AutumnBirdCamera(center: SIMD2(350, 420)),
             left: -120, right: 900, sun: SIMD2(720, 360))
@@ -1109,6 +2008,75 @@ final class PlanetCalmTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testHomeAmbientPlaybackUsesAContinuousFiveMinuteRiseAndSetCycle() {
+        let start = Date(timeIntervalSince1970: 10_000)
+        let ambient = SplashAmbientPlayback(startedAt: start)
+
+        XCTAssertEqual(ambient.progress(at: start), 0, accuracy: 0.000_001)
+        XCTAssertEqual(ambient.progress(at: start.addingTimeInterval(150)), 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(ambient.progress(at: start.addingTimeInterval(300)), 1, accuracy: 0.000_001)
+        XCTAssertEqual(ambient.progress(at: start.addingTimeInterval(450)), 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(ambient.progress(at: start.addingTimeInterval(600)), 0, accuracy: 0.000_001)
+        XCTAssertEqual(ambient.progress(at: start.addingTimeInterval(750)), 0.5, accuracy: 0.000_001)
+
+        let beforeTurn = ambient.progress(at: start.addingTimeInterval(299.9))
+        let afterTurn = ambient.progress(at: start.addingTimeInterval(300.1))
+        XCTAssertEqual(beforeTurn, afterTurn, accuracy: 0.000_001)
+        XCTAssertEqual(ambient.elapsed(at: start.addingTimeInterval(450)), 450)
+    }
+
+    @MainActor
+    func testHomeAmbientPlaybackDoesNotStartForSilentProcessInitialization() {
+        let ambient = SplashAmbientPlayback()
+        let backgroundLaunch = Date(timeIntervalSince1970: 30_000)
+        XCTAssertFalse(ambient.isActive)
+        XCTAssertEqual(ambient.progress(at: backgroundLaunch), 0)
+        ambient.beginIfNeeded(at: backgroundLaunch)
+        XCTAssertEqual(ambient.elapsed(at: backgroundLaunch.addingTimeInterval(12)), 12)
+    }
+
+    @MainActor
+    func testHomeAmbientPlaybackRetainsBrowseTimeAndOnlyResetsAfterMeditationBegins() {
+        let start = Date(timeIntervalSince1970: 20_000)
+        let ambient = SplashAmbientPlayback(startedAt: start)
+        let browsingReturn = start.addingTimeInterval(173)
+
+        // Settings, stats, stories, and setup do not own this process-wide clock.
+        XCTAssertEqual(
+            ambient.progress(at: browsingReturn),
+            0.5 - 0.5 * cos(2 * .pi * 173 / 600),
+            accuracy: 0.000_001
+        )
+        ambient.stop()
+        XCTAssertFalse(ambient.isActive)
+        XCTAssertEqual(ambient.progress(at: browsingReturn), 0, accuracy: 0.000_001)
+
+        let homeAfterMeditation = browsingReturn.addingTimeInterval(20)
+        ambient.restart(at: homeAfterMeditation)
+        XCTAssertTrue(ambient.isActive)
+        XCTAssertEqual(ambient.progress(at: homeAfterMeditation), 0, accuracy: 0.000_001)
+    }
+
+    @MainActor
+    func testHomeAmbientPlaybackOnlyStopsAfterSuccessfulFocusStart() async {
+        enum StartError: Error { case persistenceFailed }
+        let ambient = SplashAmbientPlayback(startedAt: .distantPast)
+
+        do {
+            _ = try await ambient.stopAfterSuccessfulFocusStart { () async throws -> Int in
+                throw StartError.persistenceFailed
+            }
+            XCTFail("A failed persistence start should reach the setup error UI")
+        } catch {
+            XCTAssertTrue(ambient.isActive)
+        }
+
+        let result = try? await ambient.stopAfterSuccessfulFocusStart { 42 }
+        XCTAssertEqual(result, 42)
+        XCTAssertFalse(ambient.isActive)
+    }
+
     func testFutureSoundSelectionIsDeterministicAndKeepsPoolAtEventStart() {
         let daylight = SplashAtmosphereDirector.sample(progress: 1)
         let selection = SplashAtmosphereDirector.soundSource(
@@ -1147,6 +2115,7 @@ final class PlanetCalmTests: XCTestCase {
         XCTAssertFalse(selectedPools.contains(.daylight))
     }
 
+    @MainActor
     func testSunriseGeometryAndTransportAgreement() {
         for size in [CGSize(width: 393, height: 852), CGSize(width: 852, height: 393),
                      CGSize(width: 820, height: 1180), CGSize(width: 1180, height: 820)] {
@@ -1183,6 +2152,18 @@ final class PlanetCalmTests: XCTestCase {
         XCTAssertTrue(zip(samples, samples.dropFirst()).allSatisfy {
             $0.exposure <= $1.exposure && $0.paperSpread <= $1.paperSpread
         })
+        // Ambient cloud drift receives wall-clock elapsed, never the returning
+        // sunrise progress, so a sunset does not run the cloud layer backward.
+        let ambient = SplashAmbientPlayback(startedAt: startedAt)
+        XCTAssertGreaterThan(
+            ambient.elapsed(at: startedAt.addingTimeInterval(450)),
+            ambient.elapsed(at: startedAt.addingTimeInterval(300))
+        )
+        XCTAssertEqual(
+            ambient.progress(at: startedAt.addingTimeInterval(450)),
+            ambient.progress(at: startedAt.addingTimeInterval(150)),
+            accuracy: 0.000_001
+        )
     }
 
     func testWarmPerceptualPaletteRouteAvoidsTheOldOliveMidpoint() {
@@ -1233,6 +2214,8 @@ final class PlanetCalmTests: XCTestCase {
             3.51,
             accuracy: 0.000_001
         )
+        XCTAssertEqual(SplashMotionTiming.cloudEntryDelay, 4.66, accuracy: 0.000_001)
+        XCTAssertEqual(SplashMotionTiming.cloudEntryDuration, 0.60, accuracy: 0.000_001)
         XCTAssertEqual(
             SplashMotionTiming.exitCompleteTime,
             1.50,
@@ -1328,6 +2311,7 @@ final class PlanetCalmTests: XCTestCase {
         )
         XCTAssertFalse(initial.isInteractive)
         XCTAssertEqual(initial.waveMotionAmount, 0)
+        XCTAssertEqual(initial.cloudOpacity, 0)
         XCTAssertEqual(
             initial.horizontalTravelFactor(
                 forWaveAt: 0,
@@ -1365,6 +2349,30 @@ final class PlanetCalmTests: XCTestCase {
         XCTAssertFalse(almostReady.isInteractive)
         XCTAssertTrue(readyDuringFlowers.isInteractive)
         XCTAssertGreaterThan(settled.waveMotionAmount, 0)
+        XCTAssertEqual(settled.cloudOpacity, 0)
+
+        let cloudMidpoint = SplashScenePresentation.sample(
+            performanceElapsed: SplashMotionTiming.cloudEntryDelay
+                + SplashMotionTiming.cloudEntryDuration / 2,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        XCTAssertEqual(cloudMidpoint.cloudOpacity, 0.5, accuracy: 0.000_001)
+
+        let cloudSettled = SplashScenePresentation.sample(
+            performanceElapsed: SplashMotionTiming.cloudEntryDelay
+                + SplashMotionTiming.cloudEntryDuration,
+            exitElapsed: nil,
+            reduceMotion: false
+        )
+        XCTAssertEqual(cloudSettled.cloudOpacity, 1, accuracy: 0.000_001)
+
+        let interruptedBeforeCloud = SplashScenePresentation.sample(
+            performanceElapsed: SplashMotionTiming.cloudEntryDelay - 0.01,
+            exitElapsed: 0,
+            reduceMotion: false
+        )
+        XCTAssertEqual(interruptedBeforeCloud.cloudOpacity, 0)
 
         let activeNoteElapsed = SplashMotionTiming.noteScoreStartTime
             + 3 * SplashPerformanceScore.tempo.secondsPerBeat
@@ -1398,6 +2406,7 @@ final class PlanetCalmTests: XCTestCase {
         )
         XCTAssertEqual(reduced, .presented)
         XCTAssertTrue(reduced.isInteractive)
+        XCTAssertEqual(reduced.cloudOpacity, 1)
     }
 
     func testSplashDroneAndPadsBeginWithIntroWithoutChangingZeroAmountGeometry() {
