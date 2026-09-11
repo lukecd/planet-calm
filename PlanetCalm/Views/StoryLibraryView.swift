@@ -136,10 +136,10 @@ private struct StorySceneThumbnail: View {
 
 struct StorySceneLaunchView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(AppPreferences.self) private var preferences
 
     let story: Story
     let onBack: () -> Void
-    let onStart: (FocusDuration) -> Void
     @State private var duration = FocusDuration.fiveMinutes
     @State private var confirmsExit = false
     @Binding private var volume: Double
@@ -147,39 +147,48 @@ struct StorySceneLaunchView: View {
     @Binding private var showsSettings: Bool
     let audioAvailable: Bool
 
-    private let session: PerformanceSession?
-    private let player: StoryPlayer
+    private let debugSession: PerformanceSession?
+    let runtime: SessionRuntime?
+    let durableOutcome: SessionAttempt.Outcome?
+    let persistenceError: String?
     private let autumnRecord: AutumnBranchRecord
+    let onStart: (FocusDuration) async throws -> Void
+    let onComplete: () async throws -> Void
+    let onCancel: () async throws -> Void
+    @State private var isStarting = false
+    @State private var isFinishing = false
+    @State private var lifecycleError: String?
 
     init(
         story: Story,
         session: PerformanceSession? = nil,
+        runtime: SessionRuntime? = nil,
+        durableOutcome: SessionAttempt.Outcome? = nil,
+        persistenceError: String? = nil,
         autumnRecord: AutumnBranchRecord = .init(),
         volume: Binding<Double>,
         isMuted: Binding<Bool>,
         showsSettings: Binding<Bool>,
         audioAvailable: Bool = false,
-        onStart: @escaping (FocusDuration) -> Void,
+        onStart: @escaping (FocusDuration) async throws -> Void,
+        onComplete: @escaping () async throws -> Void,
+        onCancel: @escaping () async throws -> Void,
         onBack: @escaping () -> Void
     ) {
         self.story = story
         self.onBack = onBack
-        self.onStart = onStart
         _volume = volume
         _isMuted = isMuted
         _showsSettings = showsSettings
         self.audioAvailable = audioAvailable
-
-        let resolvedSession =
-            session?.focusSession(for: story)
-            ?? FocusSession(
-                story: story,
-                duration: .twentyFiveMinutes,
-                startedAt: .now
-            )
-        self.session = session
+        self.debugSession = session
+        self.runtime = runtime
+        self.durableOutcome = durableOutcome
+        self.persistenceError = persistenceError
         self.autumnRecord = autumnRecord
-        self.player = StoryPlayer(session: resolvedSession)
+        self.onStart = onStart
+        self.onComplete = onComplete
+        self.onCancel = onCancel
     }
 
     var body: some View {
@@ -189,19 +198,26 @@ struct StorySceneLaunchView: View {
                 landscape ? -geometry.size.width * SessionPaperStyle.landscapeHeaderShift : 0
             let headerTop = landscape ? max(80, geometry.size.height * 0.2) : 56
             TimelineView(.periodic(from: .now, by: 1)) { context in
+                let session = playbackSession
+                let transport = transportState(for: session, at: context.date)
+                let player = StoryPlayer(session: focusSession(for: session))
                 ZStack(alignment: .top) {
                     Group {
                         if story == .autumnTree {
                             AutumnBranchSceneView(
-                                session: session, record: autumnRecord, reduceMotion: reduceMotion)
+                                session: session,
+                                runtime: runtime,
+                                record: autumnRecord,
+                                reduceMotion: reduceMotion
+                            )
                         } else {
                             StorySceneCatalog.scene(
                                 for: story,
                                 context: StorySceneRenderContext(
-                                    progress: session?.progress(at: context.date) ?? 0,
-                                    elapsedTime: session?.elapsedTime(at: context.date) ?? 0,
+                                    progress: transport?.progress ?? 0,
+                                    elapsedTime: transport?.elapsedTime ?? 0,
                                     performance: player.performance(
-                                        atElapsedTime: session?.elapsedTime(at: context.date) ?? 0,
+                                        atElapsedTime: transport?.elapsedTime ?? 0,
                                         reduceMotion: reduceMotion),
                                     reduceMotion: reduceMotion,
                                     duration: session?.duration.timeInterval
@@ -215,7 +231,9 @@ struct StorySceneLaunchView: View {
 
                     // Animate only the interface, never the scene or its transport.
                     ZStack(alignment: .top) {
-                        let complete = session?.progress(at: context.date) == 1
+                        let reachedEnd = transport?.isComplete == true
+                        let savedTerminal = durableOutcome != nil
+                        let complete = durableOutcome == .completed || (runtime == nil && reachedEnd)
                         if session == nil {
                             let spacious = geometry.size.width >= 600
                             beginButton
@@ -227,19 +245,31 @@ struct StorySceneLaunchView: View {
                                 .foregroundStyle(SessionPaperStyle.ink)
                                 .frame(minWidth: 60, minHeight: 44)
                                 .buttonStyle(.plain)
+                                .disabled(isStarting)
                                 .accessibilityIdentifier("sessionBack")
                                 .padding(.leading, 12).padding(.top, spacious ? 52 : 8)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .transition(.opacity)
                         } else {
                             Button {
-                                if complete { onBack() } else { confirmsExit = true }
+                                if savedTerminal { onBack() }
+                                else if reachedEnd { completeSession() }
+                                else { confirmsExit = true }
                             } label: {
                                 VStack(spacing: -14) {
-                                    Text(complete ? "Complete" : countdown(at: context.date))
+                                    Text(sessionStatusTitle(
+                                        complete: complete,
+                                        durableOutcome: durableOutcome,
+                                        reachedEnd: reachedEnd,
+                                        remaining: transport?.remainingTime
+                                    ))
                                         .font(PlanetFocusTypography.navigation(size: 56))
                                         .tracking(1)
-                                    Text(complete ? "Return to stories" : "End session")
+                                    Text(sessionStatusSubtitle(
+                                        complete: complete,
+                                        durableOutcome: durableOutcome,
+                                        reachedEnd: reachedEnd
+                                    ))
                                         .font(PlanetFocusTypography.interface(.title3))
                                 }
                                 .foregroundStyle(SessionPaperStyle.ink)
@@ -248,11 +278,16 @@ struct StorySceneLaunchView: View {
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel(complete ? "Session complete" : "Time remaining")
-                            .accessibilityValue(complete ? "Complete" : countdown(at: context.date))
+                            .accessibilityLabel(complete ? "Session complete" : savedTerminal ? "Session ended" : reachedEnd ? "Saving session" : "Time remaining")
+                            .accessibilityValue(sessionStatusTitle(
+                                complete: complete,
+                                durableOutcome: durableOutcome,
+                                reachedEnd: reachedEnd,
+                                remaining: transport?.remainingTime
+                            ))
                             .accessibilityHint(
-                                complete
-                                    ? "Return to stories"
+                                savedTerminal ? "Return to stories" : reachedEnd
+                                    ? "Double tap to retry saving this session."
                                     : "Double tap to end the session. You will be asked to confirm."
                             )
                             .accessibilityIdentifier("sessionCountdown")
@@ -295,17 +330,30 @@ struct StorySceneLaunchView: View {
         }
         .alert("End this session?", isPresented: $confirmsExit) {
             Button("Keep focusing", role: .cancel) {}
-            Button("End session", role: .destructive, action: onBack)
+            Button("End session", role: .destructive, action: cancelSession)
         } message: {
-            Text("Your progress won’t be saved.")
+            Text("This attempt will be retained with zero mindful minutes.")
+        }
+        .alert("Couldn’t update this session", isPresented: Binding(
+            get: { lifecycleError != nil },
+            set: { if !$0 { lifecycleError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(lifecycleError ?? "Please try again.")
+        }
+        .onAppear {
+            if playbackSession == nil {
+                duration = preferences.lastDuration
+            }
         }
     }
 
     private var durationLabel: some View {
-        Text("\(session?.duration.minutes ?? duration.minutes) minutes")
+        Text("\(playbackSession?.duration.minutes ?? duration.minutes) minutes")
             .font(PlanetFocusTypography.interface(.title3))
             .monospacedDigit()
-            .accessibilityValue("\(session?.duration.minutes ?? duration.minutes) minutes")
+            .accessibilityValue("\(playbackSession?.duration.minutes ?? duration.minutes) minutes")
             .accessibilityIdentifier("sessionDuration")
     }
 
@@ -314,14 +362,17 @@ struct StorySceneLaunchView: View {
             minutes: Binding(
                 get: { duration.minutes },
                 set: {
-                    if let value = FocusDuration(minutes: $0) { duration = value }
+                    if let value = FocusDuration(minutes: $0) {
+                        duration = value
+                        preferences.lastDuration = value
+                    }
                 }))
     }
 
     private var beginButton: some View {
         Button {
             showsSettings = false
-            onStart(duration)
+            startSession()
         } label: {
             VStack(spacing: -20) {
                 Text("\(duration.minutes) minutes")
@@ -337,6 +388,7 @@ struct StorySceneLaunchView: View {
         .accessibilityLabel("Begin session")
         .accessibilityValue("\(duration.minutes) minutes")
         .accessibilityIdentifier("sessionBegin")
+        .disabled(isStarting)
     }
 
     private var settingsPanel: some View {
@@ -357,9 +409,9 @@ struct StorySceneLaunchView: View {
                         durationLabel
                     }
                     durationSlider
-                        .disabled(session != nil)
-                        .opacity(session == nil ? 1 : 0.45)
-                    if session != nil {
+                        .disabled(playbackSession != nil)
+                        .opacity(playbackSession == nil ? 1 : 0.45)
+                    if playbackSession != nil {
                         Text("Duration is fixed for this session.")
                     }
                     Divider().overlay(SessionPaperStyle.ink.opacity(0.25))
@@ -398,9 +450,88 @@ struct StorySceneLaunchView: View {
         .shadow(color: .black.opacity(0.22), radius: 14, y: 5)
     }
 
-    private func countdown(at date: Date) -> String {
-        let remaining = Int(ceil(session?.remainingTime(at: date) ?? duration.timeInterval))
+    private var playbackSession: PerformanceSession? {
+        runtime?.session ?? debugSession
+    }
+
+    private func focusSession(for session: PerformanceSession?) -> FocusSession {
+        session?.focusSession(for: story)
+            ?? FocusSession(story: story, duration: .twentyFiveMinutes, startedAt: .now)
+    }
+
+    private func transportState(for session: PerformanceSession?, at date: Date) -> PerformanceState? {
+        guard let session else { return nil }
+        return runtime?.sample() ?? PerformanceRunner(session: session).sample(at: date)
+    }
+
+    private func countdown(remaining: TimeInterval?) -> String {
+        let remaining = Int(ceil(remaining ?? duration.timeInterval))
         return String(format: "%d:%02d", remaining / 60, remaining % 60)
+    }
+
+    private func sessionStatusTitle(
+        complete: Bool,
+        durableOutcome: SessionAttempt.Outcome?,
+        reachedEnd: Bool,
+        remaining: TimeInterval?
+    ) -> String {
+        if complete { return "Complete" }
+        if durableOutcome != nil { return "Ended" }
+        if reachedEnd { return persistenceError == nil ? "Saving…" : "Try again" }
+        return countdown(remaining: remaining)
+    }
+
+    private func sessionStatusSubtitle(
+        complete: Bool,
+        durableOutcome: SessionAttempt.Outcome?,
+        reachedEnd: Bool
+    ) -> String {
+        if complete { return "Return to stories" }
+        if durableOutcome != nil { return "No mindful minutes credited" }
+        if reachedEnd { return persistenceError == nil ? "Saving session" : "Couldn’t save session" }
+        return "End session"
+    }
+
+    private func startSession() {
+        guard !isStarting else { return }
+        isStarting = true
+        preferences.lastDuration = duration
+        Task {
+            defer { isStarting = false }
+            do {
+                try await onStart(duration)
+            } catch {
+                lifecycleError = error.localizedDescription
+            }
+        }
+    }
+
+    private func completeSession() {
+        guard !isFinishing else { return }
+        isFinishing = true
+        Task {
+            defer { isFinishing = false }
+            do {
+                try await onComplete()
+                onBack()
+            } catch {
+                lifecycleError = error.localizedDescription
+            }
+        }
+    }
+
+    private func cancelSession() {
+        guard !isFinishing else { return }
+        isFinishing = true
+        Task {
+            defer { isFinishing = false }
+            do {
+                try await onCancel()
+                onBack()
+            } catch {
+                lifecycleError = error.localizedDescription
+            }
+        }
     }
 }
 

@@ -747,23 +747,113 @@ final class PlanetCalmUITests: XCTestCase {
         XCTAssertTrue(waitUntilHittable(stories, timeout: 6))
 
         stats.tap()
+        XCTAssertTrue(app.otherElements["statsScreen"].waitForExistence(timeout: 3))
+        app.buttons["Back"].tap()
+        waitForSplashNavigationReveal(app, navigation: settings)
         settings.tap()
+        XCTAssertTrue(app.otherElements["settingsScreen"].waitForExistence(timeout: 3))
+        let sessionCategory = app.buttons["settings-Session"]
+        XCTAssertTrue(sessionCategory.waitForExistence(timeout: 3))
+        sessionCategory.tap()
+        XCTAssertTrue(app.staticTexts["Not available in this build."].waitForExistence(timeout: 3))
+        app.navigationBars.buttons["Back"].firstMatch.tap()
+        app.buttons["Back"].tap()
+        waitForSplashNavigationReveal(app, navigation: start)
         start.tap()
         XCTAssertTrue(app.buttons["sessionBegin"].waitForExistence(timeout: 5))
         XCTAssertFalse(app.staticTexts["Choose a story"].exists)
         app.buttons["sessionBack"].tap()
         app.buttons["Back"].tap()
-        // Returning restarts the authored 2.0s delay + 1.2s navigation reveal.
-        // XCTest cannot query hittability while its activation point is hidden.
-        let revealedAt = Date().addingTimeInterval(3.3)
-        let reveal = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            Date() >= revealedAt
-        }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [reveal], timeout: 5), .completed)
-        XCTAssertTrue(waitUntilHittable(stories, timeout: 6))
+        // Browsing back retains the settled Home composition and shared ambience.
+        waitForSplashNavigationReveal(app, navigation: stories)
         stories.tap()
         XCTAssertFalse(app.staticTexts["Choose a story"].waitForExistence(timeout: 0.30))
         XCTAssertTrue(app.staticTexts["Choose a story"].waitForExistence(timeout: 3))
+    }
+
+    func testAmbientRouteKeepsBrowseClockAndResetsAfterMeditationStarts() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ambient-route-test"]
+        app.launch()
+        let state = app.staticTexts["ambientRouteState"]
+        XCTAssertTrue(state.waitForExistence(timeout: 5))
+        XCTAssertTrue(waitUntilHittable(app.buttons["Settings"], timeout: 6))
+        let initialStart = ambientStart(state)
+
+        app.buttons["Settings"].tap()
+        XCTAssertTrue(app.otherElements["settingsScreen"].waitForExistence(timeout: 3))
+        app.buttons["Back"].tap()
+        XCTAssertEqual(ambientStart(state), initialStart)
+
+        app.buttons["Stats"].tap()
+        XCTAssertTrue(app.otherElements["statsScreen"].waitForExistence(timeout: 3))
+        app.buttons["Back"].tap()
+        XCTAssertEqual(ambientStart(state), initialStart)
+
+        app.buttons["Stories"].tap()
+        XCTAssertTrue(app.staticTexts["Choose a story"].waitForExistence(timeout: 3))
+        app.buttons["story-choice-autumnTree"].tap()
+        XCTAssertTrue(app.buttons["sessionBegin"].waitForExistence(timeout: 5))
+        app.buttons["sessionBack"].tap()
+        app.buttons["Back"].tap()
+        XCTAssertEqual(ambientStart(state), initialStart)
+
+        app.buttons["Start"].tap()
+        XCTAssertTrue(app.buttons["sessionBegin"].waitForExistence(timeout: 5))
+        app.buttons["sessionBegin"].tap()
+        XCTAssertTrue(app.buttons["sessionCountdown"].waitForExistence(timeout: 5))
+        XCTAssertEqual(ambientStart(state), -1)
+        app.buttons["sessionCountdown"].tap()
+        app.buttons["End session"].tap()
+        XCTAssertTrue(app.staticTexts["Choose a story"].waitForExistence(timeout: 5))
+        app.buttons["Back"].tap()
+        XCTAssertNotEqual(ambientStart(state), initialStart)
+        XCTAssertGreaterThan(ambientStart(state), 0)
+    }
+
+    func testSplashAuditionSessionSurvivesBrowsingRoutes() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ambient-route-test", "--performance-runner-review"]
+        app.launchEnvironment["SPLASH_AUDIO_DISABLED"] = "1"
+        app.launch()
+        let state = app.staticTexts["ambientRouteState"]
+        XCTAssertTrue(state.waitForExistence(timeout: 5))
+        if app.buttons["Hide"].exists { app.buttons["Hide"].tap() }
+        XCTAssertTrue(waitUntilHittable(app.buttons["Settings"], timeout: 6))
+        XCTAssertEqual(ambientPurpose(state), "splash")
+
+        app.buttons["Settings"].tap()
+        XCTAssertTrue(app.otherElements["settingsScreen"].waitForExistence(timeout: 3))
+        app.buttons["Back"].tap()
+        XCTAssertEqual(ambientPurpose(state), "splash")
+
+        app.buttons["Stats"].tap()
+        XCTAssertTrue(app.otherElements["statsScreen"].waitForExistence(timeout: 3))
+        app.buttons["Back"].tap()
+        XCTAssertEqual(ambientPurpose(state), "splash")
+
+        app.buttons["Stories"].tap()
+        XCTAssertTrue(app.staticTexts["Choose a story"].waitForExistence(timeout: 3))
+        app.buttons["story-choice-autumnTree"].tap()
+        XCTAssertTrue(app.buttons["sessionBegin"].waitForExistence(timeout: 5))
+        XCTAssertEqual(ambientPurpose(state), "splash")
+        app.buttons["sessionBack"].tap()
+        app.buttons["Back"].tap()
+        XCTAssertEqual(ambientPurpose(state), "splash")
+    }
+
+    private func ambientStart(_ element: XCUIElement) -> Double {
+        let prefix = "start="
+        let value = element.value as? String ?? ""
+        let field = value.split(separator: ";").first ?? ""
+        XCTAssertTrue(field.hasPrefix(prefix))
+        return Double(field.dropFirst(prefix.count)) ?? -.infinity
+    }
+
+    private func ambientPurpose(_ element: XCUIElement) -> String {
+        let value = element.value as? String ?? ""
+        return value.split(separator: ";").first(where: { $0.hasPrefix("purpose=") })
+            .map { String($0.dropFirst("purpose=".count)) } ?? ""
     }
 
     func testStoryChooserLaunchesBothScenes() throws {
@@ -796,6 +886,154 @@ final class PlanetCalmUITests: XCTestCase {
         )
     }
 
+    func testSettingsPersistAcrossRelaunchAndHistoryDeletionAlertCanBeCancelled() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
+        let settings = app.buttons["Settings"]
+        XCTAssertTrue(waitUntilHittable(settings, timeout: 6))
+        settings.tap()
+        XCTAssertTrue(app.otherElements["settingsScreen"].waitForExistence(timeout: 3))
+
+        app.buttons["settings-Sound & display"].tap()
+        let muteAudio = app.switches["Mute audio"]
+        XCTAssertTrue(muteAudio.waitForExistence(timeout: 3))
+        let originalMuteValue = muteAudio.value as? String
+        muteAudio.tap()
+        let changedMuteValue = muteAudio.value as? String
+        XCTAssertNotEqual(changedMuteValue, originalMuteValue)
+
+        app.navigationBars.buttons["Back"].firstMatch.tap()
+        app.buttons["settings-Data & help"].tap()
+        let deleteHistory = app.buttons["Delete session history"]
+        scrollToHittable(deleteHistory, in: app)
+        deleteHistory.tap()
+        let deleteAlert = app.alerts["Delete session history?"]
+        XCTAssertTrue(deleteAlert.waitForExistence(timeout: 3))
+        deleteAlert.buttons["Cancel"].tap()
+        XCTAssertFalse(deleteAlert.waitForExistence(timeout: 0.5))
+
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
+        let relaunchedSettings = app.buttons["Settings"]
+        XCTAssertTrue(waitUntilHittable(relaunchedSettings, timeout: 6))
+        relaunchedSettings.tap()
+        app.buttons["settings-Sound & display"].tap()
+        let reloadedMute = app.switches["Mute audio"]
+        XCTAssertTrue(reloadedMute.waitForExistence(timeout: 3))
+        XCTAssertEqual(reloadedMute.value as? String, changedMuteValue)
+
+        reloadedMute.tap()
+        XCTAssertEqual(reloadedMute.value as? String, originalMuteValue)
+    }
+
+    func testICloudEnableExplainsHistoryMergeAndCanBeCancelled() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let settings = app.buttons["Settings"]
+        XCTAssertTrue(waitUntilHittable(settings, timeout: 8))
+        settings.tap()
+        let data = app.buttons["settings-Data & help"]
+        scrollToHittable(data, in: app)
+        data.tap()
+
+        let syncToggle = app.switches["iCloudSyncToggle"]
+        XCTAssertTrue(syncToggle.waitForExistence(timeout: 5))
+        // This flow never changes an existing opt-in or sends real history.
+        guard syncToggle.value as? String == "0" else {
+            throw XCTSkip("Keep the device's existing iCloud opt-in unchanged.")
+        }
+        let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screen.name = "settings-icloud"
+        screen.lifetime = .keepAlways
+        add(screen)
+        syncToggle.tap()
+        let confirmation = app.alerts["Sync sessions with iCloud?"]
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 3))
+        XCTAssertTrue(confirmation.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "private iCloud history")).firstMatch.exists)
+        confirmation.buttons["Cancel"].tap()
+        XCTAssertEqual(syncToggle.value as? String, "0")
+        XCTAssertFalse(app.buttons["Sync now"].exists)
+    }
+
+    func testAppleHealthWritePermissionAndSetting() throws {
+        #if targetEnvironment(simulator)
+        let app = XCUIApplication()
+        app.launch()
+        let settings = app.buttons["Settings"]
+        XCTAssertTrue(waitUntilHittable(settings, timeout: 8))
+        settings.tap()
+        app.buttons["settings-Apple Health"].tap()
+        let toggle = app.switches["appleHealthToggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+        let initiallyEnabled = toggle.value as? String == "1"
+        if !initiallyEnabled {
+            toggle.tap()
+            let mindfulPermission = app.switches["UIA.Health.MindfulMinutes.SwitchCell.Switch"]
+            if mindfulPermission.waitForExistence(timeout: 5) {
+                let permission = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+                permission.name = "health-write-only-permission"
+                permission.lifetime = .keepAlways
+                add(permission)
+                XCTAssertTrue(app.staticTexts["Mindful Minutes"].exists)
+                mindfulPermission.tap()
+                app.buttons["Allow"].tap()
+            }
+        }
+        let enabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '1'"), object: toggle)
+        XCTAssertEqual(XCTWaiter.wait(for: [enabled], timeout: 10), .completed, app.debugDescription)
+        let detail = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        detail.name = "settings-apple-health"
+        detail.lifetime = .keepAlways
+        add(detail)
+        if !initiallyEnabled { toggle.tap() }
+        #else
+        throw XCTSkip("Permission automation is limited to the simulator.")
+        #endif
+    }
+
+    func testSettingsLargeTextKeepsCloseVisibleWhileScrolling() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        app.launch()
+        let settings = app.buttons["Settings"]
+        XCTAssertTrue(waitUntilHittable(settings, timeout: 8))
+        settings.tap()
+
+        let close = app.buttons["xmark"]
+        XCTAssertTrue(close.waitForExistence(timeout: 3))
+        let originalCloseFrame = close.frame
+        let top = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        top.name = "settings-large-text-top"
+        top.lifetime = .keepAlways
+        add(top)
+
+        let lastCategory = app.buttons["settings-Data & help"]
+        let scrollView = app.scrollViews.firstMatch
+        XCTAssertTrue(scrollView.exists)
+        for _ in 0..<5 {
+            if lastCategory.isHittable && lastCategory.frame.maxY <= scrollView.frame.maxY { break }
+            scrollView.swipeUp()
+        }
+        XCTAssertTrue(lastCategory.isHittable)
+        XCTAssertLessThanOrEqual(lastCategory.frame.maxY, scrollView.frame.maxY + 1)
+        XCTAssertTrue(close.isHittable)
+        XCTAssertEqual(close.frame.minY, originalCloseFrame.minY, accuracy: 1)
+        let bottom = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        bottom.name = "settings-large-text-scrolled"
+        bottom.lifetime = .keepAlways
+        add(bottom)
+
+        lastCategory.tap()
+        XCTAssertTrue(app.buttons["Delete session history"].waitForExistence(timeout: 3))
+        app.navigationBars.buttons["Back"].firstMatch.tap()
+        XCTAssertTrue(close.isHittable)
+        close.tap()
+        XCTAssertTrue(waitUntilHittable(settings, timeout: 8))
+    }
+
     private func waitUntilHittable(
         _ element: XCUIElement,
         timeout: TimeInterval = 5
@@ -808,6 +1046,25 @@ final class PlanetCalmUITests: XCTestCase {
             object: element
         )
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func scrollToHittable(_ element: XCUIElement, in app: XCUIApplication) {
+        for _ in 0..<8 where !element.isHittable {
+            app.scrollViews.firstMatch.swipeUp()
+        }
+        XCTAssertTrue(element.isHittable)
+    }
+
+    private func waitForSplashNavigationReveal(
+        _ app: XCUIApplication,
+        navigation: XCUIElement
+    ) {
+        let revealedAt = Date().addingTimeInterval(3.3)
+        let reveal = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            Date() >= revealedAt
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [reveal], timeout: 5), .completed)
+        XCTAssertTrue(waitUntilHittable(navigation, timeout: 6))
     }
 
     private func captureSplash(orientation: UIDeviceOrientation, name: String) {
@@ -826,7 +1083,8 @@ final class PlanetCalmUITests: XCTestCase {
             object: app
         )
         XCTAssertEqual(XCTWaiter.wait(for: [geometryExpectation], timeout: 5), .completed)
-        Thread.sleep(forTimeInterval: 4.7)
+        // Include the cloud fade that follows the main scene entrance.
+        Thread.sleep(forTimeInterval: 6)
 
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = name

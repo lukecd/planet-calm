@@ -1,6 +1,6 @@
 # Planet Focus — Visual Design Foundation
 
-**Version:** 13 · **Updated:** 2026-09-07 · **Status:** Approved palette and current native splash
+**Version:** 13 · **Updated:** 2026-09-11 · **Status:** Approved palette and current native splash
 
 This is the current design source of truth for Planet Focus outer UI. Story artwork may
 use story-specific colors, but navigation, typography, and shared surfaces should use
@@ -146,6 +146,8 @@ paper world rather than uniformly squeezing the landscape composition.
   sun placement.
 - iPhone landscape uses a compact wide composition with reduced type and navigation
   spacing while retaining the full interaction row.
+- Phone portrait uses equal-width menu items so all four labels fit. Accessibility
+  text sizes use two rows with an opaque ink backing to protect text contrast.
 - Geometry is driven by the current container and safe-area insets, never by
   `UIScreen.main.bounds` or device-name checks.
 
@@ -197,6 +199,10 @@ calibration fixture; see [Generative Performance System](../architecture/generat
   sequence begins at 3.56 seconds and finishes at 4.46 seconds, but it never blocks a
   returning user from navigating. An interrupted flower sequence reverses from its
   exact current petal state.
+- The cloud assembly fades in last, from 4.66 to 5.26 seconds. Phone portrait lowers
+  it by 16% of the viewport's short side; tablet and landscape retain their placement.
+  The opening sky is clean ink navy, with sunrise color and grain introduced gradually
+  only as the atmosphere progresses.
 - The calibration score is a 32-beat cycle. A new pad voice begins every four beats and
   remains active for sixteen beats: three-beat attack, two-beat decay, 0.72 sustain,
   ten-beat gate, and six-beat release. Four pad envelopes therefore overlap once the
@@ -214,8 +220,18 @@ calibration fixture; see [Generative Performance System](../architecture/generat
 
 ## Generative atmosphere direction
 
-The splash is a story driven by the shared performance transport. Its current sunrise
-implementation is specified in [Splash sunrise renderer](splash-sunrise-model.md).
+Home owns a process-scoped ambient light clock, independent of meditation playback.
+It follows a smooth ten-minute cosine loop: five minutes from navy night to yellow day,
+then five minutes back to night. It continues while browsing Stories, setup, Stats, and
+Settings, including while the app is backgrounded; returning before a meditation keeps
+the current light without replaying the entrance. A successful persisted meditation
+start stops the ambient clock, and returning Home afterward begins a fresh night cycle
+and entrance. Reduce Motion renders static night while the logical clock continues.
+Automatic ambient music remains deferred. The existing development Controls audition can
+continue across foreground browsing, but it is not enabled automatically. Cloud drift
+uses forward elapsed time, while only the light and sun height return during sunset.
+
+The current sunrise implementation is specified in [Splash sunrise renderer](splash-sunrise-model.md).
 That document supersedes the earlier full-canvas palette fades and expanding opaque masks.
 
 The sun begins approximately 10% exposed above the rear wave, rises, and carries a

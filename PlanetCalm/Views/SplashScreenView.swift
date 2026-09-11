@@ -65,6 +65,11 @@ struct PerformanceTempo: Equatable, Sendable {
     }
 }
 
+private enum SplashPerformancePurpose {
+    case splashAudition
+    case storyPreview
+}
+
 struct SplashWaveMotionSample: Equatable {
     let phase: CGFloat
     let amplitude: CGFloat
@@ -584,10 +589,15 @@ enum SplashMotionTiming {
     static let wordmarkEntryDuration: TimeInterval = 1.20
     static let navigationEntryDelay: TimeInterval = 2.00
     static let navigationEntryDuration: TimeInterval = 1.20
+    /// The cloud assembly arrives only after the paper field and its lotuses have
+    /// reached their rest pose. It deliberately does not extend scene settlement.
+    static let cloudEntryDelay: TimeInterval = SplashLotusChoreography.entryEnd + 0.20
+    static let cloudEntryDuration: TimeInterval = 0.60
 
     static let sunExitDuration: TimeInterval = 1.00
     static let wordmarkExitDuration: TimeInterval = 0.85
     static let navigationExitDuration: TimeInterval = 0.65
+    static let cloudExitDuration: TimeInterval = 0.50
 
     static let motionPhaseUnitsPerSecond: Double = 0.320
     static let maximumMotionAmount: CGFloat = 0.188
@@ -823,6 +833,29 @@ struct SplashScenePresentation: Equatable {
             entryDuration: SplashMotionTiming.navigationEntryDuration,
             exitDuration: SplashMotionTiming.navigationExitDuration
         ))
+    }
+
+    var cloudOpacity: Double {
+        switch state {
+        case .presented:
+            return 1
+        case .entering(let elapsed), .living(let elapsed):
+            return Double(SplashMotionTiming.revealProgress(
+                elapsed: elapsed,
+                delay: SplashMotionTiming.cloudEntryDelay,
+                duration: SplashMotionTiming.cloudEntryDuration
+            ))
+        case .exiting(let elapsed):
+            let exitStart = max(performanceElapsed - elapsed, 0)
+            let entryOpacity = SplashMotionTiming.revealProgress(
+                elapsed: exitStart,
+                delay: SplashMotionTiming.cloudEntryDelay,
+                duration: SplashMotionTiming.cloudEntryDuration
+            )
+            return Double(entryOpacity * (1 - CGFloat(SplashMotionTiming.smootherStep(
+                elapsed / SplashMotionTiming.cloudExitDuration
+            ))))
+        }
     }
 
     var waveMotionPhase: CGFloat {
@@ -1062,11 +1095,11 @@ struct SplashLayout {
     }
 
     var navigationFontSize: CGFloat {
-        shortSide * (shortSide < 600 ? 0.072 : 0.052)
+        shortSide * (shortSide < 600 ? 0.064 : 0.052)
     }
 
     var navigationSpacing: CGFloat {
-        shortSide * (shortSide < 600 ? 0.065 : 0.075)
+        shortSide * (shortSide < 600 ? 0.006 : 0.075)
     }
 
     var navigationBottom: CGFloat {
@@ -1075,6 +1108,11 @@ struct SplashLayout {
 
     var navigationLeading: CGFloat {
         max(safeAreaInsets.leading + 24, size.width * (isPortrait ? 0.055 : 0.055))
+    }
+
+    var navigationPhonePortraitInset: CGFloat {
+        guard mode == .phonePortrait else { return 0 }
+        return max(12, max(safeAreaInsets.leading, safeAreaInsets.trailing) + 8)
     }
 
     var alignsNavigationToLeading: Bool {
@@ -1089,6 +1127,7 @@ struct SplashLayout {
 struct SplashSceneView: View {
     var presentation: SplashScenePresentation = .presented
     var atmosphere: SplashAtmosphereSample = .night
+    var cloudTime: Double?
     var resonance: SplashWaveResonanceSample?
     var selectedMenu: SplashMenuItem = .start
     var onSelectMenu: (SplashMenuItem) -> Void = { _ in }
@@ -1105,7 +1144,8 @@ struct SplashSceneView: View {
                     atmosphere: atmosphere,
                     lightCenter: sunCenter,
                     horizon: layout.sunriseHorizon,
-                    sunRadius: layout.sunDiameter / 2
+                    sunRadius: layout.sunDiameter / 2,
+                    cloudTime: cloudTime
                 )
                     .accessibilityIdentifier(SplashSceneActorID.background.rawValue)
 
@@ -1123,8 +1163,10 @@ struct SplashSceneView: View {
                     lightCenter: sunCenter,
                     horizon: layout.sunriseHorizon,
                     sunRadius: layout.sunDiameter / 2,
-                    drawsClouds: true
+                    drawsClouds: true,
+                    cloudTime: cloudTime
                 )
+                .opacity(presentation.cloudOpacity)
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
 
@@ -1172,6 +1214,7 @@ struct SplashSceneView: View {
                         selectedItem: selectedMenu,
                         fontSize: layout.navigationFontSize,
                         spacing: layout.navigationSpacing,
+                        usesEqualWidthItems: layout.mode == .phonePortrait,
                         ink: atmosphere.sunrise.navigationInk,
                         selectedInk: atmosphere.sunrise.selectedInk,
                         action: onSelectMenu
@@ -1179,6 +1222,7 @@ struct SplashSceneView: View {
                     .frame(maxWidth: .infinity, alignment: layout.alignsNavigationToLeading ? .leading : .center)
                     .padding(.leading, layout.alignsNavigationToLeading ? layout.navigationLeading : 0)
                     .padding(.trailing, layout.alignsNavigationToLeading ? 0 : layout.navigationLeading)
+                    .padding(.horizontal, layout.navigationPhonePortraitInset)
                     .padding(.bottom, layout.navigationBottom)
                     .opacity(presentation.navigationOpacity)
                     .accessibilityIdentifier(SplashSceneActorID.navigation.rawValue)
@@ -1199,6 +1243,7 @@ private struct SplashAtmosphereLayer: View {
     var horizon: CGFloat
     var sunRadius: CGFloat
     var drawsClouds = false
+    var cloudTime: Double?
 
     var body: some View {
         GeometryReader { proxy in
@@ -1207,7 +1252,7 @@ private struct SplashAtmosphereLayer: View {
                 viewport: SIMD4(Float(proxy.size.width), Float(proxy.size.height),
                                 Float(lightCenter.x), Float(lightCenter.y)),
                 story: SIMD4(Float(atmosphere.progress), Float(horizon),
-                             Float(sunRadius), Float(reduceMotion ? 0 : atmosphere.sunrise.cloudTime)),
+                             Float(sunRadius), Float(reduceMotion ? 0 : cloudTime ?? atmosphere.sunrise.cloudTime)),
                 optics: SIMD4(Float(atmosphere.sunrise.solarElevationRadians),
                               Float(atmosphere.sunrise.exposure),
                               Float(atmosphere.sunrise.paperSpread),
@@ -1219,7 +1264,9 @@ private struct SplashAtmosphereLayer: View {
                     Image("NeutralPaperGrainV1")
                         .resizable(resizingMode: .tile)
                         .blendMode(.softLight)
-                        .opacity(0.30)
+                        // Keep the opening canvas as the approved uninterrupted
+                        // ink field. Grain returns with the authored sunrise.
+                        .opacity(0.30 * min(max(atmosphere.progress / 0.10, 0), 1))
                         .allowsHitTesting(false)
                 }
             }
@@ -1236,6 +1283,8 @@ private enum SplashScreenStage: Equatable {
     case opening
     case chooser
     case story(Story)
+    case settings
+    case stats
 }
 
 #if DEBUG
@@ -1266,12 +1315,20 @@ private enum PerformanceDeskContext {
 struct SplashScreenView: View {
     @Binding var selectedStory: Story
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(SessionLifecycle.self) private var sessionLifecycle
+    @Environment(AppPreferences.self) private var preferences
+    @Environment(HealthSessionCoordinator.self) private var healthSync
+    @Environment(FocusIdleTimerCoordinator.self) private var idleTimer
+    @Environment(LiveActivitySessionCoordinator.self) private var liveActivity
+    @Environment(SplashAmbientPlayback.self) private var splashAmbient
     @AppStorage("autumn.branch.record.v1") private var persistedAutumn = Data()
     @State private var autumnRecord = AutumnBranchRecord()
     @State private var synthesizer = PerformanceSynthesizer()
     @State private var auditionEnabled = true
     @State private var sceneVolume = 0.65
     @State private var sceneMuted = false
+    @State private var idleTimerRequestID = UUID()
+    @State private var liveActivitySceneID = UUID()
     @State private var showsSceneSettings = false
     @State private var runnerDuration: FocusDuration = .fiveMinutes
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1288,6 +1345,7 @@ struct SplashScreenView: View {
     @State private var scoreSeed = Int(SplashPerformanceScore.defaultSeed)
     @State private var atmosphereProgress = 0.0
     @State private var activePerformanceSession: PerformanceSession?
+    @State private var performancePurpose: SplashPerformancePurpose?
     @State private var activeSplashScoreEvents: [SplashWaveNoteEvent]?
 #if DEBUG
     @State private var isPerformanceDeskVisible: Bool
@@ -1330,6 +1388,9 @@ struct SplashScreenView: View {
                 )
                 : nil
         )
+        _performancePurpose = State(initialValue: Self.isRunnerReview
+            || ProcessInfo.processInfo.arguments.contains("--session-ending-review")
+            ? .splashAudition : nil)
 #endif
     }
 
@@ -1348,6 +1409,15 @@ struct SplashScreenView: View {
         return min(max(value, 0), 1)
 #else
         return 0
+#endif
+    }
+
+    private static var hasDebugAtmosphereOverride: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--atmosphere-progress=") }
+            || ProcessInfo.processInfo.environment["SPLASH_ATMOSPHERE_PROGRESS"] != nil
+#else
+        false
 #endif
     }
 
@@ -1378,6 +1448,24 @@ struct SplashScreenView: View {
 #endif
     }
 
+    private static var isDevelopmentSession: Bool {
+#if DEBUG
+        isRunnerReview
+            || ProcessInfo.processInfo.arguments.contains("--session-ui-review")
+            || ProcessInfo.processInfo.arguments.contains("--session-ending-review")
+            || ProcessInfo.processInfo.arguments.contains("--autumn-checkpoint")
+            || ProcessInfo.processInfo.arguments.contains("--autumn-light-audit")
+            || ProcessInfo.processInfo.arguments.contains("--autumn-encounter-review")
+#else
+        false
+#endif
+    }
+
+    private func activeRuntime(for story: Story) -> SessionRuntime? {
+        guard sessionLifecycle.activeStoryID == story.rawValue else { return nil }
+        return sessionLifecycle.activeRuntime
+    }
+
     /// Static, clean-canvas review mode for the 5% visual audit.  It deliberately
     /// avoids the running transport and the debug desk so each screenshot represents
     /// one exact, reproducible atmosphere sample.
@@ -1397,6 +1485,16 @@ struct SplashScreenView: View {
         }
 #endif
         return nil
+    }
+
+    private var manualAtmosphereProgress: Double? {
+#if DEBUG
+        guard (isPerformanceDeskVisible || Self.isAtmosphereReview || Self.hasDebugAtmosphereOverride),
+              activePerformanceSession == nil else { return nil }
+        return atmosphereProgress
+#else
+        nil
+#endif
     }
 
     private static var isResonancePeakReview: Bool {
@@ -1459,256 +1557,62 @@ struct SplashScreenView: View {
     }
 
     var body: some View {
-        ZStack {
+        finalContent
+    }
+
+    private var baseContent: AnyView {
+        AnyView(ZStack {
             // A neutral fallback remains continuous while splash actors enter and leave.
             // The scene owns the full, measured atmospheric canvas below.
-            PlanetFocusPalette.canvasInk
-                .ignoresSafeArea()
+            PlanetFocusPalette.canvasInk.ignoresSafeArea()
+            AnyView(stageContent)
+            AnyView(debugOverlay)
+        })
+    }
 
-            switch stage {
-            case .opening:
-                TimelineView(
-                    .animation(
-                        minimumInterval: reduceMotion ? 1 : 1.0 / 60.0,
-                        paused: Self.isAtmosphereReview
-                    )
-                ) { context in
-                    let transportState = activePerformanceSession.map {
-                        PerformanceRunner(session: $0).sample(at: context.date)
-                    }
-                    let performanceElapsed = transportState?.elapsedTime
-                        ?? performanceClock.elapsed(at: context.date)
-                    let scoreEvents = splashScoreEvents
-                    let exitElapsed = exitStartedAt.map {
-                        context.date.timeIntervalSince($0)
-                    }
-                    let presentation = SplashScenePresentation.sample(
-                        performanceElapsed: Self.isAtmosphereReview ? 20 : performanceElapsed,
-                        exitElapsed: exitElapsed,
-                        reduceMotion: reduceMotion,
-                        motionTuning: motionTuning,
-                        scoreEvents: scoreEvents
-                    )
-                    let atmosphere = SplashAtmosphereDirector.sample(
-                        progress: reviewProgress ?? transportState?.progress ?? atmosphereProgress
-                    )
-                    let scoreBeat = SplashPerformanceScore.scoreBeat(
-                        for: performanceElapsed,
-                        tuning: motionTuning
-                    )
-                    let resonance = Self.resonance(
-                        manualEvent: manualEvent,
-                        scoreBeat: scoreBeat,
-                        tuning: resonanceTuning
-                    )
-
-                    SplashSceneView(
-                        presentation: presentation,
-                        atmosphere: atmosphere,
-                        resonance: resonance,
-                        selectedMenu: selectedMenu,
-                        onSelectMenu: selectMenu
-                    )
-                    .ignoresSafeArea()
-                }
-                .task(id: exitStartedAt) {
-                    await finishExitIfNeeded()
-                }
-
-            case .chooser:
-                StoryChooserView(
-                    onChoose: { story in
-                        selectedStory = story
-                        activePerformanceSession = nil
-                        stage = .story(story)
-                    },
-                    onBack: resetSplash
-                )
-
-            case .story(let story):
-                StorySceneLaunchView(
-                    story: story,
-                    session: activePerformanceSession,
-                    autumnRecord: autumnRecord,
-                    volume: $sceneVolume,
-                    isMuted: $sceneMuted,
-                    showsSettings: $showsSceneSettings,
-                    onStart: { duration in
-                        autumnRecord.manualGusts = []
-                        autumnRecord.bird?.flight = nil
-                        autumnRecord.deer?.encounter = nil
-                        activeSplashScoreEvents = nil
-                        activePerformanceSession = PerformanceSession(duration: duration)
-                    }
-                ) {
-                    showsSceneSettings = false
-                    activePerformanceSession = nil
-                    activeSplashScoreEvents = nil
-                    autumnRecord = autumnRecord.settingsOnly
-                    stage = .chooser
-                }
-            }
-
-#if DEBUG
-            if ProcessInfo.processInfo.arguments.contains("--sunrise-audit") {
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        Button {
-                            sunriseAuditIndex = min(20, sunriseAuditIndex + 1)
-                        } label: {
-                            Color.clear.frame(width: 44, height: 44).contentShape(Rectangle())
-                        }
-                        .accessibilityLabel("Advance sunrise audit")
-                        .accessibilityIdentifier("sunriseAuditNext")
-                        .accessibilityValue(String(sunriseAuditIndex))
-                    }
-                }
-            }
-            if let context = performanceDeskContext, isPerformanceDeskVisible {
-                PerformanceDesk(
-                    expandedSections: $expandedPerformanceDeskSections,
-                    context: context,
-                    autumnRecord: $autumnRecord,
-                    onAutumnGust: {
-                        guard let session = activePerformanceSession, !session.isPaused else { return }
-                        autumnRecord.manualGusts.append(session.elapsedTime(at: .now))
-                    },
-                    onAutumnBird: triggerAutumnBird,
-                    onAutumnDeer: triggerAutumnDeer,
-                    speedMultiplier: motionSpeedBinding,
-                    amountMultiplier: motionAmountBinding,
-                    atmosphereProgress: $atmosphereProgress,
-                    resonanceStrength: resonanceStrengthBinding,
-                    resonanceWidth: resonanceWidthBinding,
-                    tonalSlot: $manualTonalSlot,
-                    gateBeats: $manualGateBeats,
-                    scoreSeed: $scoreSeed,
-                    onTriggerEvent: triggerPerformanceEvent,
-                    onReset: resetMotionTuning,
-                    performanceClock: performanceClock,
-                    motionTuning: motionTuning,
-                    manualEvent: manualEvent,
-                    scoreEvents: splashScoreEvents,
-                    runnerDuration: $runnerDuration,
-                    activePerformanceSession: activePerformanceSession,
-                    onRun: runCurrentScene,
-                    onStop: stopCurrentScene,
-                    onPauseResume: togglePerformancePause,
-                    auditionEnabled: $auditionEnabled,
-                    audioStatus: synthesizer.status + (synthesizer.outputLevel > 0.00001
-                        ? String(format: " · %.0f dB peak", 20 * log10(synthesizer.outputLevel)) : ""),
-                    onHide: { isPerformanceDeskVisible = false }
-                )
-                .padding(.top, 10)
-                .padding(.horizontal, 16)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-            } else if performanceDeskContext != nil, !Self.isAtmosphereReview {
-                Button {
-                    showsSceneSettings = false
-                    isPerformanceDeskVisible = true
-                } label: {
-                    Label(stage == .opening ? "Controls" : "Dev controls", systemImage: "slider.horizontal.3")
-                }
-                .accessibilityIdentifier("developerControls")
-                .buttonStyle(.borderedProminent)
-                .tint(PlanetFocusPalette.canvasInk.opacity(0.92))
-                .padding(.top, 10)
-                .padding(.trailing, 16)
-                .padding(.bottom, 12)
-                .frame(maxWidth: .infinity, maxHeight: .infinity,
-                    alignment: stage == .opening ? .topTrailing : .bottomTrailing)
-            }
-#endif
-        }
-        .background(PlanetFocusPalette.canvasInk.ignoresSafeArea())
-        .onAppear {
-            // Migrate away from resumable sessions. Only development settings survive
-            // process termination; backgrounding keeps the in-memory clock running.
-            UserDefaults.standard.removeObject(forKey: "splash.performance.session.v1")
-            UserDefaults.standard.removeObject(forKey: "performance.activeStory.v1")
-            if !ProcessInfo.processInfo.arguments.contains("--autumn-light-audit"),
-               !ProcessInfo.processInfo.arguments.contains("--autumn-fresh"),
-               let record = try? JSONDecoder().decode(AutumnBranchRecord.self, from: persistedAutumn) {
-                autumnRecord = record.settingsOnly
+    private var presentationObservedContent: AnyView {
+        AnyView(baseContent
+            .background(PlanetFocusPalette.canvasInk.ignoresSafeArea())
+            .onAppear(perform: prepareSplashView)
+            .onChange(of: autumnRecord) { _, record in
                 persistedAutumn = (try? JSONEncoder().encode(record.settingsOnly)) ?? Data()
             }
+            .onChange(of: activePerformanceSession) { _, _ in synchronizeAudio() }
+            .onChange(of: auditionEnabled) { _, _ in synchronizeAudio() }
+            .onChange(of: sceneVolume) { _, _ in synchronizeSceneOutput() }
+            .onChange(of: sceneMuted) { _, _ in synchronizeSceneOutput() })
+    }
+
+    private var idleTimerObservedContent: AnyView {
+        AnyView(presentationObservedContent
+            .onChange(of: preferences.volume) { _, value in sceneVolume = value }
+            .onChange(of: preferences.isMuted) { _, value in sceneMuted = value }
+            .onChange(of: preferences.keepScreenAwake) { _, _ in synchronizeIdleTimer() }
+            .onChange(of: sessionLifecycle.activeRuntime?.id) { _, _ in synchronizeIdleTimer() }
+            .onChange(of: sessionLifecycle.activeStoryID) { _, _ in synchronizeIdleTimer() }
+            .onChange(of: sessionLifecycle.activeOutcome) { _, _ in synchronizeIdleTimer() }
+            .onChange(of: sessionLifecycle.hasPendingTerminalEvent) { _, _ in synchronizeIdleTimer() }
+            .onChange(of: stage) { _, _ in synchronizeIdleTimer() })
+    }
+
+    private var finalContent: some View {
+        idleTimerObservedContent
 #if DEBUG
-            if ProcessInfo.processInfo.arguments.contains("--autumn-encounter-review") {
-                // Exercise the production schedule, not the manual bird trigger.
-                let duration: FocusDuration = ProcessInfo.processInfo.arguments.contains("--encounter-long")
-                    ? FocusDuration(minutes: 55)! : .fiveMinutes
-                let plan = AutumnBranchPlan(duration: duration.timeInterval, seed: 42,
-                    tuning: .standard, isFullTree: true)
-                let onset = plan.encounters.birds.first?.startTime ?? 30
-                autumnRecord = .init()
-                stage = .story(.autumnTree)
-                activePerformanceSession = PerformanceSession(duration: duration,
-                    startedAt: .now.addingTimeInterval(-max(0, onset - 3)), randomSeed: 42)
-            }
-            if ProcessInfo.processInfo.arguments.contains("--deer-study") {
-                let prefix = "--deer-pose="
-                let pose = ProcessInfo.processInfo.arguments.first { $0.hasPrefix(prefix) }
-                    .flatMap { Double($0.dropFirst(prefix.count)) }
-                triggerAutumnDeer(pose)
-            }
+            .onChange(of: showsSceneSettings) { _, shown in if shown { isPerformanceDeskVisible = false } }
+            .onChange(of: isPerformanceDeskVisible) { _, shown in if shown { showsSceneSettings = false } }
 #endif
-            if let session = activePerformanceSession {
-                activeSplashScoreEvents = SplashMusicDirector.events(for: session)
-            }
-            synchronizeAudio()
-        }
-        .onChange(of: autumnRecord) { _, record in
-            persistedAutumn = (try? JSONEncoder().encode(record.settingsOnly)) ?? Data()
-        }
-        .onChange(of: activePerformanceSession) { _, _ in
-            synchronizeAudio()
-        }
-        .onChange(of: auditionEnabled) { _, _ in synchronizeAudio() }
-        .onChange(of: sceneVolume) { _, _ in synchronizeSceneOutput() }
-        .onChange(of: sceneMuted) { _, _ in synchronizeSceneOutput() }
-#if DEBUG
-        .onChange(of: showsSceneSettings) { _, shown in
-            if shown { isPerformanceDeskVisible = false }
-        }
-        .onChange(of: isPerformanceDeskVisible) { _, shown in
-            if shown { showsSceneSettings = false }
-        }
-#endif
-        .onChange(of: scenePhase) { _, _ in synchronizeAudio() }
-        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { notification in
-            if let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-               raw == AVAudioSession.InterruptionType.began.rawValue {
-                synthesizer.fadeOut()
-            } else {
+            .onChange(of: scenePhase) { _, _ in
                 synchronizeAudio()
+                synchronizeIdleTimer()
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { notification in
-            if let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
-               raw == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue {
-                // Losing headphones silences audio, never pauses a focus session.
-                auditionEnabled = false
-                synthesizer.fadeOut()
-            }
-        }
-        .task(id: activePerformanceSession) {
-            guard let session = activePerformanceSession, !session.isPaused else { return }
-            try? await Task.sleep(for: .seconds(session.remainingTime(at: .now)))
-            guard !Task.isCancelled else { return }
-            synthesizer.fadeOut()
-        }
-        .onDisappear { synthesizer.fadeOut() }
+            .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification), perform: handleAudioInterruption)
+            .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification), perform: handleAudioRouteChange)
+            .task(id: activePerformanceSession) { await fadeSplashAudioAtSessionEnd(activePerformanceSession) }
+            .task(id: sessionLifecycle.activeRuntime?.id) { await maintainIdleTimerEligibility() }
+            .task(id: liveActivitySynchronizationID) { await synchronizeLiveActivity() }
+            .onDisappear(perform: tearDownSplashView)
 #if DEBUG
-        .onAppear {
-            if (ProcessInfo.processInfo.arguments.contains("--sunrise-audit-landscape") || ProcessInfo.processInfo.arguments.contains("--autumn-landscape")),
-               let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
-                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeLeft)) { error in
-                    print("Sunrise landscape audit unavailable: \(error)")
-                }
-            }
-        }
+            .onAppear(perform: requestSunriseLandscapeIfNeeded)
 #endif
     }
 
@@ -1716,19 +1620,372 @@ struct SplashScreenView: View {
         synchronizeSceneOutput()
         guard scenePhase == .active, auditionEnabled,
               ProcessInfo.processInfo.environment["SPLASH_AUDIO_DISABLED"] != "1",
-              let session = activePerformanceSession, !session.isPaused,
-              case .opening = stage else {
+              performancePurpose == .splashAudition,
+              let session = activePerformanceSession, !session.isPaused else {
             synthesizer.fadeOut()
             return
         }
         synthesizer.play(session: session, events: splashScoreEvents + (manualEvent.map { [$0] } ?? []))
     }
 
-    private func synchronizeSceneOutput() {
-        synthesizer.setOutput(volume: sceneVolume, isMuted: sceneMuted)
+    @ViewBuilder
+    private var stageContent: some View {
+        switch stage {
+        case .opening:
+            TimelineView(.animation(
+                minimumInterval: reduceMotion ? 1 : 1.0 / 60.0,
+                paused: Self.isAtmosphereReview
+            )) { context in
+                let transportState = activePerformanceSession.map {
+                    PerformanceRunner(session: $0).sample(at: context.date)
+                }
+                let performanceElapsed = transportState?.elapsedTime ?? performanceClock.elapsed(at: context.date)
+                let presentation = SplashScenePresentation.sample(
+                    performanceElapsed: Self.isAtmosphereReview ? 20 : performanceElapsed,
+                    exitElapsed: exitStartedAt.map { context.date.timeIntervalSince($0) },
+                    reduceMotion: reduceMotion,
+                    motionTuning: motionTuning,
+                    scoreEvents: splashScoreEvents
+                )
+                let ambientProgress = reduceMotion ? 0 : splashAmbient.progress(at: context.date)
+                let atmosphere = SplashAtmosphereDirector.sample(
+                    progress: reviewProgress ?? transportState?.progress
+                        ?? manualAtmosphereProgress ?? ambientProgress
+                )
+                let resonance = Self.resonance(
+                    manualEvent: manualEvent,
+                    scoreBeat: SplashPerformanceScore.scoreBeat(for: performanceElapsed, tuning: motionTuning),
+                    tuning: resonanceTuning
+                )
+                SplashSceneView(
+                    presentation: presentation,
+                    atmosphere: atmosphere,
+                    cloudTime: reviewProgress == nil && transportState == nil
+                        && manualAtmosphereProgress == nil
+                        ? splashAmbient.elapsed(at: context.date) : nil,
+                    resonance: resonance,
+                    selectedMenu: selectedMenu,
+                    onSelectMenu: selectMenu
+                )
+                .ignoresSafeArea()
+            }
+            .task(id: exitStartedAt) { await finishExitIfNeeded() }
+        case .chooser:
+            StoryChooserView(onChoose: chooseStory, onBack: resetSplash)
+        case let .story(story):
+            storyLaunchView(for: story)
+        case .settings:
+            PreferencesView(onBack: resetSplash)
+        case .stats:
+            StatsDestinationView(onBack: resetSplash)
+        }
+    }
+
+    private func chooseStory(_ story: Story) {
+        selectedStory = story
+        stage = .story(story)
+    }
+
+    @ViewBuilder
+    private var debugOverlay: some View {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--ambient-route-test") {
+            TimelineView(.periodic(from: .now, by: 0.1)) { context in
+                Text("Ambient route state")
+                    .opacity(0.001)
+                    .accessibilityIdentifier("ambientRouteState")
+                    .accessibilityValue(ambientRouteState(at: context.date))
+                    .accessibilityHidden(false)
+            }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--sunrise-audit") {
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    Button { sunriseAuditIndex = min(20, sunriseAuditIndex + 1) } label: {
+                        Color.clear.frame(width: 44, height: 44).contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Advance sunrise audit")
+                    .accessibilityIdentifier("sunriseAuditNext")
+                    .accessibilityValue(String(sunriseAuditIndex))
+                }
+            }
+        }
+        if let context = performanceDeskContext, isPerformanceDeskVisible {
+            PerformanceDesk(
+                expandedSections: $expandedPerformanceDeskSections, context: context,
+                autumnRecord: $autumnRecord, onAutumnGust: triggerAutumnGust,
+                onAutumnBird: triggerAutumnBird, onAutumnDeer: triggerAutumnDeer,
+                speedMultiplier: motionSpeedBinding, amountMultiplier: motionAmountBinding,
+                atmosphereProgress: $atmosphereProgress, resonanceStrength: resonanceStrengthBinding,
+                resonanceWidth: resonanceWidthBinding, tonalSlot: $manualTonalSlot,
+                gateBeats: $manualGateBeats, scoreSeed: $scoreSeed,
+                onTriggerEvent: triggerPerformanceEvent, onReset: resetMotionTuning,
+                performanceClock: performanceClock, motionTuning: motionTuning,
+                manualEvent: manualEvent, scoreEvents: splashScoreEvents,
+                runnerDuration: $runnerDuration, activePerformanceSession: activePerformanceSession,
+                onRun: runCurrentScene, onStop: stopCurrentScene,
+                onPauseResume: togglePerformancePause, auditionEnabled: $auditionEnabled,
+                audioStatus: performanceDeskAudioStatus,
+                onHide: { isPerformanceDeskVisible = false }
+            )
+            .padding(.top, 10).padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+        } else if performanceDeskContext != nil, !Self.isAtmosphereReview {
+            Button {
+                showsSceneSettings = false
+                isPerformanceDeskVisible = true
+            } label: {
+                Label(stage == .opening ? "Controls" : "Dev controls", systemImage: "slider.horizontal.3")
+            }
+            .accessibilityIdentifier("developerControls")
+            .buttonStyle(.borderedProminent)
+            .tint(PlanetFocusPalette.canvasInk.opacity(0.92))
+            .padding(.top, 10).padding(.trailing, 16).padding(.bottom, 12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity,
+                alignment: stage == .opening ? .topTrailing : .bottomTrailing)
+        }
+#endif
     }
 
 #if DEBUG
+    private func ambientRouteState(at date: Date) -> String {
+        let started = splashAmbient.startedAt?.timeIntervalSince1970 ?? -1
+        let purpose: String
+        switch performancePurpose {
+        case .splashAudition: purpose = "splash"
+        case .storyPreview: purpose = "story"
+        case nil: purpose = "none"
+        }
+        return "start=\(started);elapsed=\(splashAmbient.elapsed(at: date));purpose=\(purpose)"
+    }
+#endif
+
+    private func storyLaunchView(for story: Story) -> some View {
+        let liveRuntime = activeRuntime(for: story)
+        let liveSessionID = liveRuntime?.id
+        return StorySceneLaunchView(
+            story: story,
+            // Splash Controls can keep auditioning while someone browses setup,
+            // but they must never become a story's apparent meditation session.
+            session: performancePurpose == .storyPreview ? activePerformanceSession : nil,
+            runtime: liveRuntime,
+            durableOutcome: liveSessionID == nil ? nil : sessionLifecycle.activeOutcome,
+            persistenceError: liveSessionID == nil ? nil : sessionLifecycle.lastError?.localizedDescription,
+            autumnRecord: autumnRecord,
+            volume: $sceneVolume,
+            isMuted: $sceneMuted,
+            showsSettings: $showsSceneSettings,
+            onStart: { duration in
+                autumnRecord.manualGusts = []
+                autumnRecord.bird?.flight = nil
+                autumnRecord.deer?.encounter = nil
+                if Self.isDevelopmentSession {
+                    activePerformanceSession = PerformanceSession(duration: duration)
+                    performancePurpose = .storyPreview
+                    splashAmbient.stop()
+                }
+                else {
+                    _ = try await splashAmbient.stopAfterSuccessfulFocusStart {
+                        try await sessionLifecycle.begin(
+                            story: story,
+                            duration: duration,
+                            healthWriteRequested: healthSync.shouldRequestWriteForNewSession
+                        )
+                    }
+                    // A persisted focus attempt is the boundary between browsing
+                    // ambience and meditation. Failed starts leave ambience intact.
+                    activePerformanceSession = nil
+                    performancePurpose = nil
+                    activeSplashScoreEvents = nil
+                    synthesizer.fadeOut()
+                }
+            },
+            onComplete: {
+                if activePerformanceSession == nil {
+                    guard let liveSessionID else { throw SessionLedgerError.attemptNotFound }
+                    _ = try await sessionLifecycle.completeIfDue(id: liveSessionID)
+                }
+            },
+            onCancel: {
+                if activePerformanceSession == nil {
+                    guard let liveSessionID else { throw SessionLedgerError.attemptNotFound }
+                    _ = try await sessionLifecycle.cancel(id: liveSessionID)
+                }
+            }
+        ) {
+            showsSceneSettings = false
+            if let liveSessionID { sessionLifecycle.dismissActivePresentation(id: liveSessionID) }
+            if performancePurpose == .storyPreview {
+                activePerformanceSession = nil
+                activeSplashScoreEvents = nil
+                performancePurpose = nil
+            }
+            autumnRecord = autumnRecord.settingsOnly
+            stage = .chooser
+        }
+    }
+
+    private func prepareSplashView() {
+        splashAmbient.beginIfNeeded()
+        // Migrate away from resumable sessions. Only development settings survive
+        // process termination; backgrounding keeps the in-memory clock running.
+        UserDefaults.standard.removeObject(forKey: "splash.performance.session.v1")
+        UserDefaults.standard.removeObject(forKey: "performance.activeStory.v1")
+        if !ProcessInfo.processInfo.arguments.contains("--autumn-light-audit"),
+           !ProcessInfo.processInfo.arguments.contains("--autumn-fresh"),
+           let record = try? JSONDecoder().decode(AutumnBranchRecord.self, from: persistedAutumn) {
+            autumnRecord = record.settingsOnly
+            persistedAutumn = (try? JSONEncoder().encode(record.settingsOnly)) ?? Data()
+        }
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--autumn-encounter-review") {
+            let duration: FocusDuration = ProcessInfo.processInfo.arguments.contains("--encounter-long")
+                ? FocusDuration(minutes: 55)! : .fiveMinutes
+            let plan = AutumnBranchPlan(duration: duration.timeInterval, seed: 42,
+                tuning: .standard, isFullTree: true)
+            let onset = plan.encounters.birds.first?.startTime ?? 30
+            autumnRecord = .init()
+            stage = .story(.autumnTree)
+            activePerformanceSession = PerformanceSession(duration: duration,
+                startedAt: .now.addingTimeInterval(-max(0, onset - 3)), randomSeed: 42)
+            performancePurpose = .storyPreview
+        }
+        if ProcessInfo.processInfo.arguments.contains("--deer-study") {
+            let prefix = "--deer-pose="
+            let pose = ProcessInfo.processInfo.arguments.first { $0.hasPrefix(prefix) }
+                .flatMap { Double($0.dropFirst(prefix.count)) }
+            triggerAutumnDeer(pose)
+        }
+#endif
+        if let session = activePerformanceSession {
+            activeSplashScoreEvents = SplashMusicDirector.events(for: session)
+        }
+        sceneVolume = preferences.volume
+        sceneMuted = preferences.isMuted
+        synchronizeAudio()
+        synchronizeIdleTimer()
+    }
+
+    private func tearDownSplashView() {
+        synthesizer.fadeOut()
+        idleTimer.remove(requestID: idleTimerRequestID)
+        liveActivity.sceneDidDisappear(liveActivitySceneID)
+    }
+
+    private func handleAudioInterruption(_ notification: Notification) {
+        if let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+           raw == AVAudioSession.InterruptionType.began.rawValue {
+            synthesizer.fadeOut()
+        } else {
+            synchronizeAudio()
+        }
+    }
+
+    private func handleAudioRouteChange(_ notification: Notification) {
+        guard let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              raw == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue else {
+            return
+        }
+        // Losing headphones silences audio, never pauses a focus session.
+        auditionEnabled = false
+        synthesizer.fadeOut()
+    }
+
+    private func fadeSplashAudioAtSessionEnd(_ session: PerformanceSession?) async {
+        guard let session, !session.isPaused else { return }
+        try? await Task.sleep(for: .seconds(session.remainingTime(at: .now)))
+        guard !Task.isCancelled else { return }
+        synthesizer.fadeOut()
+    }
+
+    private func synchronizeSceneOutput() {
+        synthesizer.setOutput(volume: sceneVolume, isMuted: sceneMuted)
+        preferences.volume = sceneVolume
+        preferences.isMuted = sceneMuted
+    }
+
+    private func synchronizeIdleTimer() {
+        idleTimer.update(requestID: idleTimerRequestID, isEligible: isIdleTimerEligible)
+    }
+
+    private var liveActivitySynchronizationID: String {
+        [
+            sessionLifecycle.activeRuntime?.id.uuidString ?? "none",
+            sessionLifecycle.activeStoryID ?? "none",
+            sessionLifecycle.activeOutcome?.rawValue ?? "running",
+            preferences.lockScreenCountdownEnabled.description,
+            scenePhase == .active ? "foreground" : "background"
+        ].joined(separator: ":")
+    }
+
+    private func synchronizeLiveActivity() async {
+        let descriptor: PlanetFocusCountdownDescriptor?
+        if preferences.lockScreenCountdownEnabled,
+           sessionLifecycle.activeOutcome == nil,
+           let runtime = sessionLifecycle.activeRuntime,
+           let storyID = sessionLifecycle.activeStoryID,
+           let story = Story(rawValue: storyID) {
+            descriptor = PlanetFocusCountdownDescriptor(runtime: runtime, story: story)
+        } else {
+            descriptor = nil
+        }
+        await liveActivity.synchronize(
+            descriptor: descriptor,
+            isEnabled: preferences.lockScreenCountdownEnabled,
+            sceneID: liveActivitySceneID,
+            isForeground: scenePhase == .active
+        )
+    }
+
+    private var isIdleTimerEligible: Bool {
+        guard preferences.keepScreenAwake,
+              scenePhase == .active,
+              case let .story(story) = stage,
+              let runtime = activeRuntime(for: story),
+              sessionLifecycle.activeStoryID == story.rawValue,
+              sessionLifecycle.activeOutcome == nil,
+              !sessionLifecycle.hasPendingTerminalEvent else {
+            return false
+        }
+        return !runtime.sample().isComplete
+    }
+
+    private func maintainIdleTimerEligibility() async {
+        while !Task.isCancelled {
+            synchronizeIdleTimer()
+            guard let runtime = sessionLifecycle.activeRuntime,
+                  !sessionLifecycle.hasPendingTerminalEvent,
+                  !runtime.sample().isComplete else {
+                return
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+#if DEBUG
+    private var performanceDeskAudioStatus: String {
+        synthesizer.status + (synthesizer.outputLevel > 0.00001
+            ? String(format: " · %.0f dB peak", 20 * log10(synthesizer.outputLevel)) : "")
+    }
+
+    private func triggerAutumnGust() {
+        guard let session = activePerformanceSession, !session.isPaused else { return }
+        autumnRecord.manualGusts.append(session.elapsedTime(at: .now))
+    }
+
+    private func requestSunriseLandscapeIfNeeded() {
+        guard ProcessInfo.processInfo.arguments.contains("--sunrise-audit-landscape")
+                || ProcessInfo.processInfo.arguments.contains("--autumn-landscape"),
+              let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else {
+            return
+        }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeLeft)) { error in
+            print("Sunrise landscape audit unavailable: \(error.localizedDescription)")
+        }
+    }
+
     private func togglePerformancePause() {
         guard var session = activePerformanceSession else { return }
         if session.isPaused { session.resume(at: .now) }
@@ -1743,19 +2000,24 @@ struct SplashScreenView: View {
         manualEvent = nil
         activeSplashScoreEvents = SplashMusicDirector.events(for: session)
         activePerformanceSession = session
+        performancePurpose = .splashAudition
     }
 
     private func selectMenu(_ item: SplashMenuItem) {
-        if item == .start, exitStartedAt == nil {
-            activePerformanceSession = nil
-            activeSplashScoreEvents = nil
+        guard exitStartedAt == nil else { return }
+        selectedMenu = item
+        if item == .start {
             stage = .story(selectedStory)
             return
         }
-        guard item == .stories, exitStartedAt == nil else { return }
-        selectedMenu = item
-        activePerformanceSession = nil
-        activeSplashScoreEvents = nil
+        if item == .settings {
+            stage = .settings
+            return
+        }
+        if item == .stats {
+            stage = .stats
+            return
+        }
 
         guard !reduceMotion else {
             stage = .chooser
@@ -1780,12 +2042,17 @@ struct SplashScreenView: View {
 
     private func resetSplash() {
         selectedMenu = .start
-        performanceClock = PerformanceClock()
+        if !splashAmbient.isActive {
+            splashAmbient.restart()
+            performanceClock = PerformanceClock()
+            motionTuning.restartKeepingValues()
+            manualEvent = nil
+            atmosphereProgress = 0
+#if DEBUG
+            isPerformanceDeskVisible = false
+#endif
+        }
         exitStartedAt = nil
-        motionTuning.restartKeepingValues()
-        manualEvent = nil
-        activePerformanceSession = nil
-        activeSplashScoreEvents = nil
         stage = .opening
     }
 
@@ -1873,7 +2140,7 @@ struct SplashScreenView: View {
         switch stage {
         case .opening: .splash
         case .story(let story): .story(story)
-        case .chooser: nil
+        case .chooser, .settings, .stats: nil
         }
     }
 
@@ -1889,8 +2156,9 @@ struct SplashScreenView: View {
                 duration: duration,
                 randomSeed: UInt64(max(scoreSeed, 0))
             )
+            performancePurpose = .storyPreview
             activeSplashScoreEvents = nil
-        case .chooser:
+        case .chooser, .settings, .stats:
             break
         }
     }
@@ -1922,11 +2190,13 @@ struct SplashScreenView: View {
         autumnRecord.bird?.flight = nil
         autumnRecord.manualGusts = []
         activePerformanceSession = session
+        performancePurpose = .storyPreview
         activeSplashScoreEvents = nil
     }
 
     private func stopCurrentScene() {
         activePerformanceSession = nil
+        performancePurpose = nil
         activeSplashScoreEvents = nil
         // Ending a story leaves its scene and contextual tuning available.
     }
@@ -3780,9 +4050,11 @@ private struct SplashLotusPetalContour {
 }
 
 private struct SplashNavigationBar: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let selectedItem: SplashMenuItem
     let fontSize: CGFloat
     let spacing: CGFloat
+    let usesEqualWidthItems: Bool
     let ink: SplashColorComponents
     let selectedInk: SplashColorComponents
     let action: (SplashMenuItem) -> Void
@@ -3790,65 +4062,113 @@ private struct SplashNavigationBar: View {
     @Namespace private var indicatorNamespace
 
     var body: some View {
-        HStack(alignment: .top, spacing: spacing) {
-            ForEach(SplashMenuItem.allCases) { item in
-                let activeItem = hoveredItem ?? selectedItem
-
-                Button {
-                    action(item)
-                } label: {
-                    VStack(spacing: max(4, fontSize * 0.12)) {
-                        Text(item.rawValue)
-                            .font(PlanetFocusTypography.navigation(size: fontSize))
-                            .foregroundStyle(
-                                item == activeItem
-                                    ? selectedInk.color
-                                    : ink.color
-                            )
-                            .lineLimit(1)
-
-                        ZStack {
-                            if item == activeItem {
-                                Circle()
-                                    .fill(selectedInk.color)
-                                    .matchedGeometryEffect(
-                                        id: SplashNavigationMotion.dotID,
-                                        in: indicatorNamespace
-                                    )
-                            }
-                        }
-                        .frame(width: max(7, fontSize * 0.22), height: max(7, fontSize * 0.22))
-
-                        ZStack {
-                            if item == activeItem {
-                                Capsule()
-                                    .fill(selectedInk.color)
-                                    .matchedGeometryEffect(
-                                        id: SplashNavigationMotion.underlineID,
-                                        in: indicatorNamespace
-                                    )
-                            }
-                        }
-                        .frame(width: max(48, fontSize * 2.60), height: max(2, fontSize * 0.055))
-                    }
-                    .frame(minWidth: max(54, fontSize * 2.05), minHeight: 44, alignment: .top)
-                    .contentShape(Rectangle())
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: spacing), count: 2),
+                    spacing: 4
+                ) {
+                    menuItems
                 }
-                .buttonStyle(.plain)
-                .onHover { isHovering in
-                    withAnimation(SplashNavigationMotion.hoverTransition) {
-                        if isHovering {
-                            hoveredItem = item
-                        } else if hoveredItem == item {
-                            hoveredItem = nil
-                        }
-                    }
+                .padding(.top, 14)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+                .frame(maxWidth: .infinity)
+                .background(PlanetFocusPalette.canvasInk)
+            } else {
+                HStack(alignment: .top, spacing: spacing) {
+                    menuItems
                 }
-                .accessibilityLabel(item.rawValue)
-                .accessibilityValue(item == selectedItem ? "Selected" : "Not selected")
-                .accessibilityHint(item == .stories ? "Open stories" : "Not available yet")
-                .accessibilityIdentifier("splash-menu-\(item.rawValue.lowercased())")
             }
+        }
+    }
+
+    @ViewBuilder
+    private var menuItems: some View {
+        let usesEqualColumns = usesEqualWidthItems || dynamicTypeSize.isAccessibilitySize
+        let navigationInk = dynamicTypeSize.isAccessibilitySize
+            ? PlanetFocusPalette.typePaleBlue
+            : ink.color
+        let selectedNavigationInk = dynamicTypeSize.isAccessibilitySize
+            ? PlanetFocusPalette.warmYellow
+            : selectedInk.color
+        ForEach(SplashMenuItem.allCases) { item in
+            let activeItem = hoveredItem ?? selectedItem
+
+            Button {
+                action(item)
+            } label: {
+                VStack(spacing: max(4, fontSize * 0.12)) {
+                    Text(item.rawValue)
+                        .font(PlanetFocusTypography.navigation(size: fontSize))
+                        .foregroundStyle(
+                            item == activeItem
+                                ? selectedNavigationInk
+                                : navigationInk
+                        )
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                        .frame(maxWidth: usesEqualColumns ? .infinity : nil)
+
+                    ZStack {
+                        if item == activeItem {
+                            Circle()
+                                .fill(selectedNavigationInk)
+                                .matchedGeometryEffect(
+                                    id: SplashNavigationMotion.dotID,
+                                    in: indicatorNamespace
+                                )
+                        }
+                    }
+                    .frame(width: max(7, fontSize * 0.22), height: max(7, fontSize * 0.22))
+
+                    ZStack {
+                        if item == activeItem {
+                            Capsule()
+                                .fill(selectedNavigationInk)
+                                .matchedGeometryEffect(
+                                    id: SplashNavigationMotion.underlineID,
+                                    in: indicatorNamespace
+                                )
+                        }
+                    }
+                    .frame(width: usesEqualColumns ? nil : max(48, fontSize * 2.60),
+                           height: max(2, fontSize * 0.055))
+                }
+                .frame(
+                    minWidth: usesEqualColumns ? nil : max(54, fontSize * 2.05),
+                    maxWidth: usesEqualColumns ? .infinity : nil,
+                    minHeight: 44,
+                    alignment: .top
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { isHovering in
+                withAnimation(SplashNavigationMotion.hoverTransition) {
+                    if isHovering {
+                        hoveredItem = item
+                    } else if hoveredItem == item {
+                        hoveredItem = nil
+                    }
+                }
+            }
+            .accessibilityLabel(item.rawValue)
+            .accessibilityValue(item == selectedItem ? "Selected" : "Not selected")
+            .accessibilityHint(item.accessibilityHint)
+            .accessibilityIdentifier("splash-menu-\(item.rawValue.lowercased())")
+        }
+    }
+
+}
+
+private extension SplashMenuItem {
+    var accessibilityHint: String {
+        switch self {
+        case .start: "Begin the selected story"
+        case .stories: "Browse stories"
+        case .stats: "View focus statistics"
+        case .settings: "Open settings"
         }
     }
 }

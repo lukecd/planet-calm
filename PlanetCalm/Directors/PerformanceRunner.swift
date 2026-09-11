@@ -6,6 +6,9 @@ import Foundation
 /// Pause/Codable support is for development controls and deterministic tests;
 /// production sessions are never saved or restored across process launches.
 struct PerformanceSession: Equatable, Codable, Sendable {
+    /// Identity belongs to the session lifecycle and survives every live transport
+    /// conversion. Existing previews may still create an unpersisted session.
+    let id: UUID
     let duration: FocusDuration
     let startedAt: Date
     let randomSeed: UInt64
@@ -13,10 +16,12 @@ struct PerformanceSession: Equatable, Codable, Sendable {
     private(set) var accumulatedPause: TimeInterval = 0
 
     init(
+        id: UUID = UUID(),
         duration: FocusDuration,
         startedAt: Date = .now,
         randomSeed: UInt64 = UInt64.random(in: UInt64.min...UInt64.max)
     ) {
+        self.id = id
         self.duration = duration
         self.startedAt = startedAt
         self.randomSeed = randomSeed

@@ -104,11 +104,11 @@ constant int paperCloudLayerCount = 3;
 constant float paperSunDepth = -0.60;
 struct PaperCloudLayer { float2 center; float2 size; float depth; float pigment; };
 
-PaperCloudLayer paperCloudLayer(int index, float aspect, float time) {
+PaperCloudLayer paperCloudLayer(int index, float aspect, float time, float phonePortrait) {
     float drift = 0.025 * sin(time * 0.035);
     // Balance the sun from the left; preserve the same lateral overlap as the
     // viewport widens instead of centering a cloud directly above the disc.
-    float2 anchor = float2(aspect * 0.70 - 0.28 + drift, 0.40);
+    float2 anchor = float2(aspect * 0.70 - 0.28 + drift, 0.40 + phonePortrait * 0.16);
     // Broad lit crown, with progressively smaller, offset sheets below it.
     // Their lower edges remain exposed rather than hidden by the front sheet.
     switch (index) {
@@ -138,10 +138,11 @@ float paperCloudAlpha(float2 point, PaperCloudLayer layer, float feather) {
 // Intersect the source-to-receiver segment with each actual paper plane.
 // The same source x/y used by the sunrise determines every projected shadow.
 float paperSunVisibility(float2 receiver, float receiverDepth, float2 source,
-                         float aspect, float time, int ignoredLayer, float feather) {
+                         float aspect, float time, float phonePortrait,
+                         int ignoredLayer, float feather) {
     float visibility = 1;
     for (int j = 0; j < paperCloudLayerCount; ++j) {
-        PaperCloudLayer blocker = paperCloudLayer(j, aspect, time);
+        PaperCloudLayer blocker = paperCloudLayer(j, aspect, time, phonePortrait);
         if (j == ignoredLayer || blocker.depth >= receiverDepth) continue;
         float t = (blocker.depth - paperSunDepth) / (receiverDepth - paperSunDepth);
         float2 intersection = mix(source, receiver, t);
@@ -211,19 +212,23 @@ fragment half4 sunriseFragment(SkyVertex in [[stage_in]],
 
     float cloudTime = u.story.w;
     float aspect = size.x / shortSide;
+    float phonePortrait = size.x < 600.0 && size.y > size.x ? 1.0 : 0.0;
     // A shallow scattering slab samples shadows cast by the separate paper planes.
     // This is a 2.5D approximation, not a volume of simulated cloud droplets.
     float visibility = 0;
     for (int i = 0; i < 24; ++i) {
         float receiverDepth = mix(0.22, 0.85, (float(i) + 0.5) / 24);
         visibility += paperSunVisibility(point, receiverDepth, sunPoint,
-                                        aspect, cloudTime, -1, 0.005) / 24;
+                                        aspect, cloudTime, phonePortrait, -1, 0.005) / 24;
     }
     float rayWindow = sin(pi * p) * sin(pi * p);
     float3 radiance = (light.rayleigh + light.mie * mix(1.0, visibility, 0.7 * rayWindow)) * 12.0;
     float exposure = u.optics.y;
     float3 physical = 1 - exp(-radiance * exposure);
     float3 ink = sRGBToLinear(float3(10, 17, 36) / 255.0);
+    // The opening frame is the approved clean ink field. Blend into the existing
+    // sunrise treatment during its first 5% so the initial canvas does not flash.
+    float openingLight = smoothstep(0.0, 0.05, p);
     float3 color = ink + physical * (0.025 + 0.55 * smoothstep(0.0, 0.7, p));
     float3 lab = toLab(color);
     // A continuous pigment gamut from ink-blue through violet/coral to gold.
@@ -250,9 +255,10 @@ fragment half4 sunriseFragment(SkyVertex in [[stage_in]],
     // The paper finish receives the same projected shadow as the scattering slab.
     // Keep uncovered pixels exactly on the approved sunrise's color path.
     color *= 1 - (1 - visibility) * 0.24 * rayWindow;
+    color = mix(ink, color, openingLight);
 
     float3 output = linearToSRGB(clamp(color, 0.0, 1.0));
-    output += (hash21(in.position.xy) - 0.5) / 255.0;
+    output += (hash21(in.position.xy) - 0.5) / 255.0 * openingLight;
     return half4(half3(output), 1);
 }
 
@@ -265,6 +271,7 @@ fragment half4 paperCloudFragment(SkyVertex in [[stage_in]],
     float2 sunPoint = u.viewport.zw / shortSide;
     float aspect = size.x / shortSide;
     float cloudTime = u.story.w;
+    float phonePortrait = size.x < 600.0 && size.y > size.x ? 1.0 : 0.0;
     float p = saturate(u.story.x);
     float3 gold = sRGBToLinear(float3(255, 206, 88) / 255.0);
     float3 color = 0;
@@ -282,7 +289,7 @@ fragment half4 paperCloudFragment(SkyVertex in [[stage_in]],
     float3 backPigment = mix(mix(coolBack, warmBack, dawn), dayBack, day);
     float3 facePigment = mix(mix(coolFace, warmFace, dawn), dayFace, day);
     for (int i = 0; i < paperCloudLayerCount; ++i) {
-        PaperCloudLayer layer = paperCloudLayer(i, aspect, cloudTime);
+        PaperCloudLayer layer = paperCloudLayer(i, aspect, cloudTime, phonePortrait);
         float cover = paperCloudAlpha(point, layer, 0.001);
         // Contact shading makes the stacked paper thickness readable even in shade.
         // It is a restrained studio-fill cue, separate from solar occlusion.
@@ -292,7 +299,7 @@ fragment half4 paperCloudFragment(SkyVertex in [[stage_in]],
         alpha = shadowAlpha + alpha * (1 - shadowAlpha);
         if (cover <= 0) continue;
         float direct = paperSunVisibility(point, layer.depth, sunPoint,
-                                          aspect, cloudTime, i, 0.003);
+                                          aspect, cloudTime, phonePortrait, i, 0.003);
         float3 pigment = mix(backPigment, facePigment, layer.pigment);
         float3 face = pigment * (0.76 + 0.24 * direct);
         float paper = float(grain.sample(paperSampler,

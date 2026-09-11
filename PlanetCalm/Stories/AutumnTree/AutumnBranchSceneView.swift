@@ -28,6 +28,7 @@ private final class AutumnBranchRenderCache {
 
 struct AutumnBranchSceneView: View {
     let session: PerformanceSession?
+    let runtime: SessionRuntime?
     let record: AutumnBranchRecord
     let reduceMotion: Bool
     @State private var cache = AutumnBranchRenderCache()
@@ -38,7 +39,7 @@ struct AutumnBranchSceneView: View {
     var body: some View {
         TimelineView(.animation(minimumInterval: reduceMotion ? 1 : 1.0 / 60,
                                 paused: session?.isPaused ?? true)) { timeline in
-            let elapsed = session?.elapsedTime(at: timeline.date) ?? 0
+            let elapsed = runtime?.sample().elapsedTime ?? session?.elapsedTime(at: timeline.date) ?? 0
             let plan = cache.plan(duration: session?.duration.timeInterval ?? 120,
                 seed: session?.randomSeed ?? 42, record: record)
             let frame = cache.frame(plan: plan, time: elapsed)
@@ -81,7 +82,7 @@ struct AutumnBranchSceneView: View {
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--autumn-light-audit") { return auditProgress }
 #endif
-        return session?.progress(at: date) ?? record.tuning.sunPosition
+        return runtime?.sample().progress ?? session?.progress(at: date) ?? record.tuning.sunPosition
     }
 }
 
