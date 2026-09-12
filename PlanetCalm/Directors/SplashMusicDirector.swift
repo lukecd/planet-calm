@@ -4,7 +4,7 @@ import Foundation
 /// fixture only; running performances consume these same events in every subsystem.
 enum SplashMusicDirector {
     static func events(for session: PerformanceSession) -> [SplashWaveNoteEvent] {
-        let end = session.duration.timeInterval / SplashPerformanceScore.tempo.secondsPerBeat
+        let end = session.duration.timeInterval / SplashSamplePlan.secondsPerBeat
         var events: [SplashWaveNoteEvent] = []
         var pads = SeededRandomNumberGenerator(seed: session.randomSeed ^ StableSeed.hash("pads"))
         var melody = SeededRandomNumberGenerator(seed: session.randomSeed ^ StableSeed.hash("melody"))
@@ -62,10 +62,13 @@ enum SplashMusicDirector {
         var phraseStart = 9.0
         var phrase = 0
         let melodySlots = [2, 4, 5, 6, 7]
+        let instruments = SplashSamplePlan.melodySections(duration: session.duration.timeInterval, seed: session.randomSeed)
         while phraseStart < end - 6 {
             var position = min(Int(melody.unitInterval() * 5), 4)
             var noteStart = phraseStart
-            let count = 2 + min(Int(melody.unitInterval() * 3), 2)
+            let handpan = SplashSamplePlan.instrument(at: phraseStart * SplashSamplePlan.secondsPerBeat,
+                sections: instruments) == .handpan
+            let count = (handpan ? 3 : 2) + min(Int(melody.unitInterval() * 3), 2)
             for note in 0..<count {
                 append("melody-\(phrase)-\(note)", melodySlots[position], noteStart,
                     melody.value(in: 1.0...2.0),
@@ -74,7 +77,7 @@ enum SplashMusicDirector {
                     .melody, melody.value(in: 0.33...0.48), 1)
                 let step = melody.unitInterval() < 0.5 ? -1 : 1
                 position = min(max(position + step, 0), 4)
-                noteStart += melody.value(in: 2.0...3.2)
+                noteStart += handpan ? 1.5 : melody.value(in: 2.0...3.2)
             }
             phraseStart = noteStart + melody.value(in: 7...13)
             phrase += 1

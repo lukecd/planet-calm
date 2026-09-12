@@ -42,6 +42,8 @@
 		A10000000000000000000032 /* StoryLibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000032 /* StoryLibraryView.swift */; };
 		A10000000000000000000034 /* PlanetFocusDesign.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000034 /* PlanetFocusDesign.swift */; };
 		A10000000000000000000035 /* Assets/Fonts in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000035 /* Assets/Fonts */; };
+		900000000000000000000001 /* PerformanceAudioAssetCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900100000000000000000001 /* PerformanceAudioAssetCatalog.swift */; };
+		900000000000000000000002 /* Assets/Audio in Resources */ = {isa = PBXBuildFile; fileRef = 900100000000000000000002 /* Assets/Audio */; };
 		A10000000000000000000036 /* SplashAtmosphereDirector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000036 /* SplashAtmosphereDirector.swift */; };
 		A10000000000000000000037 /* PerformanceRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000037 /* PerformanceRunner.swift */; };
 		A10000000000000000000038 /* SunriseSkyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000038 /* SunriseSkyView.swift */; };
@@ -61,6 +63,8 @@
 		F10000000000000000000003 /* PlanetFocusCountdownAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000001 /* PlanetFocusCountdownAttributes.swift */; };
 		F10000000000000000000004 /* PlanetFocusCountdownLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000003 /* PlanetFocusCountdownLiveActivity.swift */; };
 		F10000000000000000000005 /* PlanetCalmLiveActivity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = F20000000000000000000004 /* PlanetCalmLiveActivity.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		900000000000000000000003 /* SplashSamplePlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900100000000000000000003 /* SplashSamplePlan.swift */; };
+		900000000000000000000004 /* PerformanceSampleEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900100000000000000000004 /* PerformanceSampleEngine.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -140,6 +144,8 @@
 		A20000000000000000000032 /* StoryLibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoryLibraryView.swift; sourceTree = "<group>"; };
 		A20000000000000000000034 /* PlanetFocusDesign.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlanetFocusDesign.swift; sourceTree = "<group>"; };
 		A20000000000000000000035 /* Assets/Fonts */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Assets/Fonts; sourceTree = "<group>"; };
+		900100000000000000000001 /* PerformanceAudioAssetCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceAudioAssetCatalog.swift; sourceTree = "<group>"; };
+		900100000000000000000002 /* Assets/Audio */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Assets/Audio; sourceTree = "<group>"; };
 		A20000000000000000000036 /* SplashAtmosphereDirector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplashAtmosphereDirector.swift; sourceTree = "<group>"; };
 		A20000000000000000000037 /* PerformanceRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceRunner.swift; sourceTree = "<group>"; };
 		A20000000000000000000038 /* SunriseSkyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SunriseSkyView.swift; sourceTree = "<group>"; };
@@ -159,6 +165,8 @@
 		F20000000000000000000002 /* LiveActivitySessionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivitySessionCoordinator.swift; sourceTree = "<group>"; };
 		F20000000000000000000003 /* PlanetFocusCountdownLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlanetFocusCountdownLiveActivity.swift; sourceTree = "<group>"; };
 		F20000000000000000000004 /* PlanetCalmLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = PlanetCalmLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		900100000000000000000003 /* SplashSamplePlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplashSamplePlan.swift; sourceTree = "<group>"; };
+		900100000000000000000004 /* PerformanceSampleEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceSampleEngine.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -214,6 +222,7 @@
 				A2000000000000000000001B /* Assets/Stories/AutumnTree/LeafAerodynamicsV1 */,
 				A2000000000000000000002E /* Assets/Stories/ContemporaryLotus/PondStageV1 */,
 				A20000000000000000000035 /* Assets/Fonts */,
+				900100000000000000000002 /* Assets/Audio */,
 				A4000000000000000000000E /* Design */,
 				A40000000000000000000006 /* Domain */,
 				A40000000000000000000007 /* Directors */,
@@ -279,6 +288,9 @@
 				A2000000000000000000002A /* ContemporaryLotusDirector.swift */,
 				A20000000000000000000036 /* SplashAtmosphereDirector.swift */,
 				A20000000000000000000037 /* PerformanceRunner.swift */,
+				900100000000000000000003 /* SplashSamplePlan.swift */,
+				900100000000000000000004 /* PerformanceSampleEngine.swift */,
+				900100000000000000000001 /* PerformanceAudioAssetCatalog.swift */,
 			);
 			path = Directors;
 			sourceTree = "<group>";
@@ -488,6 +500,7 @@
 				A1000000000000000000001B /* Assets/Stories/AutumnTree/LeafAerodynamicsV1 in Resources */,
 				A1000000000000000000002E /* Assets/Stories/ContemporaryLotus/PondStageV1 in Resources */,
 				A10000000000000000000035 /* Assets/Fonts in Resources */,
+				900000000000000000000002 /* Assets/Audio in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -506,6 +519,9 @@
 				C10000000000000000000002 /* AutumnBranchPerformance.swift in Sources */,
 				C10000000000000000000003 /* AutumnBranchSceneView.swift in Sources */,
 				B10000000000000000000001 /* SplashMusicDirector.swift in Sources */,
+				900000000000000000000003 /* SplashSamplePlan.swift in Sources */,
+				900000000000000000000004 /* PerformanceSampleEngine.swift in Sources */,
+				900000000000000000000001 /* PerformanceAudioAssetCatalog.swift in Sources */,
 				B10000000000000000000002 /* PerformanceSynthesizer.swift in Sources */,
 				A10000000000000000000038 /* SunriseSkyView.swift in Sources */,
 				A10000000000000000000039 /* SunriseSky.metal in Sources */,

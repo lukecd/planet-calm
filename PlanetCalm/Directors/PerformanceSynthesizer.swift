@@ -39,133 +39,253 @@ struct PerformanceSynthVoice: Sendable {
     }
 }
 
-/// Audio time is a host-time projection of the same session elapsed time used by
-/// SwiftUI. No frames advance the transport. Resume samples held notes at their
-/// current envelope positions instead of replaying missed attacks.
+/// UI state stays on the main actor; graph construction, file opening, and
+/// scheduling belong to one audio actor so they cannot interrupt a wave frame.
 @MainActor @Observable
 final class PerformanceSynthesizer {
     private(set) var status = "Sound off"
     private(set) var outputLevel: Float = 0
     private var runToken = UUID()
-    private var engine: AVAudioEngine?
+    private var playback: PerformanceAudioPlayback?
     private var playingSessionID: UUID?
+    private var playingAmbientSeed: UInt64?
+    private var ambientAudioReady = false
     private var playingEvents: [SplashWaveNoteEvent] = []
+    private var schedulingTask: Task<Void, Never>?
     private var fadeTask: Task<Void, Never>?
     private(set) var volume: Float = 0.65
     private(set) var isMuted = false
     var effectiveVolume: Float { isMuted ? 0 : volume }
+    var isPlayingAmbient: Bool { playingAmbientSeed != nil && playback != nil && ambientAudioReady }
+    var ambientSeed: UInt64? { playingAmbientSeed }
 
-    /// Output-only control: never rebuild the score or alter the shared transport.
     func setOutput(volume: Double, isMuted: Bool) {
         self.volume = volume.isFinite ? Float(min(1, max(0, volume))) : 0
         self.isMuted = isMuted
-        engine?.mainMixerNode.outputVolume = effectiveVolume
+        let level = effectiveVolume
+        if let playback { Task { await playback.setVolume(level) } }
     }
 
     func play(session: PerformanceSession, events: [SplashWaveNoteEvent]) {
         guard !session.isPaused, session.progress(at: .now) < 1 else { return }
-        guard playingSessionID != session.id || playingEvents != events || engine == nil else { return }
+        guard playingSessionID != session.id || playingEvents != events || playback == nil else { return }
         stop()
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
-            try audioSession.setActive(true)
-            let engine = AVAudioEngine()
-            let rate = audioSession.sampleRate
-            guard rate > 0, let format = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2)
-            else { status = "Audio format unavailable"; return }
-            let plan = SplashPerformancePlan(session: session, scoreEvents: events)
-            let voices = events.map { event in
-                PerformanceSynthVoice(event: event, source: plan.soundSource(
-                    for: .init(event: event, scheduledStartBeat: event.startBeat)))
-            }
-            let hostAnchor = ProcessInfo.processInfo.systemUptime
-            let elapsedAnchor = session.elapsedTime(at: .now)
-            let duration = session.duration.timeInterval
-            let node = AVAudioSourceNode(format: format) { @Sendable isSilent, timestamp, frameCount, audioBufferList in
-                let hostSeconds = AVAudioTime.seconds(forHostTime: timestamp.pointee.mHostTime)
-                let start = elapsedAnchor + hostSeconds - hostAnchor
-                let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
-                for buffer in buffers {
-                    guard let data = buffer.mData else { continue }
-                    data.assumingMemoryBound(to: Float.self).initialize(repeating: 0, count: Int(frameCount))
-                }
-                guard start < duration else { isSilent.pointee = true; return noErr }
-                for voice in voices {
-                    let secondsPerBeat = voice.secondsPerBeat
-                    guard voice.event.endBeat * secondsPerBeat > start,
-                          voice.event.startBeat * secondsPerBeat < start + Double(frameCount) / rate else { continue }
-                    let pan = Double(voice.event.tonalSlot) / 7 * 0.5 - 0.25
-                    for frame in 0..<Int(frameCount) {
-                        let elapsed = start + Double(frame) / rate
-                        let startFade = min(max((elapsed - elapsedAnchor) / 0.03, 0), 1)
-                        let sample = voice.sample(at: elapsed) * startFade
-                        for (channel, buffer) in buffers.enumerated() {
-                            guard let data = buffer.mData else { continue }
-                            let balance = channel == 0 ? 1 - pan : 1 + pan
-                            data.assumingMemoryBound(to: Float.self)[frame] += Float(sample * balance)
-                        }
+        let playback = PerformanceAudioPlayback(volume: effectiveVolume)
+        let token = UUID()
+        runToken = token
+        self.playback = playback
+        playingSessionID = session.id
+        playingEvents = events
+        status = "Preparing Splash recordings"
+        schedulingTask = Task { [weak self] in
+            do {
+                try await playback.start(session: session, events: events) { [weak self] peak in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.runToken == token else { return }
+                        self.outputLevel = peak
                     }
                 }
-                for buffer in buffers {
-                    guard let data = buffer.mData else { continue }
-                    let samples = data.assumingMemoryBound(to: Float.self)
-                    for frame in 0..<Int(frameCount) { samples[frame] = tanh(samples[frame]) }
-                }
-                isSilent.pointee = false
-                return noErr
+                try Task.checkCancellation()
+                guard let self, self.runToken == token else { await playback.stop(); return }
+                self.status = "Splash recordings · stereo"
+                try await playback.run()
+                if self.runToken == token { self.stop() }
+            } catch is CancellationError {
+                // stop/fadeOut owns cleanup; a cancelled old task must not
+                // tear down a replacement performance or cut its release tail.
+            } catch {
+                await playback.stop()
+                guard let self, self.runToken == token else { return }
+                self.stop()
+                self.status = "Audio unavailable: \(error.localizedDescription)"
             }
-            engine.attach(node)
-            engine.connect(node, to: engine.mainMixerNode, format: format)
-            engine.mainMixerNode.outputVolume = effectiveVolume
-            let token = UUID()
-            runToken = token
-            engine.mainMixerNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { @Sendable [weak self] buffer, _ in
-                guard let samples = buffer.floatChannelData?[0] else { return }
-                var peak: Float = 0
-                for frame in 0..<Int(buffer.frameLength) { peak = max(peak, abs(samples[frame])) }
-                let measuredPeak = peak
-                Task { @MainActor [weak self] in
-                    guard let self, self.runToken == token, self.engine != nil else { return }
-                    self.outputLevel = measuredPeak
+        }
+    }
+
+    /// Starts the process-scoped browsing atmosphere. Its score is generated in
+    /// short absolute-time windows by PerformanceSampleEngine and therefore keeps
+    /// moving across the 10-minute light cycle without rebuilding the graph.
+    func playAmbient(seed: UInt64, startedAt: Date) {
+        guard playingAmbientSeed != seed || playback == nil else { return }
+        stop()
+        let playback = PerformanceAudioPlayback(volume: effectiveVolume)
+        let token = UUID()
+        runToken = token
+        self.playback = playback
+        playingAmbientSeed = seed
+        ambientAudioReady = false
+        status = "Preparing home atmosphere"
+        schedulingTask = Task { [weak self] in
+            do {
+                try await playback.startAmbient(seed: seed, startedAt: startedAt) { [weak self] peak in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.runToken == token else { return }
+                        self.outputLevel = peak
+                    }
                 }
+                try Task.checkCancellation()
+                guard let self, self.runToken == token else { await playback.stop(); return }
+                self.ambientAudioReady = true
+                self.status = "Home atmosphere · stereo"
+                try await playback.run()
+            } catch is CancellationError {
+            } catch {
+                await playback.stop()
+                guard let self, self.runToken == token else { return }
+                self.stop()
+                self.status = "Audio unavailable: \(error.localizedDescription)"
             }
-            try engine.start()
-            self.engine = engine
-            playingSessionID = session.id
-            playingEvents = events
-            status = "Synth audition · drone, pads + melody"
-        } catch {
-            status = "Audio unavailable: \(error.localizedDescription)"
         }
     }
 
     func fadeOut() {
-        fadeTask?.cancel()
-        guard let fadingEngine = engine else { status = "Sound off"; return }
-        engine = nil
+        guard fadeTask == nil, let fading = playback else { return }
+        schedulingTask?.cancel()
+        schedulingTask = nil
+        runToken = UUID()
         playingSessionID = nil
+        playingAmbientSeed = nil
+        ambientAudioReady = false
         playingEvents = []
-        status = "Sound off"
         outputLevel = 0
-        fadeTask = Task {
-            let volume = fadingEngine.mainMixerNode.outputVolume
-            for step in (0..<6).reversed() {
-                guard !Task.isCancelled else { break }
-                fadingEngine.mainMixerNode.outputVolume = volume * Float(step) / 6
-                try? await Task.sleep(for: .milliseconds(5))
-            }
-            fadingEngine.stop()
+        status = "Sound off"
+        // Keep ownership until the release finishes, so mute/volume changes
+        // still reach the fading graph and a new run can stop it immediately.
+        fadeTask = Task { [weak self] in
+            await fading.fadeOut()
+            guard let self, self.playback === fading else { return }
+            self.playback = nil
+            self.fadeTask = nil
         }
     }
 
     func stop() {
+        schedulingTask?.cancel()
+        schedulingTask = nil
+        let stopped = playback
+        clearPlayback()
+        if let stopped { Task { await stopped.stop() } }
+    }
+
+    /// Used for route loss and interruptions where even a short release tail can
+    /// leak to a newly selected output device.
+    func stopImmediately() { stop() }
+
+    private func clearPlayback() {
         fadeTask?.cancel()
-        engine?.stop()
-        engine = nil
+        fadeTask = nil
+        runToken = UUID()
+        playback = nil
         playingSessionID = nil
+        playingAmbientSeed = nil
+        ambientAudioReady = false
         playingEvents = []
         outputLevel = 0
         status = "Sound off"
+    }
+}
+
+/// Each performance exclusively owns its engine. No AVAudioEngine or file is
+/// passed across actors; only the immutable score and peak measurements cross.
+private actor PerformanceAudioPlayback {
+    private var engine: PerformanceSampleEngine?
+    private var volume: Float
+    private var stopped = false
+
+    init(volume: Float) { self.volume = volume }
+
+    func start(session: PerformanceSession, events: [PerformanceNoteEvent],
+               onPeak: @escaping @Sendable (Float) -> Void) throws {
+        try Task.checkCancellation()
+        guard !stopped else { throw CancellationError() }
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+        try audioSession.setActive(true)
+        let prepared = try PerformanceSampleEngine(session: session, score: events)
+        try Task.checkCancellation()
+        prepared.setVolume(volume)
+        prepared.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { buffer, _ in
+            guard let channels = buffer.floatChannelData else { return }
+            var peak: Float = 0
+            for channel in 0..<Int(buffer.format.channelCount) {
+                for frame in 0..<Int(buffer.frameLength) { peak = max(peak, abs(channels[channel][frame])) }
+            }
+            onPeak(peak)
+        }
+        do {
+            // Sample the original session clock AFTER preparation. The visuals
+            // keep running during preparation; audio joins that same timeline.
+            try prepared.start(elapsed: session.elapsedTime(at: .now))
+            engine = prepared
+        } catch {
+            prepared.stop()
+            throw error
+        }
+    }
+
+    func startAmbient(seed: UInt64, startedAt: Date,
+                      onPeak: @escaping @Sendable (Float) -> Void) throws {
+        try Task.checkCancellation()
+        guard !stopped else { throw CancellationError() }
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+        try audioSession.setActive(true)
+        let prepared = try PerformanceSampleEngine(ambientSeed: seed)
+        try Task.checkCancellation()
+        prepared.setVolume(volume)
+        prepared.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { buffer, _ in
+            guard let channels = buffer.floatChannelData else { return }
+            var peak: Float = 0
+            for channel in 0..<Int(buffer.format.channelCount) {
+                for frame in 0..<Int(buffer.frameLength) { peak = max(peak, abs(channels[channel][frame])) }
+            }
+            onPeak(peak)
+        }
+        do {
+            // Derive elapsed after file opening and graph setup. This keeps audio
+            // on the same absolute browsing clock even when preparation is slow.
+            try prepared.start(elapsed: Date().timeIntervalSince(startedAt))
+            engine = prepared
+        } catch {
+            prepared.stop()
+            throw error
+        }
+    }
+
+    func run() async throws {
+        while let engine, !stopped {
+            try Task.checkCancellation()
+            let elapsed = engine.currentElapsed()
+            try engine.update(elapsed: elapsed)
+            if engine.duration.isFinite && elapsed >= engine.duration { stop(); return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func setVolume(_ volume: Float) {
+        self.volume = volume
+        engine?.setVolume(volume)
+    }
+
+    func fadeOut() async {
+        guard let fading = engine else { stop(); return }
+        let relativeLevel = volume > 0 ? fading.engine.mainMixerNode.outputVolume / volume : 0
+        let clock = ContinuousClock()
+        let started = clock.now
+        while engine === fading, !Task.isCancelled {
+            let duration = started.duration(to: clock.now).components
+            let elapsed = Double(duration.seconds) + Double(duration.attoseconds) / 1e18
+            let release = Float(1 - PerformanceEnvelope.smooth(elapsed / 2))
+            fading.engine.mainMixerNode.outputVolume = volume * relativeLevel * release
+            if elapsed >= 2 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        stop()
+    }
+
+    func stop() {
+        stopped = true
+        engine?.stop()
+        engine = nil
     }
 }

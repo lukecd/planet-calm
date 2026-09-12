@@ -1775,6 +1775,32 @@ final class PlanetCalmTests: XCTestCase {
         XCTAssertEqual(synth.outputLevel, 0)
     }
 
+    @MainActor
+    func testSplashStopDuringAudioPreparationCannotReviveOldPlayback() async throws {
+        let synth = PerformanceSynthesizer()
+        defer { synth.stop() }
+        let session = PerformanceSession(duration: .oneMinute,
+            startedAt: Date().addingTimeInterval(-12), randomSeed: 42)
+        let events = SplashMusicDirector.events(for: session)
+        synth.play(session: session, events: events)
+        try await Task.sleep(for: .milliseconds(10))
+        synth.stop()
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertEqual(synth.status, "Sound off")
+        XCTAssertEqual(synth.outputLevel, 0)
+
+        synth.play(session: session, events: events)
+        for _ in 0..<30 {
+            if synth.outputLevel > 0.001 { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertGreaterThan(synth.outputLevel, 0.001, synth.status)
+        synth.fadeOut()
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(synth.status, "Sound off")
+        XCTAssertEqual(synth.outputLevel, 0)
+    }
+
     func testMusicRunnerPauseResumeAndPersistence() throws {
         let start = Date(timeIntervalSince1970: 1_000)
         var session = PerformanceSession(duration: .fiveMinutes, startedAt: start, randomSeed: 42)
@@ -2599,6 +2625,220 @@ final class PlanetCalmTests: XCTestCase {
         XCTAssertTrue(completedExit.bottom.isEmpty)
     }
 
+    func testSplashOverlappingMelodyDoesNotMoveAnExistingPadRipple() {
+        let pad = PerformanceNoteEvent(id: "held-pad", tonalSlot: 2, startBeat: 0,
+            gateBeats: 32, envelope: .init(attackBeats: 3, decayBeats: 2,
+                sustainLevel: 0.72, releaseBeats: 7), isRepeating: false)
+        let melody = PerformanceNoteEvent(id: "new-melody", tonalSlot: 2, startBeat: 18,
+            gateBeats: 1.5, envelope: .init(attackBeats: 0.12, decayBeats: 0.6,
+                sustainLevel: 0.30, releaseBeats: 2.5), role: .melody, isRepeating: false)
+        for step in 0...12 {
+            let beat = 18 + Double(step) / 100
+            let elapsed = beat * SplashPerformanceScore.tempo.secondsPerBeat
+            let held = SplashPerformanceScore.waveMotionSample(for: .waveWarmReveal,
+                performanceElapsed: elapsed, events: [pad])
+            let combined = SplashPerformanceScore.waveMotionSample(for: .waveWarmReveal,
+                performanceElapsed: elapsed, events: [pad, melody])
+            // The new note is at the left edge, outside the held ripple's support.
+            // Its attack must not relocate or erase the ripple already mid-wave.
+            let heldCenter = CGFloat(-0.02 + 1.04 * beat / pad.totalBeats)
+            XCTAssertEqual(combined.packetAmplitude(at: heldCenter),
+                held.packetAmplitude(at: heldCenter), accuracy: 0.000_001,
+                "Existing ripple moved at beat \(beat)")
+        }
+    }
+
+    func testSplashSeededWaveMotionStaysContinuousThroughFirstMinute() {
+        for seed: UInt64 in [650_208, 42, 91_337] {
+            let score = SplashMusicDirector.events(for:
+                PerformanceSession(duration: .fiveMinutes, randomSeed: seed))
+            var previous: [SplashWaveRibbon]?
+            var largestStep: CGFloat = 0
+            var largestStepLocation = ""
+            for frame in 0...3600 {
+                let elapsed = Double(frame) / 60
+                let samples = SplashWaveGenerator.formulas.map {
+                    SplashPerformanceScore.waveMotionSample(for: $0.id,
+                        performanceElapsed: elapsed, events: score)
+                }
+                let scoreBeat = SplashPerformanceScore.scoreBeat(
+                    for: elapsed, tuning: .standard
+                )
+                let resonance = SplashPerformanceScore.melodyResonanceSample(
+                    events: score,
+                    scoreBeat: scoreBeat,
+                    tuning: .standard
+                )
+                let ribbons = SplashWaveGenerator.ribbons(
+                    motionSamples: samples,
+                    resonance: resonance
+                )
+                if let previous {
+                    for wave in ribbons.indices {
+                        for point in ribbons[wave].top.indices {
+                            let step = max(
+                                abs(ribbons[wave].top[point].y - previous[wave].top[point].y),
+                                abs(ribbons[wave].bottom[point].y - previous[wave].bottom[point].y))
+                            if step > largestStep {
+                                largestStep = step
+                                largestStepLocation = "\(elapsed)s wave \(wave)"
+                            }
+                        }
+                    }
+                }
+                previous = ribbons
+            }
+            // Bound one frame's movement to 0.3% of the wave world's height,
+            // including attacks, note overlaps, and the initial foundation handoff.
+            XCTAssertLessThan(largestStep, 0.003, "Seed \(seed): \(largestStep) at \(largestStepLocation)")
+        }
+    }
+
+    func testSplashMelodicPaperResponsePreservesSharedNoteBoundaries() throws {
+        let event = PerformanceNoteEvent(tonalSlot: 2, startBeat: 9, gateBeats: 1.5,
+            envelope: .init(attackBeats: 0.12, decayBeats: 0.6,
+                sustainLevel: 0.3, releaseBeats: 2.5),
+            role: .melody, intensity: 0.4, isRepeating: false)
+        XCTAssertNil(SplashPerformanceScore.waveEnvelopeSample(for: event, scoreBeat: 8.999))
+        XCTAssertEqual(SplashPerformanceScore.waveEnvelopeSample(for: event, scoreBeat: 9)?.value, 0)
+        XCTAssertGreaterThan(try XCTUnwrap(SplashPerformanceScore.waveEnvelopeSample(
+            for: event, scoreBeat: 9.02)).value, 0)
+        XCTAssertEqual(try XCTUnwrap(event.sample(at: 9.12)).value, 1, accuracy: 0.000_001)
+        XCTAssertLessThan(try XCTUnwrap(SplashPerformanceScore.waveEnvelopeSample(
+            for: event, scoreBeat: 9.12)).value, 0.01)
+        XCTAssertNil(SplashPerformanceScore.waveEnvelopeSample(for: event, scoreBeat: event.endBeat))
+    }
+
+    func testSplashMelodyResonanceUsesSharedStartsAndSlowPaperAttack() throws {
+        let event = PerformanceNoteEvent(id: "melody-visual-attack", tonalSlot: 2,
+            startBeat: 10, gateBeats: 1.5,
+            envelope: .init(attackBeats: 0.12, decayBeats: 0.6,
+                sustainLevel: 0.30, releaseBeats: 2.5),
+            role: .melody, intensity: 0.45, isRepeating: false)
+
+        XCTAssertNil(SplashPerformanceScore.melodyResonanceSample(
+            events: [event], scoreBeat: 9.999, tuning: .standard
+        ))
+        let onset = try XCTUnwrap(SplashPerformanceScore.melodyResonanceSample(
+            events: [event], scoreBeat: event.startBeat, tuning: .standard
+        ))
+        XCTAssertEqual(onset.contributions.count, 1)
+        XCTAssertEqual(onset.contributions[0].center,
+            SplashWaveResonanceSample.melodicCenterRange.lowerBound,
+            accuracy: 0.000_001)
+
+        let early = try XCTUnwrap(SplashPerformanceScore.melodyResonanceSample(
+            events: [event], scoreBeat: event.startBeat + 0.05, tuning: .standard
+        ))
+        // The visual attack is approximately 0.9 seconds, so it must not copy
+        // the source note's 120 ms audio attack.
+        XCTAssertLessThan(early.contributions[0].strength, 0.02)
+        XCTAssertGreaterThan(early.contributions[0].strength, 0)
+        XCTAssertEqual(
+            early.contributions[0].center,
+            SplashWaveResonanceSample.melodicCenterRange.lowerBound
+                + (SplashWaveResonanceSample.melodicCenterRange.upperBound
+                    - SplashWaveResonanceSample.melodicCenterRange.lowerBound)
+                * early.contributions[0].progress,
+            accuracy: 0.000_001
+        )
+        let frameBeat = (1.0 / 120.0) / SplashPerformanceScore.tempo.secondsPerBeat
+        let smoothA = try XCTUnwrap(SplashPerformanceScore.melodyResonanceSample(
+            events: [event], scoreBeat: event.startBeat + 0.10, tuning: .standard
+        ))
+        let smoothB = try XCTUnwrap(SplashPerformanceScore.melodyResonanceSample(
+            events: [event], scoreBeat: event.startBeat + 0.10 + frameBeat,
+            tuning: .standard
+        ))
+        let smoothX = smoothA.contributions[0].center
+        XCTAssertLessThan(
+            abs(smoothB.verticalShift(at: smoothX, waveIndex: event.tonalSlot)
+                - smoothA.verticalShift(at: smoothX, waveIndex: event.tonalSlot)),
+            0.0002
+        )
+        XCTAssertNil(SplashPerformanceScore.melodyResonanceSample(
+            events: [event], scoreBeat: event.endBeat, tuning: .standard
+        ))
+    }
+
+    func testSplashMelodyResonanceAccumulatesOverlappingNotesWithBounds() throws {
+        let envelope = PerformanceEnvelope(attackBeats: 0.12, decayBeats: 0.6,
+            sustainLevel: 0.30, releaseBeats: 2.5)
+        let first = PerformanceNoteEvent(id: "melody-first", tonalSlot: 2,
+            startBeat: 10, gateBeats: 1.5, envelope: envelope,
+            role: .melody, intensity: 0.48, isRepeating: false)
+        let second = PerformanceNoteEvent(id: "melody-second", tonalSlot: 2,
+            startBeat: 10.45, gateBeats: 1.5, envelope: envelope,
+            role: .melody, intensity: 0.48, isRepeating: false)
+        let beat = 10.8
+
+        let combined = try XCTUnwrap(SplashPerformanceScore.melodyResonanceSample(
+            events: [first, second], scoreBeat: beat, tuning: .standard
+        ))
+        XCTAssertEqual(combined.contributions.count, 2)
+        XCTAssertGreaterThan(combined.contributions[0].center,
+            combined.contributions[1].center)
+
+        let firstOnly = try XCTUnwrap(SplashPerformanceScore.melodyResonanceSample(
+            events: [first], scoreBeat: beat, tuning: .standard
+        ))
+        let firstCenter = combined.contributions[0].center
+        XCTAssertGreaterThan(
+            abs(combined.verticalShift(at: firstCenter, waveIndex: 2)),
+            abs(firstOnly.verticalShift(at: firstCenter, waveIndex: 2))
+        )
+        let secondOnset = try XCTUnwrap(SplashPerformanceScore.melodyResonanceSample(
+            events: [first, second], scoreBeat: second.startBeat, tuning: .standard
+        ))
+        XCTAssertEqual(secondOnset.contributions.count, 2)
+        XCTAssertEqual(secondOnset.contributions[1].strength, 0, accuracy: 0.000_001)
+        XCTAssertEqual(secondOnset.seamOpacity(for: secondOnset.contributions[1]), 0,
+            accuracy: 0.000_001)
+        XCTAssertGreaterThan(secondOnset.seamOpacity(for: 2), 0)
+        XCTAssertLessThanOrEqual(
+            abs(combined.verticalShift(at: firstCenter, waveIndex: 2)), 0.034
+        )
+        XCTAssertLessThanOrEqual(
+            combined.seamOpacity(for: 2), 0.38 * Double(SplashWaveResonanceSample.maximumSeamStrength)
+        )
+        XCTAssertEqual(combined.seamContributions(for: 4), [])
+    }
+
+    func testSplashGeneratedMelodyResonanceIsCentralAndReduceMotionSafe() {
+        let events = SplashMusicDirector.events(for: .init(
+            duration: .fiveMinutes, randomSeed: 42
+        ))
+        let melody = events.filter { $0.role == .melody }
+        XCTAssertFalse(melody.isEmpty)
+        let event = melody[0]
+        let sample = SplashPerformanceScore.melodyResonanceSample(
+            events: events,
+            scoreBeat: event.startBeat + 0.6,
+            tuning: .standard
+        )
+        XCTAssertNotNil(sample)
+        XCTAssertTrue(sample?.contributions.allSatisfy {
+            SplashWaveResonanceSample.melodicCenterRange.contains($0.center)
+        } == true)
+        XCTAssertNil(SplashPerformanceScore.melodyResonanceSample(
+            events: events,
+            scoreBeat: event.startBeat + 0.6,
+            tuning: .standard,
+            reduceMotion: true
+        ))
+    }
+
+    func testSplashFirstPadCannotIntroduceAnUnrelatedFoundation() {
+        let pad = PerformanceNoteEvent(tonalSlot: 2, startBeat: 4, gateBeats: 16,
+            envelope: SplashPerformanceScore.noteEnvelope, isRepeating: false)
+        for beat in [3.999, 4.0] {
+            let sample = SplashPerformanceScore.waveMotionSample(for: .waveWarmReveal,
+                performanceElapsed: beat * SplashPerformanceScore.tempo.secondsPerBeat, events: [pad])
+            XCTAssertEqual(sample.bedAmplitude, 0, accuracy: 0.000_001)
+            XCTAssertEqual(sample.amplitude, 0, accuracy: 0.000_001)
+        }
+    }
+
     func testSplashNotePacketsAreDeterministicLocalizedAndRestrained() {
         let activeElapsed = SplashMotionTiming.noteScoreStartTime
             + 5 * SplashPerformanceScore.tempo.secondsPerBeat
@@ -2616,9 +2856,8 @@ final class PlanetCalmTests: XCTestCase {
         let packetOnlySamples = motionSamples.map {
             SplashWaveMotionSample(
                 phase: $0.phase,
-                amplitude: $0.amplitude,
-                packetCenter: $0.packetCenter,
-                packetHalfWidth: $0.packetHalfWidth
+                packets: $0.packets,
+                packetLimit: $0.packetLimit
             )
         }
 
@@ -2652,11 +2891,7 @@ final class PlanetCalmTests: XCTestCase {
                     changedSamples += 1
                 }
 
-                let packetGain = SplashWaveGenerator.travelingPacketGain(
-                    at: x,
-                    center: packetOnlySamples[index].packetCenter,
-                    halfWidth: packetOnlySamples[index].packetHalfWidth
-                )
+                let packetGain = packetOnlySamples[index].packetAmplitude(at: x)
                 if packetGain == 0 {
                     XCTAssertEqual(topDelta, 0, accuracy: 0.000_001)
                     XCTAssertEqual(bottomDelta, 0, accuracy: 0.000_001)
@@ -2688,7 +2923,7 @@ final class PlanetCalmTests: XCTestCase {
                 SplashMotionTiming.noteScoreStartTime
                 + 6 * SplashPerformanceScore.tempo.secondsPerBeat
         )
-        XCTAssertGreaterThan(later.packetCenter, early.packetCenter)
+        XCTAssertGreaterThan(later.packets[0].center, early.packets[0].center)
     }
 
     func testSplashLivingMotionIsPerceptibleOverOneSecond() {
@@ -3720,5 +3955,349 @@ final class PlanetCalmTests: XCTestCase {
             velocity += accelerationMetersPerSecondSquared * scenePointsPerMeter * timeStep
         }
         return velocity
+    }
+}
+
+extension PlanetCalmTests {
+    func testSplashAmbientScoreIsDeterministicAndChunkInvariant() {
+        let seed: UInt64 = 650_208
+        let whole = SplashAmbientScore.events(from: 0, through: 1_200, seed: seed)
+        let chunks = stride(from: 0.0, to: 1_200, by: 120).flatMap { start in
+            SplashAmbientScore.events(from: start, through: min(start + 120, 1_200), seed: seed)
+        }
+        XCTAssertEqual(whole, chunks)
+        XCTAssertEqual(whole, SplashAmbientScore.events(from: 0, through: 1_200, seed: seed))
+        XCTAssertNotEqual(whole, SplashAmbientScore.events(from: 0, through: 1_200, seed: seed + 1))
+        XCTAssertEqual(Set(whole.map(\.id)).count, whole.count)
+    }
+
+    func testSplashAmbientScoreCarriesTailsAcrossLightCycleSeam() {
+        let seam = SplashAmbientScore.events(from: 580, through: 600, seed: 42)
+        XCTAssertTrue(seam.contains { $0.role == .drone && $0.startBeat * SplashSamplePlan.secondsPerBeat < 600 && $0.endBeat * SplashSamplePlan.secondsPerBeat > 600 })
+        let next = SplashAmbientScore.events(from: 600, through: 620, seed: 42)
+        XCTAssertTrue(next.contains { $0.startBeat * SplashSamplePlan.secondsPerBeat >= 600 })
+    }
+
+    func testSplashAmbientMappedEventsAreChunkInvariant() {
+        let durations = Dictionary(uniqueKeysWithValues: PerformanceAudioAssetCatalog.all.map {
+            ($0.fileName, 60.0)
+        })
+        let whole = SplashSamplePlan.ambientEvents(from: 0, through: 180,
+            seed: 650_208, durations: durations)
+        var split = SplashSamplePlan.ambientEvents(from: 0, through: 37, seed: 650_208, durations: durations)
+        split += SplashSamplePlan.ambientEvents(from: 37, through: 91, seed: 650_208, durations: durations)
+        split += SplashSamplePlan.ambientEvents(from: 91, through: 180, seed: 650_208, durations: durations)
+        XCTAssertEqual(whole, split)
+        let seam = SplashSamplePlan.ambientEvents(from: 580, through: 620,
+            seed: 42, durations: durations)
+        XCTAssertTrue(seam.contains { $0.start < 600 && $0.end > 600 })
+        XCTAssertTrue(seam.contains { $0.start >= 600 })
+    }
+
+    func testSplashAmbientLightAndPadFilterStayBounded() {
+        let values = stride(from: 0.0, through: 1_200, by: 30).map { elapsed in
+            (PerformanceSampleEngine.ambientGain(at: elapsed),
+             PerformanceSampleEngine.ambientPadFilterFrequency(at: elapsed))
+        }
+        XCTAssertGreaterThanOrEqual(values.map { $0.0 }.min() ?? -1, 0.70)
+        XCTAssertLessThanOrEqual(values.map { $0.0 }.max() ?? 2, 1.0)
+        XCTAssertGreaterThanOrEqual(values.map { $0.1 }.min() ?? -1, 6_500 - 0.001)
+        XCTAssertLessThanOrEqual(values.map { $0.1 }.max() ?? 12_000, 11_000 + 0.001)
+        XCTAssertGreaterThan(PerformanceSampleEngine.ambientPadFilterFrequency(at: 300),
+                             PerformanceSampleEngine.ambientPadFilterFrequency(at: 0))
+    }
+
+    func testSplashRecordedPlanIsSeededAndSharesVisualOnsets() {
+        let durations = Dictionary(uniqueKeysWithValues: PerformanceAudioAssetCatalog.all.map { ($0.fileName, 60.0) })
+        var lowered = 0
+        var drones = 0
+        for seed in UInt64(1)...100 {
+            let session = PerformanceSession(duration: .fiveMinutes, randomSeed: seed)
+            let score = SplashMusicDirector.events(for: session)
+            let events = SplashSamplePlan.events(session: session, score: score, durations: durations)
+            XCTAssertEqual(events, SplashSamplePlan.events(session: session, score: score, durations: durations))
+            XCTAssertEqual(events.count, Set(events.map(\.id)).count)
+            let byID = Dictionary(uniqueKeysWithValues: events.map { ($0.id, $0) })
+            for note in score {
+                let audio = byID[note.id]
+                XCTAssertNotNil(audio, note.id)
+                XCTAssertEqual(audio?.start ?? -1, note.startBeat * SplashSamplePlan.secondsPerBeat, accuracy: 0.000001)
+            }
+            for event in events {
+                XCTAssertLessThanOrEqual(event.end, session.duration.timeInterval)
+                XCTAssertEqual(event.gain(at: event.end), 0)
+                XCTAssertEqual(event.gain(at: event.start - 0.01), 0)
+                if event.asset.kind == .bassDrone {
+                    drones += 1
+                    if event.pitchCents == -1200 { lowered += 1 }
+                }
+            }
+            let sections = SplashSamplePlan.melodySections(duration: 300, seed: seed)
+            XCTAssertEqual(Set(sections.prefix(3).map(\.instrument)).count, 3)
+            for (a, b) in zip(sections, sections.dropFirst()) {
+                XCTAssertNotEqual(a.instrument, b.instrument)
+                XCTAssertTrue((48...72).contains(b.start - a.start))
+            }
+            for boundary in [100.0, 200.0] {
+                XCTAssertTrue(events.contains { $0.asset.kind == .pad && $0.start < boundary && $0.end > boundary + 1 })
+            }
+        }
+        XCTAssertTrue((0.15...0.25).contains(Double(lowered) / Double(drones)))
+        let a = PerformanceSession(duration: .fiveMinutes, randomSeed: 42)
+        let b = PerformanceSession(duration: .fiveMinutes, randomSeed: 43)
+        XCTAssertNotEqual(SplashSamplePlan.events(session: a, score: SplashMusicDirector.events(for: a), durations: durations),
+                          SplashSamplePlan.events(session: b, score: SplashMusicDirector.events(for: b), durations: durations))
+    }
+
+    @MainActor
+    func testSplashRecordedCompositionFullLengthAndLevels() throws {
+        for seed: UInt64 in [650_208, 42, 91_337] {
+            let session = PerformanceSession(duration: .fiveMinutes, randomSeed: seed)
+            let playback = try PerformanceSampleEngine(session: session, score: SplashMusicDirector.events(for: session))
+            defer { playback.stop() }
+            playback.setVolume(1)
+            try playback.start(elapsed: 0, offline: true)
+            let engine = playback.engine
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: 480))
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("splash-qa-\(seed).wav")
+            let file = try AVAudioFile(forWriting: url, settings: engine.manualRenderingFormat.settings)
+            var peak: Float = 0
+            var energy = 0.0
+            var stereoDifference = 0.0
+            var minuteEnergy = [Double](repeating: 0, count: 5)
+            var quietBlocks = 0
+            var longestQuiet = 0
+            let totalFrames: Int64 = 300 * 48_000
+            var retries = 0
+            while engine.manualRenderingSampleTime < totalFrames {
+                let frame = engine.manualRenderingSampleTime
+                let elapsed = Double(frame) / 48_000
+                try playback.update(elapsed: elapsed)
+                let status = try engine.renderOffline(480, to: buffer)
+                if status == .cannotDoInCurrentContext {
+                    retries += 1
+                    guard retries < 1000 else { throw PerformanceSampleEngine.Failure.renderFailed }
+                    continue
+                }
+                guard status == .success else { throw PerformanceSampleEngine.Failure.renderFailed }
+                retries = 0
+                try file.write(from: buffer)
+                let channels = try XCTUnwrap(buffer.floatChannelData)
+                var blockEnergy = 0.0
+                for index in 0..<Int(buffer.frameLength) {
+                    let left = channels[0][index], right = channels[1][index]
+                    guard left.isFinite, right.isFinite else { XCTFail("Non-finite audio"); return }
+                    peak = max(peak, abs(left), abs(right))
+                    blockEnergy += Double(left * left + right * right) / 2
+                    stereoDifference += Double((left - right) * (left - right))
+                }
+                energy += blockEnergy
+                minuteEnergy[min(4, Int(elapsed / 60))] += blockEnergy
+                if elapsed > 5 && elapsed < 290 {
+                    quietBlocks = blockEnergy / Double(buffer.frameLength) < 1e-9 ? quietBlocks + 1 : 0
+                    longestQuiet = max(longestQuiet, quietBlocks)
+                }
+            }
+            XCTAssertGreaterThan(peak, 0.01)
+            XCTAssertLessThan(peak, 0.9, "Seed \(seed) is too close to clipping at full volume")
+            XCTAssertGreaterThan(stereoDifference / Double(totalFrames), 1e-7)
+            XCTAssertLessThan(longestQuiet, 50, "Unexpected silence longer than half a second")
+            XCTAssertEqual(playback.scheduledCount, playback.events.count)
+            XCTAssertLessThanOrEqual(playback.voiceCount, 48)
+            let minuteDB = minuteEnergy.map { 10 * log10(max($0 / (60 * 48_000), 1e-15)) }
+            print("SPLASH QA seed=\(seed) peakDB=\(20 * log10(peak)) rmsDB=\(10 * log10(energy / Double(totalFrames))) minutes=\(minuteDB) voices=\(playback.voiceCount) file=\(url.path)")
+        }
+    }
+
+    @MainActor
+    func testSplashRecordedResumeDoesNotReplayMissedMelody() throws {
+        let session = PerformanceSession(duration: .fiveMinutes, randomSeed: 42)
+        let playback = try PerformanceSampleEngine(session: session, score: SplashMusicDirector.events(for: session))
+        defer { playback.stop() }
+        try playback.start(elapsed: 150, offline: true)
+        let expected = playback.events.filter {
+            $0.end > 150 && $0.start <= 150.25 && ($0.start >= 149.98 || $0.resumesAfterInterruption)
+        }
+        XCTAssertEqual(playback.scheduledCount, expected.count)
+    }
+}
+
+extension PlanetCalmTests {
+    @MainActor
+    func testSplashAmbientEngineRendersThroughNightBoundaryWithBoundedStereoVoices() throws {
+        for seed: UInt64 in [650_208, 42] {
+            let playback = try PerformanceSampleEngine(ambientSeed: seed)
+            defer { playback.stop() }
+            playback.setVolume(1)
+            try playback.start(elapsed: 0, offline: true)
+            let engine = playback.engine
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: 480))
+            XCTAssertEqual(buffer.format.channelCount, 2)
+            let totalFrames: Int64 = 660 * 48_000
+            var peak: Float = 0
+            var stereoEnergy = 0.0
+            var quietBlocks = 0
+            var maximumQuietBlocks = 0
+            var maximumQueue = 0
+            var retries = 0
+            var boundaryEnergy = 0.0
+            while engine.manualRenderingSampleTime < totalFrames {
+                let elapsed = Double(engine.manualRenderingSampleTime) / 48_000
+                try playback.update(elapsed: elapsed)
+                maximumQueue = max(maximumQueue, playback.events.count)
+                let status = try engine.renderOffline(480, to: buffer)
+                if status == .cannotDoInCurrentContext {
+                    retries += 1
+                    guard retries < 1_000 else { throw PerformanceSampleEngine.Failure.renderFailed }
+                    continue
+                }
+                guard status == .success else { throw PerformanceSampleEngine.Failure.renderFailed }
+                retries = 0
+                let channels = try XCTUnwrap(buffer.floatChannelData)
+                var energy = 0.0
+                for frame in 0..<Int(buffer.frameLength) {
+                    let left = channels[0][frame], right = channels[1][frame]
+                    guard left.isFinite, right.isFinite else { XCTFail("Non-finite ambient output"); return }
+                    peak = max(peak, abs(left), abs(right))
+                    energy += Double(left * left + right * right) / 2
+                    stereoEnergy += Double((left - right) * (left - right))
+                }
+                if elapsed > 8 {
+                    quietBlocks = energy / Double(buffer.frameLength) < 1e-9 ? quietBlocks + 1 : 0
+                    maximumQuietBlocks = max(maximumQuietBlocks, quietBlocks)
+                }
+                if (599...601).contains(elapsed) { boundaryEnergy += energy }
+            }
+            XCTAssertGreaterThan(peak, 0.01)
+            XCTAssertLessThan(peak, 0.9)
+            XCTAssertGreaterThan(stereoEnergy / Double(totalFrames), 1e-7)
+            XCTAssertGreaterThan(boundaryEnergy / (2 * 48_000), 1e-9)
+            XCTAssertLessThan(maximumQuietBlocks, 50, "Unexpected half-second gap")
+            XCTAssertLessThan(maximumQueue, 150, "Rolling score must release past events")
+            XCTAssertLessThanOrEqual(playback.voiceCount, 48)
+            print("AMBIENT QA seed=\(seed) duration=660 peakDB=\(20 * log10(peak)) queue=\(maximumQueue) voices=\(playback.voiceCount) maxQuietBlocks=\(maximumQuietBlocks)")
+        }
+    }
+}
+
+extension PlanetCalmTests {
+    func testSplashAmbientMappingAndNightDensityAcrossMultipleCycles() {
+        let durations = Dictionary(uniqueKeysWithValues: PerformanceAudioAssetCatalog.all.map { ($0.fileName, 60.0) })
+        for seed: UInt64 in 0..<25 {
+            let score = SplashAmbientScore.events(from: 0, through: 1_800, seed: seed)
+            let audio = SplashSamplePlan.ambientEvents(from: 0, through: 1_800, seed: seed, durations: durations)
+            let byID = Dictionary(uniqueKeysWithValues: audio.map { ($0.id, $0) })
+            for note in score {
+                XCTAssertNotNil(byID[note.id], note.id)
+                XCTAssertEqual(byID[note.id]?.start ?? -1, note.startBeat * SplashSamplePlan.secondsPerBeat, accuracy: 0.000001)
+            }
+            XCTAssertEqual(audio.filter { $0.asset.kind == .bookend }.map(\.id), ["ambient-intro"])
+            XCTAssertTrue(audio.contains { $0.asset.kind == .transition })
+            XCTAssertTrue(audio.contains { $0.asset.kind == .atmosphere })
+            let night = score.filter {
+                let t = ($0.startBeat * SplashSamplePlan.secondsPerBeat).truncatingRemainder(dividingBy: 600)
+                return t < 60 || t >= 540
+            }
+            let day = score.filter {
+                let t = ($0.startBeat * SplashSamplePlan.secondsPerBeat).truncatingRemainder(dividingBy: 600)
+                return t >= 240 && t < 360
+            }
+            XCTAssertLessThan(night.filter { $0.role == .melody }.count, day.filter { $0.role == .melody }.count)
+            XCTAssertLessThan(night.filter { $0.role == .pad }.count, day.filter { $0.role == .pad }.count)
+        }
+    }
+}
+
+extension PlanetCalmTests {
+    func testSplashAmbientHarmonyPaletteStaysNaturalAndSharesTransitions() {
+        let naturalSlots = Set(0...7)
+        for seed: UInt64 in [42, 650_208, 91_337] {
+            let harmonies = (0..<18).map { SplashAmbientScore.harmony(at: $0, seed: seed) }
+            XCTAssertGreaterThanOrEqual(Set(harmonies.map { $0 }).count, 3)
+            for chord in harmonies {
+                XCTAssertTrue(Set(chord).isSubset(of: naturalSlots))
+                XCTAssertTrue(chord.contains(0), "F must remain the harmonic anchor")
+                XCTAssertTrue(chord.contains(4), "Upper C must carry between voicings")
+            }
+            for block in stride(from: 3, to: 18, by: 3) {
+                XCTAssertFalse(Set(harmonies[block - 1]).intersection(harmonies[block]).isEmpty)
+                let movement = zip(harmonies[block - 1], harmonies[block]).map { abs(SplashAmbientScore.slotSemitones[$0] - SplashAmbientScore.slotSemitones[$1]) }
+                XCTAssertLessThanOrEqual(movement.max() ?? .max, 3,
+                    "Adjacent voicing positions should move by only a few semitones")
+            }
+
+            let events = SplashAmbientScore.events(from: 0, through: 600, seed: seed)
+            let pads = events.filter { $0.role == .pad }
+            XCTAssertTrue(pads.allSatisfy { $0.octaveOffset == 0 })
+            XCTAssertTrue(events.filter { $0.role == .melody }.allSatisfy {
+                SplashAmbientScore.supportedMelodySlots.contains($0.tonalSlot)
+            })
+            for block in 3..<18 where block % 3 == 0 {
+                let outgoing = SplashAmbientScore.harmony(at: block - 1, seed: seed)
+                let incoming = SplashAmbientScore.harmony(at: block, seed: seed)
+                let firstPad = pads.first { $0.id == "ambient-pad-\(block)-0" }
+                let previousBase = Double(block - 1) * SplashAmbientScore.blockDuration
+                let previousCount = SplashAmbientScore.lightProgress(at: previousBase) < 0.4 ? 3 : 4
+                let lastPad = pads.first { $0.id == "ambient-pad-\(block - 1)-\(previousCount - 1)" }
+                XCTAssertNotNil(firstPad)
+                XCTAssertNotNil(lastPad)
+                XCTAssertEqual(lastPad?.tonalSlot, 4, "Upper C carries through the boundary")
+                XCTAssertTrue(Set(outgoing).intersection(incoming).contains(lastPad?.tonalSlot ?? -1))
+                XCTAssertNotEqual(firstPad?.tonalSlot, 4, "Let the shared C ring before retriggering it")
+                let lastEnd = ((lastPad?.startBeat ?? 0)
+                    + (lastPad?.gateBeats ?? 0)
+                    + (lastPad?.envelope.releaseBeats ?? 0)) * SplashSamplePlan.secondsPerBeat
+                let firstStart = (firstPad?.startBeat ?? .greatestFiniteMagnitude)
+                    * SplashSamplePlan.secondsPerBeat
+                XCTAssertLessThan(firstStart, lastEnd,
+                    "The outgoing shared pad must retain its release into the next block")
+            }
+        }
+    }
+
+    func testSplashAmbientHarmonyDoesNotIncreaseBlockDensity() {
+        for seed: UInt64 in [42, 650_208, 91_337] {
+            let events = SplashAmbientScore.events(from: 0, through: 1_800, seed: seed)
+            for block in 0..<61 {
+                let start = Double(block) * SplashAmbientScore.blockDuration
+                let end = start + SplashAmbientScore.blockDuration
+                let pads = events.filter {
+                    $0.role == .pad && $0.startBeat * SplashSamplePlan.secondsPerBeat >= start
+                        && $0.startBeat * SplashSamplePlan.secondsPerBeat < end
+                }
+                XCTAssertLessThanOrEqual(pads.count, 4)
+            }
+        }
+    }
+
+    func testSplashAmbientVisualWindowRefreshIsContinuousThroughNightBoundary() {
+        for seed: UInt64 in [42, 650_208] {
+            var score: [PerformanceNoteEvent] = []
+            var previous: [SplashWaveRibbon]?
+            var maximumStep: CGFloat = 0
+            for frame in 0...2400 {
+                let elapsed = 580 + Double(frame) / 60
+                if frame % 600 == 0 {
+                    score = SplashAmbientScore.events(from: elapsed - 60, through: elapsed + 30, seed: seed)
+                }
+                let motion = SplashWaveGenerator.formulas.map {
+                    SplashPerformanceScore.waveMotionSample(for: $0.id, performanceElapsed: elapsed, events: score)
+                }
+                let resonance = SplashPerformanceScore.melodyResonanceSample(events: score,
+                    scoreBeat: elapsed / SplashSamplePlan.secondsPerBeat, tuning: .standard)
+                let ribbons = SplashWaveGenerator.ribbons(motionSamples: motion, resonance: resonance)
+                if let previous {
+                    for wave in ribbons.indices {
+                        for point in ribbons[wave].top.indices {
+                            maximumStep = max(maximumStep,
+                                abs(ribbons[wave].top[point].y - previous[wave].top[point].y),
+                                abs(ribbons[wave].bottom[point].y - previous[wave].bottom[point].y))
+                        }
+                    }
+                }
+                previous = ribbons
+            }
+            XCTAssertLessThan(maximumStep, 0.003, "Refreshing the score must not jump a wave: \(seed)")
+        }
     }
 }

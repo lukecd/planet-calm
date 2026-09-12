@@ -1,6 +1,6 @@
 # Generative Performance System
 
-**Status:** live splash integration with temporary synthesized audio · **Updated:** 2026-09-10
+**Status:** live splash integration with recorded stereo audio · **Updated:** 2026-09-12
 
 One authoritative transport and one seeded score drive narrative motion and sound.
 The splash is the first integrated consumer. Autumn now has an integrated branch
@@ -17,7 +17,9 @@ migrated. See [Autumn branch checkpoint](autumn-branch-checkpoint.md).
 | `SplashPerformancePlan` | Resolve the semantic sound source at each event's onset; sample atmosphere from the same session. |
 | `SplashAtmosphereDirector` | Progress-to-pool weights, semantic palette, and renderer-independent sunrise state. |
 | `SplashPerformanceScore` | Shared tempo, note envelopes, scheduled-event queries, and visual sampling. Its old repeating score is a calibration fixture only. |
-| `PerformanceSynthesizer` | Temporary native audio consumer of the same event plan. It does not invent note timing or random choices. |
+| `SplashSamplePlan` | Resolve score events to recordings, sustained instrument sections, seeded dynamics, and accents. |
+| `PerformanceSampleEngine` | Bounded streaming stereo voices, audio-clock scheduling, and offline validation using the same graph. |
+| `PerformanceSynthesizer` | Existing UI facade for recorded playback, output controls, metering, and lifecycle. |
 | `SplashScreenView` | Connect transport, plan, renderer, audition, session lifetime, settings persistence, and the nonblocking performance desk. |
 | `StoryPlayer` / `StoryDirector` / `StoryMoment` | Existing focus-story adapters and visual/audio moment contract. Preserve them when adapting other scenes. |
 
@@ -36,14 +38,14 @@ opens the selected story's setup. A handwritten duration / Tap to begin group at
 top starts a fresh session with a fresh seed, then fades into a large handwritten
 countdown in the same position. End session opens the Exit
 confirmation. No public pause, replay, or restore exists. The development
-runner accordion retains restart, pause/resume, end, and synth audition.
+runner accordion retains restart, pause/resume, end, and recorded-instrument audition.
 
 The non-blocking Scene settings panel locks duration while a session exists. Volume
 and mute stay live and only affect `PerformanceSynthesizer` mixer output; they do not
 pause transport, discard scheduled notes, or reset the story. Scene audio settings
 are in-memory UI state, not a new persistence service. Autumn currently has cue
 intents but no playable soundtrack, so settings explicitly report its silent status.
-Only Splash currently invokes synth playback. Preferred duration and app-wide audio
+Only Splash currently invokes recorded playback. Preferred duration and app-wide audio
 preferences are deferred.
 
 Elapsed time is clamped to the duration and is calculated as:
@@ -69,8 +71,10 @@ audition without pausing the timer. Background audio playback is not enabled.
 
 An ended/completed run has no future notes. Completion holds the final scene with
 Complete / Return to stories returning to the chooser; it never offers replay.
-The app does not start another musical cycle automatically. Calibration mode remains
-available when no finite run is active.
+Finite sessions do not start another musical cycle automatically. Browsing ambience is
+separate from a focus session: it continues through Home, Settings, Stats, and Stories,
+without creating Health or history records. Starting a meditation stops browsing
+ambience; returning Home afterward begins a fresh ambient timeline.
 
 While running, the speed and light calibration sliders are disabled. The visual Amount
 control can still scale wave displacement without changing any musical time or envelope.
@@ -121,72 +125,103 @@ wave assignment, and scheduled starts/lengths. Its frozen/fast-review view is in
 only; it does not seek playback. Structural diagnostics are cached per plan rather
 than recomputed for every animation frame.
 
-## Sound pools and visual evolution
+## Recorded Splash instruments
 
-Night, Twilight, and Daylight are the three semantic pools. For progress p:
+Production resources live in `PlanetCalm/Assets/Audio/Stories/Splash`, grouped into
+Pads, Bass, Melody, Transitions, Atmosphere, and Bookends. All 47 imports are lossless
+ALAC in M4A containers, stereo, 48 kHz. Ableton originals stay in the audio project.
+Filename octave labels are the original export convention; a prominent harmonic is
+not evidence that the MIDI note is wrong. The two bass timbres intentionally retain
+the different sounding registers approved by the composer.
 
-- 0…0.5: weights are Night = 1−2p, Twilight = 2p, Daylight = 0.
-- 0.5…1: weights are Night = 0, Twilight = 2−2p, Daylight = 2p−1.
+Pad banks advance in thirds of the selected duration. A note holds its bank through
+release, so notes from both banks overlap around a boundary. Visual pad source labels
+use the same boundary calculation. Melody instruments use a seeded shuffled bag,
+remaining for 48–72 seconds and changing only between phrases. Handpan phrases have
+3–5 neighboring notes, spaced 1.5 beats apart, with alternating gentle left/right
+balance. Chimes retain their sparse authored strikes and cyber chords retain their
+baked texture. The shared handpan effects are a quiet tempo-related delay and hall
+reverb; the other recordings receive no additional reverb or delay.
 
-Each event deterministically selects its pool from its onset progress, run seed, and
-event identity. It holds that source through its release. Long overlaps therefore
-blend banks naturally; a held note is never replaced at a pool boundary.
+Bass alternates its two recordings, with a seeded 20% chance of an octave-down
+pitch shift on each event. TimePitch preserves playback duration. Note dynamics
+vary by approximately −1.5…+1 dB. This varies amplitude, not the timbre of a
+velocity-sensitive instrument: only one rendered velocity layer was supplied.
 
-The same progress drives the approved native Metal sunrise: sun rise, cloud lighting,
-atmospheric scattering, and paper-color treatment. Do not replace it with an even
-whole-screen RGB fade. See [Splash sunrise model](../design/splash-sunrise-model.md).
-Cloud artwork and its ray-blocking shapes share geometry and depth.
+The catalog records the Ableton faders. The runtime additionally trims pad banks by
+−3/+7/+6 dB to reduce the measured level drop between banks. Rainstick 1 has an
+18 dB catalog correction for its unusually quiet source; both rainsticks receive a
+further gentle −6…−4 dB trim in the mix. These are reversible playback settings,
+not normalization of the source files. Intro/outro frame a finite run; one rainstick
+plays at each pad transition; occasional koshi accents leave space around those
+transitions. A planned finite ending fades the complete output, including effects, over ten seconds.
 
-## Temporary audio implementation
+## Playback and verification
 
-The audition uses native AVAudioEngine and AVAudioSourceNode, not JavaScript, MIDI
-sent to another app, bundled samples, or a second transport. Immutable prepared voices
-retain the canonical score event and selected semantic source key.
+The same finite score event IDs and absolute start beats drive waves and recorded
+notes. Accents/bookends are audio-only texture, not extra wave triggers. Recorded
+melodies preserve their natural tails beyond the short visual note envelope. Pads
+and drones follow their scheduled gate/release lengths using gradual gain envelopes.
+Overlapping notes keep independent traveling wave packets. Their local strengths
+combine within a fixed motion budget; a new attack cannot move an existing packet.
+Percussive notes begin their visual response at the shared onset, but the paper
+builds over up to 0.9 seconds at the note's intensity instead of snapping to the
+instrument's short attack. Gate/release endpoints stay shared. Only waves with an
+existing ambient foundation hand it off when their first note arrives.
+Generated melody notes also drive the paper-edge highlight and localized lift.
+Each note keeps its own contribution through overlaps, using the same gentle
+visual attack and shared score onset. Travel stays in the central portion of
+the wave world visible in portrait. Reduce Motion suppresses these accents.
 
-The source callback maps the audio host timestamp to session elapsed seconds using
-one start anchor; it samples only voices intersecting the requested audio block.
-Audio callbacks are explicitly sendable and do not inherit main-actor isolation.
-They perform no file I/O, random selection, or score mutation. A mixer tap reports
-actual output level to the debug desk, so a successful engine start is not mistaken
-for nonzero output.
+`AVAudioPlayerNode` streams segments instead of loading the full sample bank into
+RAM. A bounded pool is sized to the score's maximum simultaneous voices, including
+lookahead. A dedicated audio actor prepares the graph, opens files, and runs the
+10 ms control task off the UI actor. It queues 250 ms ahead; note onsets are
+scheduled with `AVAudioTime`, not fired by that task's tick. Playback projects the
+same session elapsed time onto the host audio clock, accounting for engine startup.
+Background audio remains disabled. Returning seeks held pads/drones into their
+current source positions and skips missed melodic attacks and accents. Mute/volume
+only affect output and never regenerate the score.
 
-The drone and pads use quiet harmonic synthesis with a slow spectral-tilt modulation;
-the melodic voice has decaying bell-like partials. Pool choices alter harmonic
-brightness. Gain is conservative and output is soft-limited. Resume/unmute has a
-short click-prevention ramp; pause/end fades output briefly. These are audition
-instruments, not an assertion that the final music is approved.
+Offline tests use this same engine graph and scheduling path. They render three
+complete five-minute seeds at full output, verify finite samples, stereo energy,
+headroom, absence of unintended silence, and complete event scheduling. Plan tests
+cover shared visual/audio onsets, seed determinism and variation, instrument dwell,
+bank overlap, and the bass transposition distribution. Existing score-continuity
+and live-output tests also run. Musical balance still needs the composer's live
+listening judgment; numerical tests cannot establish whether a piece feels calming.
 
-The app uses an ambient, mixing audio session and respects silent mode. Focus
-stories retain audio-cue data but are not wired to this splash audition. The unused
-silent dispatcher has been removed; it is not a second playback service to extend.
+A Debug-only `--splash-audio-review` launch opens a finite five-minute run with animations
+and recordings for comparison. `--splash-ambient-review` opens the continuous browsing
+composition. The existing Controls runner can still start a reproducible finite seed.
 
-Relevant Apple API contracts:
-[Source render callback](https://developer.apple.com/documentation/avfaudio/avaudiosourcenoderenderblock)
-and [host-time conversion](https://developer.apple.com/documentation/avfaudio/avaudiotime/seconds(forhosttime:)).
 
-## Recording intake and future scenes
+## Continuous browsing composition
 
-Retain `SplashSoundAssetKey` as the source lookup contract: pool, role, tonal slot,
-octave offset. Original recordings can replace the audition voice without changing
-score timing, wave envelopes, or bank selection. Provide long pad/drone notes and
-short melodic articulations separately, with note/octave, tuning, sample format,
-full release tail, loop metadata where applicable, and tempo markers for phrases.
-Do not discard originals or normalize them destructively.
+Home ambience uses the existing five-minute rise and five-minute return to night.
+Music advances forward throughout; it never reverses with the sun. The shared light
+progress controls a restrained night-to-day gain change and a pad-only low-pass filter.
+Night is quieter with more space between musical phrases; daylight is fuller and the
+pads gently brighten. Filtering preserves stereo and leaves the source files intact.
 
-The Autumn adapter should consume the same transport progress for leaf evolution and
-shared moments for synchronized cues, while retaining its own director and geometry.
-Do that as a separate scoped integration after the splash checkpoint is accepted.
+Musical passages use repeatable seeded variation. Harmonic variety stays inside the
+existing F-centered natural-note pool, with the recorded F bass as an anchor. Changes
+must preserve the sparse onset rate and five-voice pad ceiling; adding compatible
+chords must not add extra musical activity. Shared pitches bridge changes through
+existing overlapping recordings, whose baked releases cannot sustain indefinitely.
+Five close voicings retain F and C; upper C enters last in each block and rings
+across the next boundary before being retriggered. Harmonic sections last about
+89 seconds, with a seeded chance to hold for a second section. Night favors open
+colors, while daylight also admits major-seventh colors. Independent pad octave
+jumps are removed. Melody notes follow the current chord’s pitch classes within
+the five recorded melody notes, using semitone distance for nearby choices.
+Short motifs recur with small changes rather than replacing every note independently.
+Melody instruments stay for sustained passages. Drone timbres alternate, retaining the approved
+occasional octave-down variation. Rainsticks mark pad changes and koshi accents leave
+space around them. The intro plays only at the beginning; cycle boundaries have no
+outro, restart, or global fade. Existing notes and effects finish naturally across them.
 
-## Verification and limits
-
-Automated checks cover development pause/resume, settings-only persistence,
-cancel/discard, background continuation, no relaunch restoration, deterministic seeds, finite endings,
-drone continuity, active-wave density, event/audio envelope identity, source-key
-stability, offline PCM output, live mixer output, and nonblocking playback controls.
-Use the one-minute rendered audition to evaluate musical structure, then audition
-longer sessions before accepting final harmony or mix.
-
-Existing intro/exit choreography and the approved sun/cloud scene are preserved.
-The desktop simulator is a functional check, not physical-device latency, battery,
-or audio-route qualification. Production recordings, full background playback, and
-final musical taste approval remain outstanding.
+The rolling score must be independent of query size: requesting one passage in several
+small batches must produce exactly the same events, timbres, and full lifetimes as one
+larger request. Retention and audio voice counts remain bounded during long playback.
+The first entrance fades in gradually; mute and headphone loss remain responsive.
