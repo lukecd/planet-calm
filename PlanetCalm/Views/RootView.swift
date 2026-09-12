@@ -33,17 +33,17 @@ final class SplashAmbientPlayback {
     static let cycleDuration: TimeInterval = halfCycleDuration * 2
 
     private(set) var startedAt: Date?
+    private(set) var randomSeed: UInt64?
     var isActive: Bool { startedAt != nil }
 
-    init(startedAt: Date? = nil) {
+    init(startedAt: Date? = nil, randomSeed: UInt64? = nil) {
         self.startedAt = startedAt
+        self.randomSeed = startedAt == nil ? nil : randomSeed ?? UInt64.random(in: UInt64.min...UInt64.max)
     }
 
     func progress(at date: Date = .now) -> Double {
         guard let startedAt else { return 0 }
-        let cycleProgress = max(date.timeIntervalSince(startedAt), 0)
-            .truncatingRemainder(dividingBy: Self.cycleDuration) / Self.cycleDuration
-        return 0.5 - 0.5 * cos(2 * .pi * cycleProgress)
+        return SplashAmbientScore.lightProgress(at: max(date.timeIntervalSince(startedAt), 0))
     }
 
     func elapsed(at date: Date = .now) -> TimeInterval {
@@ -54,14 +54,17 @@ final class SplashAmbientPlayback {
     func beginIfNeeded(at date: Date = .now) {
         guard startedAt == nil else { return }
         startedAt = date
+        randomSeed = UInt64.random(in: UInt64.min...UInt64.max)
     }
 
     func restart(at date: Date = .now) {
         startedAt = date
+        randomSeed = UInt64.random(in: UInt64.min...UInt64.max)
     }
 
     func stop() {
         startedAt = nil
+        randomSeed = nil
     }
 
     /// Keeps the browsing atmosphere alive when persistence rejects a start.

@@ -70,29 +70,40 @@ private enum SplashPerformancePurpose {
     case storyPreview
 }
 
+struct SplashWaveMotionPacket: Equatable {
+    let amplitude: CGFloat
+    let center: CGFloat
+    let halfWidth: CGFloat
+}
+
 struct SplashWaveMotionSample: Equatable {
     let phase: CGFloat
-    let amplitude: CGFloat
-    let packetCenter: CGFloat
-    let packetHalfWidth: CGFloat
+    let packets: [SplashWaveMotionPacket]
+    let packetLimit: CGFloat
     let bedPhase: CGFloat
     let bedAmplitude: CGFloat
 
+    init(phase: CGFloat, amplitude: CGFloat) {
+        self.init(phase: phase, packets: [
+            .init(amplitude: amplitude, center: 0.5, halfWidth: .infinity)
+        ])
+    }
+
     init(
         phase: CGFloat,
-        amplitude: CGFloat,
-        packetCenter: CGFloat = 0.5,
-        packetHalfWidth: CGFloat = .infinity,
+        packets: [SplashWaveMotionPacket],
+        packetLimit: CGFloat = 1,
         bedPhase: CGFloat = 0,
         bedAmplitude: CGFloat = 0
     ) {
         self.phase = phase
-        self.amplitude = amplitude
-        self.packetCenter = packetCenter
-        self.packetHalfWidth = packetHalfWidth
+        self.packets = packets
+        self.packetLimit = packetLimit
         self.bedPhase = bedPhase
         self.bedAmplitude = bedAmplitude
     }
+
+    var amplitude: CGFloat { packets.map(\.amplitude).max() ?? 0 }
 
     var totalAmplitude: CGFloat {
         min(amplitude + bedAmplitude, 1)
@@ -100,6 +111,21 @@ struct SplashWaveMotionSample: Equatable {
 
     var isMoving: Bool {
         totalAmplitude > 0
+    }
+
+    func packetAmplitude(at x: CGFloat) -> CGFloat {
+        // Combine local disturbances without moving their centers or allowing
+        // overlap to exceed the motion budget. A distant attack cannot erase
+        // a ripple that is already travelling across the paper.
+        let ceiling = packetLimit
+        guard ceiling > 0 else { return 0 }
+        let remaining = packets.reduce(CGFloat(1)) { remaining, packet in
+            let support = SplashWaveGenerator.travelingPacketGain(
+                at: x, center: packet.center, halfWidth: packet.halfWidth
+            )
+            return remaining * (1 - min(max(packet.amplitude / ceiling, 0), 1) * support)
+        }
+        return ceiling * (1 - remaining)
     }
 
     static let resting = SplashWaveMotionSample(
@@ -122,42 +148,156 @@ struct SplashWaveResonanceTuning: Equatable {
 }
 
 struct SplashWaveResonanceSample: Equatable {
-    let progress: CGFloat
-    let center: CGFloat
-    let strength: CGFloat
-    let halfWidth: CGFloat
-    let targetWaveIndex: Int
+    struct Contribution: Equatable {
+        let progress: CGFloat
+        let center: CGFloat
+        let strength: CGFloat
+        let halfWidth: CGFloat
+        let targetWaveIndex: Int
+    }
+
+    let contributions: [Contribution]
+
+    // These accessors keep the single-event review surface inspectable while
+    // the renderer can carry several overlapping generated notes.
+    var progress: CGFloat { contributions.first?.progress ?? 0 }
+    var center: CGFloat { contributions.first?.center ?? 0 }
+    var strength: CGFloat { contributions.first?.strength ?? 0 }
+    var halfWidth: CGFloat { contributions.first?.halfWidth ?? 0 }
+    var targetWaveIndex: Int { contributions.first?.targetWaveIndex ?? 0 }
+
+    init(
+        progress: CGFloat,
+        center: CGFloat,
+        strength: CGFloat,
+        halfWidth: CGFloat,
+        targetWaveIndex: Int
+    ) {
+        contributions = [Contribution(
+            progress: progress,
+            center: center,
+            strength: strength,
+            halfWidth: halfWidth,
+            targetWaveIndex: targetWaveIndex
+        )]
+    }
+
+    init(contributions: [Contribution]) {
+        self.contributions = contributions
+    }
+
+    static let maximumLiftStrength: CGFloat = 1
+    static let maximumSeamStrength: CGFloat = 1.35
+    static let melodicCenterRange: ClosedRange<CGFloat> = 0.36...0.64
 
     static func sample(
         event: SplashWaveNoteEvent,
         scoreBeat: Double,
-        tuning: SplashWaveResonanceTuning
+        tuning: SplashWaveResonanceTuning,
+        centerRange: ClosedRange<CGFloat>? = nil
     ) -> SplashWaveResonanceSample? {
-        guard let envelope = event.sample(at: scoreBeat) else { return nil }
+        let envelope: SplashEnvelopeSample?
+        if event.role == .melody || event.role == .chime {
+            // The visual response has its own quiet paper attack. It starts at
+            // the same score beat as audio, while avoiding the instrument's
+            // sharp 120 ms onset.
+            envelope = SplashPerformanceScore.waveEnvelopeSample(
+                for: event,
+                scoreBeat: scoreBeat
+            )
+        } else {
+            envelope = event.sample(at: scoreBeat)
+        }
+        guard let envelope else { return nil }
 
         let progress = CGFloat(envelope.lifecycleProgress)
-        let center = -tuning.halfWidth
-            + (1 + tuning.halfWidth * 2) * progress
+        let center: CGFloat
+        if let centerRange {
+            center = centerRange.lowerBound
+                + (centerRange.upperBound - centerRange.lowerBound) * progress
+        } else {
+            center = -tuning.halfWidth
+                + (1 + tuning.halfWidth * 2) * progress
+        }
+        // waveEnvelopeSample already applies melody intensity. Keep that
+        // value from being multiplied a second time when this helper samples
+        // generated melody events; legacy non-melodic review events retain
+        // their existing intensity behavior.
+        let intensity = event.role == .melody || event.role == .chime
+            ? 1 : event.intensity
         return SplashWaveResonanceSample(
             progress: progress,
             center: center,
-            strength: tuning.strength
-                * CGFloat(event.intensity)
+            strength: tuning.strength * intensity
                 * CGFloat(SplashPerformanceScore.visualMotionGain(for: envelope)),
             halfWidth: tuning.halfWidth,
             targetWaveIndex: event.tonalSlot
         )
     }
 
+    /// Samples every active melodic event on the shared score clock. The
+    /// contributions stay independent so a new note never relocates an older
+    /// highlight; the render-time lift and opacity methods provide the bounds.
+    static func melodySample(
+        events: [SplashWaveNoteEvent],
+        scoreBeat: Double,
+        tuning: SplashWaveResonanceTuning
+    ) -> SplashWaveResonanceSample? {
+        let contributions = events
+            .filter { $0.role == .melody || $0.role == .chime }
+            .compactMap {
+                sample(
+                    event: $0,
+                    scoreBeat: scoreBeat,
+                    tuning: tuning,
+                    centerRange: melodicCenterRange
+                )?.contributions.first
+            }
+        guard !contributions.isEmpty else { return nil }
+        return SplashWaveResonanceSample(contributions: contributions)
+    }
+
     func verticalShift(at x: CGFloat, waveIndex: Int) -> CGFloat {
-        let distance = (x - center) / max(halfWidth, 0.001)
-        let localizedGain = exp(-0.5 * distance * distance)
-        guard waveIndex == targetWaveIndex else { return 0 }
-        return -0.034 * strength * localizedGain
+        let gains = contributions.compactMap { contribution -> CGFloat? in
+            guard waveIndex == contribution.targetWaveIndex else { return nil }
+            let distance = (x - contribution.center) / max(contribution.halfWidth, 0.001)
+            return contribution.strength * CGFloat(exp(-0.5 * distance * distance))
+        }
+        return -0.034 * Self.boundedUnion(gains, ceiling: Self.maximumLiftStrength)
     }
 
     func seamOpacity(for waveIndex: Int) -> Double {
-        waveIndex == targetWaveIndex ? Double(0.38 * strength) : 0
+        let strengths = contributions.compactMap { contribution -> CGFloat? in
+            waveIndex == contribution.targetWaveIndex ? contribution.strength : nil
+        }
+        return Double(0.38 * Self.boundedUnion(
+            strengths,
+            ceiling: Self.maximumSeamStrength
+        ))
+    }
+
+    func seamOpacity(
+        for contribution: Contribution
+    ) -> Double {
+        Double(0.38 * Self.boundedUnion(
+            [contribution.strength],
+            ceiling: Self.maximumSeamStrength
+        ))
+    }
+
+    func seamContributions(for waveIndex: Int) -> [Contribution] {
+        contributions.filter { $0.targetWaveIndex == waveIndex }
+    }
+
+    private static func boundedUnion(
+        _ gains: [CGFloat],
+        ceiling: CGFloat
+    ) -> CGFloat {
+        guard ceiling > 0 else { return 0 }
+        let remaining = gains.reduce(CGFloat(1)) { remaining, gain in
+            remaining * (1 - min(max(gain / ceiling, 0), 1))
+        }
+        return ceiling * (1 - remaining)
     }
 }
 
@@ -204,6 +344,11 @@ struct SplashPerformancePlan: Equatable {
     ) -> SplashSoundAssetKey {
         let secondsFromStart = scheduledEvent.scheduledStartBeat
             * SplashPerformanceScore.tempo.secondsPerBeat
+        if scheduledEvent.event.role == .pad {
+            let bank = SplashSamplePlan.padBank(at: secondsFromStart, duration: session.duration.timeInterval)
+            return .init(pool: [.night, .twilight, .daylight][bank - 1], role: .pad,
+                tonalSlot: scheduledEvent.event.tonalSlot, octaveOffset: scheduledEvent.event.octaveOffset)
+        }
         let eventProgress = min(
             max(secondsFromStart / session.duration.timeInterval, 0),
             1
@@ -301,6 +446,7 @@ enum SplashPerformanceScore {
     static let droneSlots: Set<Int> = [0, 1, 3, 5]
     static let noteBedShare: CGFloat = 0.28
     static let packetShare: CGFloat = 0.86
+    static let melodicWaveAttackDuration: TimeInterval = 0.9
 
     /// Stable visual voices that can later address eight recorded scale tones.
     static let waveVoices: [SplashWaveVoice] = [
@@ -385,15 +531,17 @@ enum SplashPerformanceScore {
             $0.tonalSlot == voice.tonalSlot
         }
         let liveSamples = events.filter { $0.tonalSlot == voice.tonalSlot }.compactMap {
-            scheduledSample(for: $0, scoreBeat: scoreBeat)?.envelope
+            waveEnvelopeSample(for: $0, scoreBeat: scoreBeat)
         }
         let noteSample = liveSamples.max { $0.value < $1.value }
-        // Blend simultaneous notes continuously; a new melody never steals a pad's packet.
-        let gainSum = liveSamples.reduce(0.0) { $0 + $1.value }
-        let packetProgress = CGFloat(gainSum > 0.000001
-            ? liveSamples.reduce(0.0) { $0 + $1.lifecycleProgress * $1.value } / gainSum : 0)
-        let packetCenter = packetStart
-            + (packetEnd - packetStart) * packetProgress
+        let packets = liveSamples.map { sample in
+            SplashWaveMotionPacket(
+                amplitude: SplashMotionTiming.maximumMotionAmount * packetShare
+                    * CGFloat(visualMotionGain(for: sample)) * CGFloat(tuning.amountMultiplier),
+                center: packetStart + (packetEnd - packetStart) * CGFloat(sample.lifecycleProgress),
+                halfWidth: packetHalfWidth
+            )
+        }
         // Every voice samples one continuous phase clock. Note events shape the
         // strength and location of motion; they never restart the wave itself.
         let phase = CGFloat(
@@ -403,26 +551,33 @@ enum SplashPerformanceScore {
         let noteMotionGain = noteSample.map {
             visualMotionGain(for: $0)
         } ?? 0
-        let amplitude = SplashMotionTiming.maximumMotionAmount
-            * packetShare
-            * CGFloat(noteMotionGain)
-            * CGFloat(tuning.amountMultiplier)
 
-        let isInitialFoundation = droneSlots.contains(voice.tonalSlot)
+        // A rolling ambient window may begin in the middle of the performance.
+        // Only the absolute-zero drone can establish the initial paper bed.
+        let isRollingScore = events.contains { $0.id.hasPrefix("ambient-") }
+        let isInitialNote = !isRollingScore
+            || abs((noteEvent?.startBeat ?? 0) * tempo.secondsPerBeat) < 0.001
+        let isInitialFoundation = isInitialNote
+            && droneSlots.contains(voice.tonalSlot)
             && scoreBeat < (noteEvent?.startBeat ?? 0)
         let attackHandoff: Double
-        let isFirstAttack = noteEvent.map {
+        let firstAttackBeats = noteEvent.map { waveAttackBeats(for: $0) } ?? 1
+        let isFirstAttack = isInitialNote && noteEvent.map {
             scoreBeat >= $0.startBeat
-                && scoreBeat < $0.startBeat + $0.envelope.attackBeats
+                && scoreBeat < $0.startBeat + firstAttackBeats
         } ?? false
-        if let noteSample, noteSample.stage == .attack, isFirstAttack {
+        let firstSample = noteEvent.flatMap { waveEnvelopeSample(for: $0, scoreBeat: scoreBeat) }
+        if let firstSample, firstSample.stage == .attack, isFirstAttack {
             attackHandoff = 1 - SplashMotionTiming.smootherStep(
-                noteSample.localBeat / (noteEvent?.envelope.attackBeats ?? 1)
+                firstSample.localBeat / firstAttackBeats
             )
         } else {
             attackHandoff = 0
         }
-        let foundationGain = max(isInitialFoundation ? 1 : 0, attackHandoff)
+        // Only the waves that already carry a foundation may hand it off.
+        // Introducing one on another wave at its first note creates a hard jump.
+        let foundationGain = droneSlots.contains(voice.tonalSlot)
+            ? max(isInitialFoundation ? 1 : 0, attackHandoff) : 0
         let fadeIn = SplashMotionTiming.smootherStep(
             elapsed / droneFadeInDuration
         )
@@ -438,12 +593,51 @@ enum SplashPerformanceScore {
 
         return SplashWaveMotionSample(
             phase: phase,
-            amplitude: amplitude,
-            packetCenter: packetCenter,
-            packetHalfWidth: packetHalfWidth,
+            packets: packets,
+            packetLimit: SplashMotionTiming.maximumMotionAmount * packetShare * CGFloat(tuning.amountMultiplier),
             bedPhase: phase,
             bedAmplitude: bedAmplitude
         )
+    }
+
+    static func waveEnvelopeSample(
+        for event: SplashWaveNoteEvent,
+        scoreBeat: Double
+    ) -> SplashEnvelopeSample? {
+        guard let scheduled = scheduledSample(for: event, scoreBeat: scoreBeat) else { return nil }
+        guard event.role == .melody || event.role == .chime else { return scheduled.envelope }
+        // Paper has a slower response than a struck instrument. Keep the exact
+        // onset, gate, and release end; do not copy its 110 ms audio attack into
+        // a full-width visual kick or change the shared score/audio envelope.
+        let envelope = SplashADSREnvelope(
+            attackBeats: waveAttackBeats(for: event),
+            decayBeats: 0, sustainLevel: 1, releaseBeats: event.envelope.releaseBeats
+        )
+        guard let sample = envelope.sample(localBeat: scheduled.envelope.localBeat,
+            gateBeats: event.gateBeats) else { return nil }
+        return SplashEnvelopeSample(value: sample.value * min(max(event.intensity, 0), 1),
+            lifecycleProgress: sample.lifecycleProgress, localBeat: sample.localBeat,
+            stage: sample.stage)
+    }
+
+    static func melodyResonanceSample(
+        events: [SplashWaveNoteEvent],
+        scoreBeat: Double,
+        tuning: SplashWaveResonanceTuning,
+        reduceMotion: Bool = false
+    ) -> SplashWaveResonanceSample? {
+        guard !reduceMotion else { return nil }
+        return SplashWaveResonanceSample.melodySample(
+            events: events,
+            scoreBeat: scoreBeat,
+            tuning: tuning
+        )
+    }
+
+    private static func waveAttackBeats(for event: SplashWaveNoteEvent) -> Double {
+        event.role == .melody || event.role == .chime
+            ? min(melodicWaveAttackDuration / tempo.secondsPerBeat, event.gateBeats)
+            : event.envelope.attackBeats
     }
 
     /// Preserves the audio ADSR endpoints while making its quieter shoulders
@@ -1347,6 +1541,7 @@ struct SplashScreenView: View {
     @State private var activePerformanceSession: PerformanceSession?
     @State private var performancePurpose: SplashPerformancePurpose?
     @State private var activeSplashScoreEvents: [SplashWaveNoteEvent]?
+    @State private var ambientVisualScoreEvents: [SplashWaveNoteEvent]?
 #if DEBUG
     @State private var isPerformanceDeskVisible: Bool
     @State private var expandedPerformanceDeskSections: Set<PerformanceDeskSection>
@@ -1367,7 +1562,8 @@ struct SplashScreenView: View {
             initialValue: Self.debugAtmosphereProgress
         )
 #if DEBUG
-        _runnerDuration = State(initialValue: Self.isRunnerReview ? .oneMinute : .twoMinutes)
+        _runnerDuration = State(initialValue: ProcessInfo.processInfo.arguments.contains("--splash-audio-review")
+            ? .fiveMinutes : Self.isRunnerReview ? .oneMinute : .twoMinutes)
         _isPerformanceDeskVisible = State(
             initialValue: !Self.isAtmosphereReview && (Self.isRunnerReview || Self.isScoreMonitorReview || Self.isResonanceReview || ProcessInfo.processInfo.arguments.contains("--autumn-checkpoint") || ProcessInfo.processInfo.arguments.contains("--autumn-light-audit"))
         )
@@ -1379,7 +1575,9 @@ struct SplashScreenView: View {
                     : [.splashTuning]
         )
         _activePerformanceSession = State(
-            initialValue: ProcessInfo.processInfo.arguments.contains("--session-ending-review")
+            initialValue: ProcessInfo.processInfo.arguments.contains("--splash-audio-review")
+                ? PerformanceSession(duration: .fiveMinutes, randomSeed: SplashPerformanceScore.defaultSeed)
+                : ProcessInfo.processInfo.arguments.contains("--session-ending-review")
                 ? PerformanceSession(duration: .oneMinute, startedAt: .now.addingTimeInterval(-58))
                 : Self.isRunnerReview
                 ? PerformanceSession(
@@ -1389,6 +1587,7 @@ struct SplashScreenView: View {
                 : nil
         )
         _performancePurpose = State(initialValue: Self.isRunnerReview
+            || ProcessInfo.processInfo.arguments.contains("--splash-audio-review")
             || ProcessInfo.processInfo.arguments.contains("--session-ending-review")
             ? .splashAudition : nil)
 #endif
@@ -1409,6 +1608,25 @@ struct SplashScreenView: View {
         return min(max(value, 0), 1)
 #else
         return 0
+#endif
+    }
+
+    private static var isAmbientReview: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--splash-ambient-review")
+#else
+        false
+#endif
+    }
+
+    private static var ambientReviewElapsed: TimeInterval? {
+#if DEBUG
+        let prefix = "--splash-ambient-elapsed="
+        return ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix(prefix) })
+            .flatMap { Double($0.dropFirst(prefix.count)) }
+            ?? ProcessInfo.processInfo.environment["SPLASH_AMBIENT_ELAPSED"].flatMap(Double.init)
+#else
+        nil
 #endif
     }
 
@@ -1490,7 +1708,7 @@ struct SplashScreenView: View {
     private var manualAtmosphereProgress: Double? {
 #if DEBUG
         guard (isPerformanceDeskVisible || Self.isAtmosphereReview || Self.hasDebugAtmosphereOverride),
-              activePerformanceSession == nil else { return nil }
+              activePerformanceSession == nil, !splashAmbient.isActive else { return nil }
         return atmosphereProgress
 #else
         nil
@@ -1544,16 +1762,32 @@ struct SplashScreenView: View {
     private static func resonance(
         manualEvent: SplashWaveNoteEvent?,
         scoreBeat: Double,
-        tuning: SplashWaveResonanceTuning
+        tuning: SplashWaveResonanceTuning,
+        scoreEvents: [SplashWaveNoteEvent],
+        reduceMotion: Bool
     ) -> SplashWaveResonanceSample? {
-        let event = manualEvent ?? reviewEvent(at: scoreBeat)
-        return event.flatMap {
-            SplashWaveResonanceSample.sample(
-                event: $0,
-                scoreBeat: scoreBeat,
-                tuning: tuning
-            )
+        guard !reduceMotion else { return nil }
+
+        var contributions = SplashPerformanceScore.melodyResonanceSample(
+            events: scoreEvents,
+            scoreBeat: scoreBeat,
+            tuning: tuning,
+            reduceMotion: reduceMotion
+        )?.contributions ?? []
+
+        let reviewSampleEvent = manualEvent ?? reviewEvent(at: scoreBeat)
+        if let reviewSampleEvent,
+           let sample = SplashWaveResonanceSample.sample(
+               event: reviewSampleEvent,
+               scoreBeat: scoreBeat,
+               tuning: tuning
+           ) {
+            contributions.append(contentsOf: sample.contributions)
         }
+
+        return contributions.isEmpty
+            ? nil
+            : SplashWaveResonanceSample(contributions: contributions)
     }
 
     var body: some View {
@@ -1578,6 +1812,10 @@ struct SplashScreenView: View {
                 persistedAutumn = (try? JSONEncoder().encode(record.settingsOnly)) ?? Data()
             }
             .onChange(of: activePerformanceSession) { _, _ in synchronizeAudio() }
+            .onChange(of: splashAmbient.randomSeed) { _, _ in
+                refreshAmbientVisualScore()
+                synchronizeAudio()
+            }
             .onChange(of: auditionEnabled) { _, _ in synchronizeAudio() }
             .onChange(of: sceneVolume) { _, _ in synchronizeSceneOutput() }
             .onChange(of: sceneMuted) { _, _ in synchronizeSceneOutput() })
@@ -1601,13 +1839,15 @@ struct SplashScreenView: View {
             .onChange(of: showsSceneSettings) { _, shown in if shown { isPerformanceDeskVisible = false } }
             .onChange(of: isPerformanceDeskVisible) { _, shown in if shown { showsSceneSettings = false } }
 #endif
-            .onChange(of: scenePhase) { _, _ in
+            .onChange(of: scenePhase) { _, phase in
                 synchronizeAudio()
                 synchronizeIdleTimer()
+                if phase == .active { refreshAmbientVisualScore() }
             }
             .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification), perform: handleAudioInterruption)
             .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification), perform: handleAudioRouteChange)
             .task(id: activePerformanceSession) { await fadeSplashAudioAtSessionEnd(activePerformanceSession) }
+            .task(id: splashAmbient.randomSeed) { await maintainAmbientVisualScore() }
             .task(id: sessionLifecycle.activeRuntime?.id) { await maintainIdleTimerEligibility() }
             .task(id: liveActivitySynchronizationID) { await synchronizeLiveActivity() }
             .onDisappear(perform: tearDownSplashView)
@@ -1618,14 +1858,58 @@ struct SplashScreenView: View {
 
     private func synchronizeAudio() {
         synchronizeSceneOutput()
-        guard scenePhase == .active, auditionEnabled,
-              ProcessInfo.processInfo.environment["SPLASH_AUDIO_DISABLED"] != "1",
-              performancePurpose == .splashAudition,
-              let session = activePerformanceSession, !session.isPaused else {
+        guard scenePhase == .active else { synthesizer.stop(); return }
+        guard auditionEnabled,
+              ProcessInfo.processInfo.environment["SPLASH_AUDIO_DISABLED"] != "1" else {
             synthesizer.fadeOut()
             return
         }
-        synthesizer.play(session: session, events: splashScoreEvents + (manualEvent.map { [$0] } ?? []))
+        if performancePurpose == .splashAudition,
+           let session = activePerformanceSession, !session.isPaused {
+            synthesizer.play(session: session, events: splashScoreEvents + (manualEvent.map { [$0] } ?? []))
+            return
+        }
+        guard performancePurpose != .storyPreview,
+              activePerformanceSession == nil,
+              sessionLifecycle.activeRuntime == nil,
+              splashAmbient.isActive,
+              let seed = splashAmbient.randomSeed else {
+            synthesizer.fadeOut()
+            return
+        }
+        guard let startedAt = splashAmbient.startedAt else {
+            synthesizer.fadeOut()
+            return
+        }
+        synthesizer.playAmbient(seed: seed, startedAt: startedAt)
+    }
+
+    @MainActor
+    private func maintainAmbientVisualScore() async {
+        guard let seed = splashAmbient.randomSeed else { return }
+        while !Task.isCancelled, splashAmbient.isActive,
+              splashAmbient.randomSeed == seed {
+            let elapsed = splashAmbient.elapsed(at: .now)
+            ambientVisualScoreEvents = SplashAmbientScore.events(
+                from: max(0, elapsed - SplashAmbientScore.tailAllowance),
+                through: elapsed + 30,
+                seed: seed
+            )
+            try? await Task.sleep(for: .seconds(10))
+        }
+        if splashAmbient.randomSeed == seed { ambientVisualScoreEvents = nil }
+    }
+
+    @MainActor
+    private func refreshAmbientVisualScore() {
+        guard activePerformanceSession == nil, splashAmbient.isActive,
+              let seed = splashAmbient.randomSeed else { return }
+        let elapsed = splashAmbient.elapsed(at: .now)
+        ambientVisualScoreEvents = SplashAmbientScore.events(
+            from: max(0, elapsed - SplashAmbientScore.tailAllowance),
+            through: elapsed + 30,
+            seed: seed
+        )
     }
 
     @ViewBuilder
@@ -1639,13 +1923,17 @@ struct SplashScreenView: View {
                 let transportState = activePerformanceSession.map {
                     PerformanceRunner(session: $0).sample(at: context.date)
                 }
-                let performanceElapsed = transportState?.elapsedTime ?? performanceClock.elapsed(at: context.date)
+                let performanceElapsed = transportState?.elapsedTime
+                    ?? (splashAmbient.isActive
+                        ? splashAmbient.elapsed(at: context.date)
+                        : performanceClock.elapsed(at: context.date))
+                let visualScoreEvents = renderedScoreEvents
                 let presentation = SplashScenePresentation.sample(
                     performanceElapsed: Self.isAtmosphereReview ? 20 : performanceElapsed,
                     exitElapsed: exitStartedAt.map { context.date.timeIntervalSince($0) },
                     reduceMotion: reduceMotion,
-                    motionTuning: motionTuning,
-                    scoreEvents: splashScoreEvents
+                    motionTuning: renderedMotionTuning,
+                    scoreEvents: visualScoreEvents
                 )
                 let ambientProgress = reduceMotion ? 0 : splashAmbient.progress(at: context.date)
                 let atmosphere = SplashAtmosphereDirector.sample(
@@ -1654,8 +1942,10 @@ struct SplashScreenView: View {
                 )
                 let resonance = Self.resonance(
                     manualEvent: manualEvent,
-                    scoreBeat: SplashPerformanceScore.scoreBeat(for: performanceElapsed, tuning: motionTuning),
-                    tuning: resonanceTuning
+                    scoreBeat: SplashPerformanceScore.scoreBeat(for: performanceElapsed, tuning: renderedMotionTuning),
+                    tuning: resonanceTuning,
+                    scoreEvents: visualScoreEvents,
+                    reduceMotion: reduceMotion
                 )
                 SplashSceneView(
                     presentation: presentation,
@@ -1722,8 +2012,9 @@ struct SplashScreenView: View {
                 resonanceWidth: resonanceWidthBinding, tonalSlot: $manualTonalSlot,
                 gateBeats: $manualGateBeats, scoreSeed: $scoreSeed,
                 onTriggerEvent: triggerPerformanceEvent, onReset: resetMotionTuning,
-                performanceClock: performanceClock, motionTuning: motionTuning,
-                manualEvent: manualEvent, scoreEvents: splashScoreEvents,
+                performanceClock: PerformanceClock(startedAt: splashAmbient.startedAt ?? performanceClock.startedAt), motionTuning: renderedMotionTuning,
+                manualEvent: manualEvent, scoreEvents: renderedScoreEvents,
+                isAmbientPlayback: activePerformanceSession == nil && splashAmbient.isActive,
                 runnerDuration: $runnerDuration, activePerformanceSession: activePerformanceSession,
                 onRun: runCurrentScene, onStop: stopCurrentScene,
                 onPauseResume: togglePerformancePause, auditionEnabled: $auditionEnabled,
@@ -1752,13 +2043,15 @@ struct SplashScreenView: View {
 #if DEBUG
     private func ambientRouteState(at date: Date) -> String {
         let started = splashAmbient.startedAt?.timeIntervalSince1970 ?? -1
+        let audioStart = synthesizer.isPlayingAmbient ? started : -1
+        let audioSeed = synthesizer.isPlayingAmbient ? (synthesizer.ambientSeed ?? UInt64.max) : UInt64.max
         let purpose: String
         switch performancePurpose {
         case .splashAudition: purpose = "splash"
         case .storyPreview: purpose = "story"
         case nil: purpose = "none"
         }
-        return "start=\(started);elapsed=\(splashAmbient.elapsed(at: date));purpose=\(purpose)"
+        return "start=\(started);elapsed=\(splashAmbient.elapsed(at: date));purpose=\(purpose);audioStart=\(audioStart);audioSeed=\(audioSeed)"
     }
 #endif
 
@@ -1829,6 +2122,14 @@ struct SplashScreenView: View {
 
     private func prepareSplashView() {
         splashAmbient.beginIfNeeded()
+#if DEBUG
+        if Self.isAmbientReview, let elapsed = Self.ambientReviewElapsed {
+            splashAmbient.restart(at: Date().addingTimeInterval(-max(elapsed, 0)))
+        }
+#endif
+        if activePerformanceSession == nil, !Self.isAtmosphereReview {
+            manualEvent = nil
+        }
         // Migrate away from resumable sessions. Only development settings survive
         // process termination; backgrounding keeps the in-memory clock running.
         UserDefaults.standard.removeObject(forKey: "splash.performance.session.v1")
@@ -1864,6 +2165,7 @@ struct SplashScreenView: View {
         }
         sceneVolume = preferences.volume
         sceneMuted = preferences.isMuted
+        refreshAmbientVisualScore()
         synchronizeAudio()
         synchronizeIdleTimer()
     }
@@ -1877,7 +2179,7 @@ struct SplashScreenView: View {
     private func handleAudioInterruption(_ notification: Notification) {
         if let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
            raw == AVAudioSession.InterruptionType.began.rawValue {
-            synthesizer.fadeOut()
+            synthesizer.stopImmediately()
         } else {
             synchronizeAudio()
         }
@@ -1890,7 +2192,7 @@ struct SplashScreenView: View {
         }
         // Losing headphones silences audio, never pauses a focus session.
         auditionEnabled = false
-        synthesizer.fadeOut()
+        synthesizer.stopImmediately()
     }
 
     private func fadeSplashAudioAtSessionEnd(_ session: PerformanceSession?) async {
@@ -2054,6 +2356,17 @@ struct SplashScreenView: View {
         }
         exitStartedAt = nil
         stage = .opening
+        synchronizeAudio()
+    }
+
+    private var renderedScoreEvents: [SplashWaveNoteEvent] {
+        activePerformanceSession == nil && splashAmbient.isActive
+            ? (ambientVisualScoreEvents ?? []) : splashScoreEvents
+    }
+
+    private var renderedMotionTuning: SplashMotionTuning {
+        activePerformanceSession == nil && splashAmbient.isActive
+            ? SplashMotionTuning(amountMultiplier: motionTuning.amountMultiplier) : motionTuning
     }
 
     private var splashScoreEvents: [SplashWaveNoteEvent] {
@@ -2067,6 +2380,7 @@ struct SplashScreenView: View {
         Binding(
             get: { motionTuning.speedMultiplier },
             set: { newValue in
+                guard !splashAmbient.isActive else { return }
                 motionTuning.setSpeedMultiplier(
                     newValue,
                     performanceElapsed: performanceClock.elapsed(at: Date())
@@ -2097,7 +2411,8 @@ struct SplashScreenView: View {
     }
 
     private func triggerPerformanceEvent() {
-        guard activePerformanceSession?.isPaused != true else { return }
+        guard activePerformanceSession?.isPaused != true,
+              activePerformanceSession != nil || !splashAmbient.isActive else { return }
         let performanceElapsed = activePerformanceSession?.elapsedTime(at: .now)
             ?? performanceClock.elapsed(at: Date())
         let scoreBeat = SplashPerformanceScore.scoreBeat(
@@ -2126,6 +2441,12 @@ struct SplashScreenView: View {
         if activePerformanceSession != nil {
             motionTuning = .standard
             resonanceTuning = .standard
+            return
+        }
+        if splashAmbient.isActive {
+            motionTuning = .standard
+            resonanceTuning = .standard
+            manualEvent = nil
             return
         }
         motionTuning.reset(
@@ -2225,6 +2546,7 @@ private struct PerformanceDesk: View {
     let motionTuning: SplashMotionTuning
     let manualEvent: SplashWaveNoteEvent?
     let scoreEvents: [SplashWaveNoteEvent]
+    let isAmbientPlayback: Bool
     @Binding var runnerDuration: FocusDuration
     let activePerformanceSession: PerformanceSession?
     let onRun: (FocusDuration) -> Void
@@ -2257,7 +2579,8 @@ private struct PerformanceDesk: View {
                             tonalSlot: $tonalSlot,
                             gateBeats: $gateBeats,
                         scoreSeed: $scoreSeed,
-                        isTransportDrivingLight: activePerformanceSession != nil,
+                        isTransportDrivingLight: activePerformanceSession != nil || isAmbientPlayback,
+                        isAmbientPlayback: isAmbientPlayback,
                         onTriggerEvent: onTriggerEvent,
                             onReset: onReset
                         )
@@ -2308,12 +2631,12 @@ private struct PerformanceDesk: View {
                         onPauseResume: onPauseResume
                     )
                     if context.isSplash {
-                        Toggle("Synth audition", isOn: $auditionEnabled)
+                        Toggle("Recorded instruments", isOn: $auditionEnabled)
                             .font(.caption)
                             .tint(PlanetFocusPalette.warmYellow)
                         Text(audioStatus)
                             .font(.caption2)
-                        Text("Temporary sounds—not the final recordings.")
+                        Text("Your Splash instruments, with gentle variation.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -2532,6 +2855,7 @@ private struct SplashTuningControls: View {
     @Binding var gateBeats: Double
     @Binding var scoreSeed: Int
     let isTransportDrivingLight: Bool
+    var isAmbientPlayback = false
     let onTriggerEvent: () -> Void
     let onReset: () -> Void
 
@@ -2591,6 +2915,7 @@ private struct SplashTuningControls: View {
             .tint(PlanetFocusPalette.warmYellow)
             .foregroundStyle(PlanetFocusPalette.canvasInk)
             .accessibilityIdentifier("splashResonanceTrigger")
+            .disabled(isAmbientPlayback)
 
             Stepper(value: $tonalSlot, in: 0...7) {
                 HStack {
@@ -2784,7 +3109,7 @@ private struct SplashScoreMonitorContent: View {
                 Button(isFrozen ? "Resume live" : "Freeze", action: onFreezeToggle)
                     .buttonStyle(.bordered)
             }
-            Text(isFrozen ? "Monitor frozen; splash transport continues live." : "Live transport; synth audition is controlled in the runner.")
+            Text(isFrozen ? "Monitor frozen; splash transport continues live." : "Live transport; recorded instruments are controlled in the runner.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             if let atmosphere {
@@ -3496,12 +3821,7 @@ enum SplashWaveGenerator {
             let sample = index < motionSamples.count
                 ? motionSamples[index]
                 : .resting
-            let packetGain = travelingPacketGain(
-                at: x,
-                center: sample.packetCenter,
-                halfWidth: sample.packetHalfWidth
-            )
-            let packetAmount = min(max(sample.amplitude, 0), 1) * packetGain
+            let packetAmount = sample.packetAmplitude(at: x)
             let bedAmount = min(max(sample.bedAmplitude, 0), 1)
             let packetCenterPhase = -sample.phase * abs(formula.motionRate)
             let bedCenterPhase = -sample.bedPhase * abs(formula.motionRate)
@@ -3740,16 +4060,37 @@ private struct SplashWavePaperLayer: View {
                     lineWidth: SplashWaveMaterial.edgeHighlightWidth
                 )
 
-                if let resonance, resonance.seamOpacity(for: waveIndex) > 0 {
-                    SplashWaveResonanceSeam(
-                        points: shape.top,
-                        center: resonance.center,
-                        halfWidth: resonance.halfWidth * 2.1
-                    )
-                    .stroke(
-                        Color.white.opacity(resonance.seamOpacity(for: waveIndex)),
-                        style: StrokeStyle(lineWidth: 1.45, lineCap: .round)
-                    )
+                if let resonance {
+                    let seamContributions = resonance.seamContributions(for: waveIndex)
+                    if !seamContributions.isEmpty {
+                        ZStack {
+                            ForEach(Array(seamContributions.enumerated()), id: \.offset) { item in
+                                let contribution = item.element
+                                let normalizedOpacity = min(
+                                    max(
+                                        contribution.strength
+                                            / SplashWaveResonanceSample.maximumSeamStrength,
+                                        0
+                                    ),
+                                    1
+                                )
+                                if normalizedOpacity > 0 {
+                                    SplashWaveResonanceSeam(
+                                        points: shape.top,
+                                        contributions: [contribution]
+                                    )
+                                    .stroke(
+                                        Color.white.opacity(Double(normalizedOpacity)),
+                                        style: StrokeStyle(lineWidth: 1.45, lineCap: .round)
+                                    )
+                                }
+                            }
+                        }
+                        .compositingGroup()
+                        .opacity(
+                            0.38 * Double(SplashWaveResonanceSample.maximumSeamStrength)
+                        )
+                    }
                 }
             }
             .compositingGroup()
@@ -3775,21 +4116,58 @@ private struct SplashWavePaperLayer: View {
 /// overlay, so the light follows the paper rather than crossing through it.
 private struct SplashWaveResonanceSeam: Shape {
     let points: [CGPoint]
-    let center: CGFloat
-    let halfWidth: CGFloat
+    let contributions: [SplashWaveResonanceSample.Contribution]
 
     func path(in rect: CGRect) -> Path {
-        let lowerBound = center - halfWidth
-        let upperBound = center + halfWidth
-        let segment = points.filter { $0.x >= lowerBound && $0.x <= upperBound }
-        guard let first = segment.first else { return Path() }
-
         var path = Path()
-        path.move(to: CGPoint(x: first.x * rect.width, y: first.y * rect.height))
-        for point in segment.dropFirst() {
-            path.addLine(to: CGPoint(x: point.x * rect.width, y: point.y * rect.height))
+        guard let firstPoint = points.first, let lastPoint = points.last else {
+            return path
+        }
+        for contribution in contributions {
+            let lowerBound = max(
+                contribution.center - contribution.halfWidth * 2.1, firstPoint.x
+            )
+            let upperBound = min(
+                contribution.center + contribution.halfWidth * 2.1, lastPoint.x
+            )
+            guard upperBound > lowerBound, points.count > 1 else { continue }
+
+            // Interpolate the moving endpoints instead of snapping them to
+            // the nearest analytic sample. This keeps the edge highlight's
+            // travel continuous at the geometry sample boundaries.
+            let lowerPoint = interpolatedPoint(at: lowerBound)
+            let upperPoint = interpolatedPoint(at: upperBound)
+            let segment = points.filter {
+                $0.x > lowerBound && $0.x < upperBound
+            }
+
+            path.move(to: CGPoint(
+                x: lowerPoint.x * rect.width,
+                y: lowerPoint.y * rect.height
+            ))
+            for point in segment {
+                path.addLine(to: CGPoint(x: point.x * rect.width, y: point.y * rect.height))
+            }
+            path.addLine(to: CGPoint(
+                x: upperPoint.x * rect.width,
+                y: upperPoint.y * rect.height
+            ))
         }
         return path
+    }
+
+    private func interpolatedPoint(at x: CGFloat) -> CGPoint {
+        let upperIndex = points.firstIndex { $0.x >= x } ?? points.count - 1
+        let lowerIndex = max(upperIndex - 1, 0)
+        let span = points[upperIndex].x - points[lowerIndex].x
+        let fraction = span > 0
+            ? (x - points[lowerIndex].x) / span
+            : 0
+        return CGPoint(
+            x: x,
+            y: points[lowerIndex].y
+                + (points[upperIndex].y - points[lowerIndex].y) * fraction
+        )
     }
 }
 

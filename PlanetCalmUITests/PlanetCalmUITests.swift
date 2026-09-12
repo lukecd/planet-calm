@@ -779,16 +779,19 @@ final class PlanetCalmUITests: XCTestCase {
         XCTAssertTrue(state.waitForExistence(timeout: 5))
         XCTAssertTrue(waitUntilHittable(app.buttons["Settings"], timeout: 6))
         let initialStart = ambientStart(state)
+        assertAmbientAudioStart(state, equals: initialStart)
 
         app.buttons["Settings"].tap()
         XCTAssertTrue(app.otherElements["settingsScreen"].waitForExistence(timeout: 3))
         app.buttons["Back"].tap()
         XCTAssertEqual(ambientStart(state), initialStart)
+        assertAmbientAudioStart(state, equals: initialStart)
 
         app.buttons["Stats"].tap()
         XCTAssertTrue(app.otherElements["statsScreen"].waitForExistence(timeout: 3))
         app.buttons["Back"].tap()
         XCTAssertEqual(ambientStart(state), initialStart)
+        assertAmbientAudioStart(state, equals: initialStart)
 
         app.buttons["Stories"].tap()
         XCTAssertTrue(app.staticTexts["Choose a story"].waitForExistence(timeout: 3))
@@ -797,18 +800,21 @@ final class PlanetCalmUITests: XCTestCase {
         app.buttons["sessionBack"].tap()
         app.buttons["Back"].tap()
         XCTAssertEqual(ambientStart(state), initialStart)
+        assertAmbientAudioStart(state, equals: initialStart)
 
         app.buttons["Start"].tap()
         XCTAssertTrue(app.buttons["sessionBegin"].waitForExistence(timeout: 5))
         app.buttons["sessionBegin"].tap()
         XCTAssertTrue(app.buttons["sessionCountdown"].waitForExistence(timeout: 5))
         XCTAssertEqual(ambientStart(state), -1)
+        assertAmbientAudioStart(state, equals: -1)
         app.buttons["sessionCountdown"].tap()
         app.buttons["End session"].tap()
         XCTAssertTrue(app.staticTexts["Choose a story"].waitForExistence(timeout: 5))
         app.buttons["Back"].tap()
         XCTAssertNotEqual(ambientStart(state), initialStart)
         XCTAssertGreaterThan(ambientStart(state), 0)
+        assertAmbientAudioStart(state, equals: ambientStart(state))
     }
 
     func testSplashAuditionSessionSurvivesBrowsingRoutes() throws {
@@ -848,6 +854,19 @@ final class PlanetCalmUITests: XCTestCase {
         let field = value.split(separator: ";").first ?? ""
         XCTAssertTrue(field.hasPrefix(prefix))
         return Double(field.dropFirst(prefix.count)) ?? -.infinity
+    }
+
+    private func assertAmbientAudioStart(_ element: XCUIElement, equals expected: Double,
+                                         file: StaticString = #filePath, line: UInt = #line) {
+        let ready = NSPredicate { _, _ in
+            let value = element.value as? String ?? ""
+            let field = value.split(separator: ";").first { $0.hasPrefix("audioStart=") }
+            let actual = field.flatMap { Double($0.dropFirst("audioStart=".count)) }
+            return actual.map { abs($0 - expected) < 0.001 } ?? false
+        }
+        let result = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: ready, object: nil)], timeout: 10)
+        XCTAssertEqual(result, .completed, "Ambient audio should follow the browsing clock: \(element.value ?? "missing")",
+                       file: file, line: line)
     }
 
     private func ambientPurpose(_ element: XCUIElement) -> String {
