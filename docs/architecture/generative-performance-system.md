@@ -2,10 +2,11 @@
 
 **Status:** live splash integration with recorded stereo audio · **Updated:** 2026-09-12
 
-One authoritative transport and one seeded score drive narrative motion and sound.
-The splash is the first integrated consumer. Autumn now has an integrated branch
-checkpoint using the same transport; its full tree and musical direction are not yet
-migrated. See [Autumn branch checkpoint](autumn-branch-checkpoint.md).
+One authoritative transport and one seeded story plan drive narrative motion and
+sound. Splash keeps its approved composition unchanged behind the shared playback
+boundary. Autumn's complete branch plan now feeds both its native renderer and a
+semantic audio score; its original recordings and final MIDI arrangement remain to
+be authored. See [Autumn branch checkpoint](autumn-branch-checkpoint.md).
 
 ## Ownership: reuse these components
 
@@ -18,10 +19,13 @@ migrated. See [Autumn branch checkpoint](autumn-branch-checkpoint.md).
 | `SplashAtmosphereDirector` | Progress-to-pool weights, semantic palette, and renderer-independent sunrise state. |
 | `SplashPerformanceScore` | Shared tempo, note envelopes, scheduled-event queries, and visual sampling. Its old repeating score is a calibration fixture only. |
 | `SplashSamplePlan` | Resolve score events to recordings, sustained instrument sections, seeded dynamics, and accents. |
-| `PerformanceSampleEngine` | Bounded streaming stereo voices, audio-clock scheduling, and offline validation using the same graph. |
+| `StoryPlayableAudioPlan` / `StorySampleEvent` | Story-neutral recording, timing, gain, pan, pitch, and processing-route contract. |
+| `StoryAudioScore` / `StoryMIDIScore` | Exportable semantic cues and MIDI notes derived from the same immutable plan as the animation. |
+| `PerformanceSampleEngine` | Consume a story-neutral playable plan with bounded streaming stereo voices, audio-clock scheduling, and offline validation using the same graph. |
 | `PerformanceSynthesizer` | Existing UI facade for recorded playback, output controls, metering, and lifecycle. |
 | `SplashScreenView` | Connect transport, plan, renderer, audition, session lifetime, settings persistence, and the nonblocking performance desk. |
-| `StoryPlayer` / `StoryDirector` / `StoryMoment` | Existing focus-story adapters and visual/audio moment contract. Preserve them when adapting other scenes. |
+| `StoryPlayer` / `StoryDirector` / `StoryMoment` | Materialize one seeded plan per session; visual and audio consumers read that exact plan. |
+| `StoryScoreExporter` | Write deterministic Standard MIDI, a cue sheet, and metadata for the Ableton handoff. |
 
 Implementation lives in `PlanetCalm/Directors/`, with shared note/envelope/source contracts in
 `PlanetCalm/Directors/PerformanceNoteEvent.swift` and splash visual sampling in
@@ -190,6 +194,22 @@ cover shared visual/audio onsets, seed determinism and variation, instrument dwe
 bank overlap, and the bass transposition distribution. Existing score-continuity
 and live-output tests also run. Musical balance still needs the composer's live
 listening judgment; numerical tests cannot establish whether a piece feels calming.
+
+## Animation-to-Ableton export
+
+Export a reproducible score from the repository root:
+
+```sh
+scripts/export_story_score --story splash --minutes 25 --seed 650208 --output /path/to/export
+scripts/export_story_score --story autumn-tree --minutes 55 --seed 42 --output /path/to/export
+```
+
+Each run writes a format-1 `.mid`, a tab-separated semantic cue sheet, and JSON
+metadata containing the story, duration, seed, tempo, and counts. The same arguments
+produce byte-identical MIDI. Splash MIDI is derived directly from its approved
+director. Autumn currently exports animation cues and an intentionally empty MIDI
+tempo track; after the visual choreography is refined, those same moment identities
+will be converted into quantized musical notes before recordings are made in Ableton.
 
 A Debug-only `--splash-audio-review` launch opens a finite five-minute run with animations
 and recordings for comparison. `--splash-ambient-review` opens the continuous browsing

@@ -1,29 +1,5 @@
 import Foundation
 
-/// All creative choices are made once from the session seed. The streaming engine
-/// consumes this plan, including during offline renders; it never rolls randomness.
-struct SplashSampleEvent: Equatable, Sendable {
-    let id: String
-    let asset: PerformanceAudioAssetReference
-    let start: Double
-    let end: Double
-    let fadeIn: Double
-    let fadeOut: Double
-    let gainDB: Double
-    let pan: Float
-    let pitchCents: Float
-
-    var usesHandpanEffects: Bool { asset.fileName.hasPrefix("handpan-") }
-    var resumesAfterInterruption: Bool { asset.kind == .pad || asset.kind == .bassDrone }
-
-    func gain(at time: Double) -> Float {
-        guard time >= start, time < end else { return 0 }
-        let attack = PerformanceEnvelope.smooth((time - start) / max(fadeIn, 0.001))
-        let release = PerformanceEnvelope.smooth((end - time) / max(fadeOut, 0.001))
-        return Float(pow(10, gainDB / 20) * attack * release)
-    }
-}
-
 enum SplashMelodyInstrument: String, CaseIterable, Sendable {
     case chimes, cyberChord = "cyber-chord", handpan
 }
@@ -76,9 +52,9 @@ enum SplashSamplePlan {
     /// Maps only the requested slice to imported recordings. The caller owns the
     /// rolling window, so this function never constructs a session-length plan.
     static func ambientEvents(from start: Double, through end: Double,
-                              seed: UInt64, durations: [String: Double]) -> [SplashSampleEvent] {
+                              seed: UInt64, durations: [String: Double]) -> [StorySampleEvent] {
         let score = ambientScoreEvents(from: start, through: end, seed: seed)
-        var result: [SplashSampleEvent] = []
+        var result: [StorySampleEvent] = []
 
         func append(id: String, name: String, start: Double, length: Double,
                     attack: Double, release: Double, trim: Double = 0,
@@ -164,10 +140,10 @@ enum SplashSamplePlan {
     }
 
     static func events(session: PerformanceSession, score: [PerformanceNoteEvent],
-                       durations: [String: Double]) -> [SplashSampleEvent] {
+                       durations: [String: Double]) -> [StorySampleEvent] {
         let duration = session.duration.timeInterval
         let sections = melodySections(duration: duration, seed: session.randomSeed)
-        var result: [SplashSampleEvent] = []
+        var result: [StorySampleEvent] = []
         var droneIndex = 0
         var phraseInstruments: [String: SplashMelodyInstrument] = [:]
 
@@ -249,6 +225,17 @@ enum SplashSamplePlan {
             nextAccent += accents.value(in: 60...90)
         }
         return result.sorted { $0.start == $1.start ? $0.id < $1.id : $0.start < $1.start }
+    }
+
+    /// Compatibility adapter at the reusable playback boundary. Splash keeps its
+    /// approved scheduler and mapping; the engine receives the same generic plan
+    /// that future recorded stories will provide.
+    static func playablePlan(session: PerformanceSession, score: [PerformanceNoteEvent],
+                             durations: [String: Double]) -> StoryPlayableAudioPlan {
+        StoryPlayableAudioPlan(
+            duration: session.duration.timeInterval,
+            assets: PerformanceAudioAssetCatalog.all,
+            events: events(session: session, score: score, durations: durations))
     }
 }
 

@@ -1,6 +1,6 @@
 import Foundation
 
-enum Story: String, CaseIterable, Identifiable, Codable {
+enum Story: String, CaseIterable, Identifiable, Codable, Sendable {
     case autumnTree
     case contemporaryLotus
 

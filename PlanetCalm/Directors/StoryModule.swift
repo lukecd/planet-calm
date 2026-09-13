@@ -3,13 +3,32 @@ import Foundation
 protocol StoryModule {
     var story: Story { get }
     func makeDirector() -> any StoryDirector
+    func makeAudioScore(for session: StorySessionContext, plan: StoryPlan) -> StoryAudioScore
+}
+
+extension StoryModule {
+    func makeAudioScore(for session: StorySessionContext, plan: StoryPlan) -> StoryAudioScore {
+        .silent(story: story, session: session)
+    }
 }
 
 struct AutumnTreeStoryModule: StoryModule {
     let story: Story = .autumnTree
+    let record: AutumnBranchRecord
+
+    init(record: AutumnBranchRecord = .init()) {
+        self.record = record.settingsOnly
+    }
 
     func makeDirector() -> any StoryDirector {
-        AutumnTreeDirector()
+        AutumnTreeDirector(record: record)
+    }
+
+    func makeAudioScore(for session: StorySessionContext, plan: StoryPlan) -> StoryAudioScore {
+        guard let autumn = plan.payload(as: AutumnBranchPlan.self) else {
+            return .silent(story: story, session: session)
+        }
+        return AutumnAudioScore.score(for: autumn)
     }
 }
 

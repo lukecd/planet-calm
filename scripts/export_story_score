@@ -1,0 +1,34 @@
+#!/bin/zsh
+set -euo pipefail
+
+script_dir=${0:A:h}
+project_dir=${script_dir:h}
+task_temp=$(mktemp -d "${TMPDIR:-/tmp}/planet-focus-score.XXXXXX")
+trap 'rm -rf "$task_temp"' EXIT
+
+xcrun swiftc -D DEBUG -parse-as-library \
+  -module-cache-path "$task_temp/module-cache" \
+  "$project_dir/PlanetCalm/Domain/Story.swift" \
+  "$project_dir/PlanetCalm/Domain/FocusSession.swift" \
+  "$project_dir/PlanetCalm/Directors/PerformanceRunner.swift" \
+  "$project_dir/PlanetCalm/Physics/SeededRandomNumberGenerator.swift" \
+  "$project_dir/PlanetCalm/Physics/WindField.swift" \
+  "$project_dir/PlanetCalm/Physics/LeafAerodynamics.swift" \
+  "$project_dir/PlanetCalm/Physics/LeafGravityLabConfiguration.swift" \
+  "$project_dir/PlanetCalm/Directors/PerformanceNoteEvent.swift" \
+  "$project_dir/PlanetCalm/Directors/StoryDirector.swift" \
+  "$project_dir/PlanetCalm/Directors/RandomMomentScheduler.swift" \
+  "$project_dir/PlanetCalm/Directors/PerformanceAudioAssetCatalog.swift" \
+  "$project_dir/PlanetCalm/Directors/StoryAudioPlan.swift" \
+  "$project_dir/PlanetCalm/Directors/StoryScoreExporter.swift" \
+  "$project_dir/PlanetCalm/Directors/SplashMusicDirector.swift" \
+  "$project_dir/PlanetCalm/Directors/SplashSamplePlan.swift" \
+  "$project_dir/PlanetCalm/Directors/AutumnOrigamiFlight.swift" \
+  "$project_dir/PlanetCalm/Directors/AutumnDeerEncounter.swift" \
+  "$project_dir/PlanetCalm/Directors/AutumnTreeDirector.swift" \
+  "$project_dir/PlanetCalm/Directors/AutumnBranchPerformance.swift" \
+  "$project_dir/PlanetCalm/Directors/AutumnAudioScore.swift" \
+  "$script_dir/story_score_export_main.swift" \
+  -o "$task_temp/story-score-export"
+
+"$task_temp/story-score-export" "$@"

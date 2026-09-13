@@ -75,7 +75,9 @@ final class PlanetCalmTests: XCTestCase {
         let duration = 900.0
         let plan = AutumnBranchPlan(duration: duration, seed: 42, tuning: .standard, isFullTree: true)
         let directed = AutumnTreeDirector().makePlan(for: .init(duration: duration, randomSeed: 42))
-        XCTAssertEqual(Set(directed.moments.map(\.id)), Set((plan.gusts + plan.encounters.birds.map(\.moment) + [plan.deerEnding.moment]).map(\.id)))
+        XCTAssertEqual(Set(directed.moments.map(\.id)),
+                       Set((plan.gusts + plan.encounters.birds.map(\.moment)
+                           + plan.leafReleases + [plan.deerEnding.moment]).map(\.id)))
         let bird = try XCTUnwrap(plan.encounters.birds.first)
         let manual = AutumnOrigamiFlight(startTime: bird.startTime - 5, seed: 99, tuning: .init())
         XCTAssertEqual(plan.encounters.bird(at: bird.startTime, manual: manual), manual)
@@ -3992,6 +3994,132 @@ extension PlanetCalmTests {
             seed: 42, durations: durations)
         XCTAssertTrue(seam.contains { $0.start < 600 && $0.end > 600 })
         XCTAssertTrue(seam.contains { $0.start >= 600 })
+    }
+
+    /// Freezes the approved seeded Splash arrangement before its contracts are
+    /// extracted into the shared story runtime. Doubles use IEEE bit patterns so
+    /// timing or gain changes cannot hide behind display formatting.
+    func testApprovedSplashArrangementFingerprint() {
+        let durations = Dictionary(uniqueKeysWithValues: PerformanceAudioAssetCatalog.all.map {
+            ($0.fileName, 60.0)
+        })
+        var rows: [String] = []
+        for (minutes, seed) in [(5, UInt64(650_208)), (25, 42), (55, 9_001)] {
+            let session = PerformanceSession(duration: FocusDuration(minutes: minutes)!,
+                                             randomSeed: seed)
+            let score = SplashMusicDirector.events(for: session)
+            rows += score.map { event in
+                ["score", String(minutes), String(seed), event.id,
+                 String(event.tonalSlot), splashBits(event.startBeat), splashBits(event.gateBeats),
+                 splashBits(event.envelope.attackBeats), splashBits(event.envelope.decayBeats),
+                 splashBits(event.envelope.sustainLevel), splashBits(event.envelope.releaseBeats),
+                 event.role.rawValue, splashBits(event.intensity), String(event.octaveOffset)]
+                    .joined(separator: "|")
+            }
+            rows += SplashSamplePlan.events(session: session, score: score, durations: durations).map {
+                ["sample", String(minutes), String(seed), $0.id, $0.asset.fileName,
+                 splashBits($0.start), splashBits($0.end), splashBits($0.fadeIn), splashBits($0.fadeOut),
+                 splashBits($0.gainDB), String($0.pan.bitPattern), String($0.pitchCents.bitPattern)]
+                    .joined(separator: "|")
+            }
+        }
+        for (start, end, seed) in [(0.0, 180.0, UInt64(650_208)),
+                                   (580, 620, 650_208), (1_180, 1_220, 42)] {
+            rows += SplashSamplePlan.ambientEvents(from: start, through: end,
+                                                    seed: seed, durations: durations).map {
+                ["ambient", splashBits(start), splashBits(end), String(seed), $0.id, $0.asset.fileName,
+                 splashBits($0.start), splashBits($0.end), splashBits($0.fadeIn), splashBits($0.fadeOut),
+                 splashBits($0.gainDB), String($0.pan.bitPattern), String($0.pitchCents.bitPattern)]
+                    .joined(separator: "|")
+            }
+        }
+        let fingerprint = SHA256.hash(data: Data(rows.joined(separator: "\n").utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        print("APPROVED SPLASH ARRANGEMENT FINGERPRINT: \(fingerprint)")
+        XCTAssertEqual(fingerprint, "d4078c29cd7fc57bfae11d93235bdc92752721bcbc870db08a6bd8b94798453b")
+    }
+
+    func testSplashSharedPlaybackAdapterIsDescriptorExact() {
+        let durations = Dictionary(uniqueKeysWithValues: PerformanceAudioAssetCatalog.all.map {
+            ($0.fileName, 60.0)
+        })
+        for (minutes, seed) in [(5, UInt64(42)), (25, 650_208), (55, 91_337)] {
+            let session = PerformanceSession(duration: FocusDuration(minutes: minutes)!,
+                                             randomSeed: seed)
+            let score = SplashMusicDirector.events(for: session)
+            let expected = SplashSamplePlan.events(session: session, score: score,
+                                                   durations: durations)
+            let shared = SplashSamplePlan.playablePlan(session: session, score: score,
+                                                       durations: durations)
+            XCTAssertEqual(shared.duration, session.duration.timeInterval)
+            XCTAssertEqual(shared.assets, PerformanceAudioAssetCatalog.all)
+            XCTAssertEqual(shared.events, expected)
+        }
+    }
+
+    func testSplashProcessingRoutesAreExplicitAndUnchanged() {
+        for asset in PerformanceAudioAssetCatalog.all {
+            let expected: StoryAudioProcessingRoute = asset.fileName.hasPrefix("handpan-")
+                ? .melodicEcho : .dry
+            XCTAssertEqual(asset.processingRoute, expected, asset.fileName)
+        }
+    }
+
+    func testStoryScoreExporterIsDeterministicAndWritesStandardMIDI() {
+        let session = PerformanceSession(duration: .twentyFiveMinutes,
+                                         randomSeed: 650_208)
+        let score = SplashAudioScore.score(for: session)
+        let first = StoryScoreExporter.midiData(score.midi)
+        let second = StoryScoreExporter.midiData(SplashAudioScore.score(for: session).midi)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(String(data: first.prefix(4), encoding: .ascii), "MThd")
+        XCTAssertEqual(Array(first.dropFirst(8).prefix(2)), [0, 1], "Exporter uses MIDI format 1")
+        XCTAssertEqual(Array(first.dropFirst(12).prefix(2)), [1, 224], "480 ticks per beat")
+        XCTAssertEqual(score.midi.notes.count, SplashMusicDirector.events(for: session).count)
+        XCTAssertEqual(Set(score.midi.notes.map(\.track)), ["Drone", "Pads", "Melody"])
+        XCTAssertEqual(score.midi.durationBeats,
+                       session.duration.timeInterval / SplashSamplePlan.secondsPerBeat)
+    }
+
+    func testAutumnAudioScoreComesFromTheAuthoritativeAnimationPlan() throws {
+        let focus = FocusSession(story: .autumnTree, duration: FocusDuration(minutes: 55)!,
+                                 startedAt: Date(timeIntervalSince1970: 0), randomSeed: 42)
+        let player = StoryPlayer(session: focus, module: AutumnTreeStoryModule())
+        let plan = try XCTUnwrap(player.plan.payload(as: AutumnBranchPlan.self))
+        XCTAssertEqual(plan.duration, focus.duration.timeInterval)
+        XCTAssertEqual(plan.seed, focus.randomSeed)
+        XCTAssertEqual(player.audioScore.duration, plan.duration)
+        XCTAssertEqual(player.audioScore.seed, plan.seed)
+
+        let momentIDs = Set(player.plan.moments.map(\.id))
+        XCTAssertTrue(player.audioScore.cues.allSatisfy {
+            $0.sourceMomentID.map(momentIDs.contains) ?? false
+        })
+        XCTAssertEqual(player.audioScore.cues.filter { $0.bus == .leaves }.count,
+                       plan.leafReleases.count)
+        XCTAssertEqual(Set(player.audioScore.cues.filter { $0.bus == .birds }.map(\.phase)),
+                       ["approach", "landing", "perch", "departure"])
+        XCTAssertEqual(Set(player.audioScore.cues.filter { $0.bus == .animals }.map(\.phase)),
+                       ["approach", "listening", "settling", "rest"])
+        XCTAssertTrue(player.audioScore.midi.notes.isEmpty,
+                      "Autumn MIDI remains empty until its animation score is refined")
+        XCTAssertEqual(player.audioScore.midi.durationBeats, plan.duration)
+    }
+
+    @MainActor
+    func testFiftyFiveMinuteSplashSharedEngineKeepsBoundedVoices() throws {
+        for seed: UInt64 in [42, 650_208, 91_337] {
+            let session = PerformanceSession(duration: FocusDuration(minutes: 55)!, randomSeed: seed)
+            let playback = try PerformanceSampleEngine(
+                session: session, score: SplashMusicDirector.events(for: session))
+            defer { playback.stop() }
+            XCTAssertLessThanOrEqual(playback.voiceCount, 48)
+            XCTAssertEqual(playback.duration, session.duration.timeInterval)
+        }
+    }
+
+    private func splashBits(_ value: Double) -> String {
+        String(value.bitPattern, radix: 16)
     }
 
     func testSplashAmbientLightAndPadFilterStayBounded() {

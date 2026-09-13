@@ -64,6 +64,7 @@ struct StoryVisualCue: Equatable, Sendable {
 }
 
 enum StoryAudioBus: String, Equatable, Codable, Sendable {
+    case animals
     case birds
     case leaves
     case atmosphere
@@ -133,14 +134,30 @@ struct StoryContext: Equatable, Sendable {
 
 struct StoryPlan: Equatable, Sendable {
     let moments: [StoryMoment]
+    let payload: StoryPlanPayload?
 
-    init(moments: [StoryMoment] = []) {
+    init(moments: [StoryMoment] = [], payload: StoryPlanPayload? = nil) {
         self.moments = moments.sorted {
             if $0.startTime == $1.startTime {
                 return $0.id.rawValue < $1.id.rawValue
             }
             return $0.startTime < $1.startTime
         }
+        self.payload = payload
+    }
+
+    init<Payload: Equatable & Sendable>(moments: [StoryMoment] = [], payload: Payload) {
+        self.moments = moments.sorted {
+            if $0.startTime == $1.startTime {
+                return $0.id.rawValue < $1.id.rawValue
+            }
+            return $0.startTime < $1.startTime
+        }
+        self.payload = StoryPlanPayload(payload)
+    }
+
+    func payload<Payload>(as type: Payload.Type = Payload.self) -> Payload? {
+        payload?.value(as: type)
     }
 
     static let empty = StoryPlan()

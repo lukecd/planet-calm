@@ -7,7 +7,15 @@ private final class AutumnBranchRenderCache {
     var simulation: AutumnBranchSimulation?
     private var cachedPlan: AutumnBranchPlan?
     private var cachedRecord: AutumnBranchRecord?
-    func plan(duration: Double, seed: UInt64, record: AutumnBranchRecord) -> AutumnBranchPlan {
+    func plan(authoritativePlan: StoryPlan?, duration: Double, seed: UInt64,
+              record: AutumnBranchRecord) -> AutumnBranchPlan {
+        if let directed = authoritativePlan?.payload(as: AutumnBranchPlan.self) {
+            if cachedPlan != directed {
+                cachedPlan = directed
+                cachedRecord = record
+            }
+            return directed
+        }
         if let cachedPlan, cachedPlan.duration == duration, cachedPlan.seed == seed,
            cachedRecord == record { return cachedPlan }
         let plan = AutumnBranchPlan(duration: duration, seed: seed, tuning: record.tuning,
@@ -31,6 +39,7 @@ struct AutumnBranchSceneView: View {
     let runtime: SessionRuntime?
     let record: AutumnBranchRecord
     let reduceMotion: Bool
+    var storyPlan: StoryPlan? = nil
     @State private var cache = AutumnBranchRenderCache()
 #if DEBUG
     @State private var auditProgress = 0.0
@@ -40,7 +49,8 @@ struct AutumnBranchSceneView: View {
         TimelineView(.animation(minimumInterval: reduceMotion ? 1 : 1.0 / 60,
                                 paused: session?.isPaused ?? true)) { timeline in
             let elapsed = runtime?.sample().elapsedTime ?? session?.elapsedTime(at: timeline.date) ?? 0
-            let plan = cache.plan(duration: session?.duration.timeInterval ?? 120,
+            let plan = cache.plan(authoritativePlan: storyPlan,
+                duration: session?.duration.timeInterval ?? 120,
                 seed: session?.randomSeed ?? 42, record: record)
             let frame = cache.frame(plan: plan, time: elapsed)
             let progress = lightingProgress(at: timeline.date)
@@ -92,7 +102,8 @@ struct AutumnBranchSnapshotView: View {
     @State private var cache = AutumnBranchRenderCache()
 
     var body: some View {
-        let plan = cache.plan(duration: context.duration, seed: context.randomSeed, record: .init())
+        let plan = cache.plan(authoritativePlan: context.storyPlan,
+                              duration: context.duration, seed: context.randomSeed, record: .init())
         let frame = context.reduceMotion ? AutumnCanopy.frame()
             : cache.frame(plan: plan, time: context.elapsedTime)
         GeometryReader { geometry in
@@ -446,7 +457,8 @@ struct AutumnBranchMonitor: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.25)) { tick in
             let time = session?.elapsedTime(at: tick.date) ?? 0
-            let plan = cache.plan(duration: session?.duration.timeInterval ?? 120,
+            let plan = cache.plan(authoritativePlan: nil,
+                duration: session?.duration.timeInterval ?? 120,
                 seed: session?.randomSeed ?? 42, record: record)
             let frame = cache.frame(plan: plan, time: time)
             VStack(alignment: .leading, spacing: 5) {

@@ -65,6 +65,9 @@
 		F10000000000000000000005 /* PlanetCalmLiveActivity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = F20000000000000000000004 /* PlanetCalmLiveActivity.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		900000000000000000000003 /* SplashSamplePlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900100000000000000000003 /* SplashSamplePlan.swift */; };
 		900000000000000000000004 /* PerformanceSampleEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900100000000000000000004 /* PerformanceSampleEngine.swift */; };
+		910000000000000000000001 /* StoryAudioPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 910100000000000000000001 /* StoryAudioPlan.swift */; };
+		910000000000000000000002 /* StoryScoreExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 910100000000000000000002 /* StoryScoreExporter.swift */; };
+		910000000000000000000003 /* AutumnAudioScore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 910100000000000000000003 /* AutumnAudioScore.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -167,6 +170,9 @@
 		F20000000000000000000004 /* PlanetCalmLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = PlanetCalmLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		900100000000000000000003 /* SplashSamplePlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplashSamplePlan.swift; sourceTree = "<group>"; };
 		900100000000000000000004 /* PerformanceSampleEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceSampleEngine.swift; sourceTree = "<group>"; };
+		910100000000000000000001 /* StoryAudioPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoryAudioPlan.swift; sourceTree = "<group>"; };
+		910100000000000000000002 /* StoryScoreExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoryScoreExporter.swift; sourceTree = "<group>"; };
+		910100000000000000000003 /* AutumnAudioScore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutumnAudioScore.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -291,6 +297,9 @@
 				900100000000000000000003 /* SplashSamplePlan.swift */,
 				900100000000000000000004 /* PerformanceSampleEngine.swift */,
 				900100000000000000000001 /* PerformanceAudioAssetCatalog.swift */,
+				910100000000000000000001 /* StoryAudioPlan.swift */,
+				910100000000000000000002 /* StoryScoreExporter.swift */,
+				910100000000000000000003 /* AutumnAudioScore.swift */,
 			);
 			path = Directors;
 			sourceTree = "<group>";
@@ -522,6 +531,9 @@
 				900000000000000000000003 /* SplashSamplePlan.swift in Sources */,
 				900000000000000000000004 /* PerformanceSampleEngine.swift in Sources */,
 				900000000000000000000001 /* PerformanceAudioAssetCatalog.swift in Sources */,
+				910000000000000000000001 /* StoryAudioPlan.swift in Sources */,
+				910000000000000000000002 /* StoryScoreExporter.swift in Sources */,
+				910000000000000000000003 /* AutumnAudioScore.swift in Sources */,
 				B10000000000000000000002 /* PerformanceSynthesizer.swift in Sources */,
 				A10000000000000000000038 /* SunriseSkyView.swift in Sources */,
 				A10000000000000000000039 /* SunriseSky.metal in Sources */,

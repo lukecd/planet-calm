@@ -21,6 +21,16 @@ struct PerformanceAudioAssetReference: Hashable, Sendable {
     /// Starting point taken from the Ableton lane fader. This is not per-file
     /// normalization; the rendered source dynamics remain intact.
     let startingGainDB: Double
+    let processingRoute: StoryAudioProcessingRoute
+
+    init(fileName: String, subdirectory: String, kind: PerformanceAudioAssetKind,
+         startingGainDB: Double, processingRoute: StoryAudioProcessingRoute = .dry) {
+        self.fileName = fileName
+        self.subdirectory = subdirectory
+        self.kind = kind
+        self.startingGainDB = startingGainDB
+        self.processingRoute = processingRoute
+    }
 
     var resourceURL: URL? {
         Bundle.main.url(
@@ -95,7 +105,8 @@ enum PerformanceAudioAssetCatalog {
                     fileName: "\(prefix)-\(note)",
                     subdirectory: "Audio/Stories/Splash/Melody/\(directory)",
                     kind: .melody,
-                    startingGainDB: gain
+                    startingGainDB: gain,
+                    processingRoute: prefix == "handpan" ? .melodicEcho : .dry
                 )
             }
         }
