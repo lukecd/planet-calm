@@ -45,10 +45,13 @@ ending times. Manual bird controls replace overlapping automatic visits complete
 so no partially elapsed visit reappears after the study. Manual gusts do not reseed
 or rewrite the automatic schedule. End the run before changing physics parameters.
 
-For later music, consume the same `StoryMoment` identities and timestamps. Gust
-audio intents already share their visual moments; animal audio is intentionally
-unassigned. Do not invent a separate sound-side encounter schedule. Generic settings,
-blocking, history, and preferences belong outside this story policy.
+`AutumnAudioScore` now consumes these exact plan values and exposes breeze, every
+leaf release, the bird's approach/landing/perch/departure, and the deer's
+approach/listening/settling/rest as semantic cues. It does not yet select recordings
+or invent notes. The MIDI/cue exporter preserves each source `StoryMoment` identity,
+so later quantization and density limits can be traced back to animation events
+without creating a sound-side encounter schedule. Generic settings, blocking,
+history, and preferences belong outside this story policy.
 
 ## Verification boundary
 

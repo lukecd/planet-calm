@@ -129,8 +129,36 @@ private struct StorySceneThumbnail: View {
             performance: player.performance(at: referenceDate, reduceMotion: true),
             reduceMotion: true,
             duration: session.duration.timeInterval,
-            randomSeed: session.randomSeed
+            randomSeed: session.randomSeed,
+            storyPlan: player.plan
         )
+    }
+}
+
+@MainActor
+private final class StoryPlayerCache {
+    private struct Key: Equatable {
+        let story: Story
+        let duration: FocusDuration
+        let seed: UInt64
+        let autumnRecord: AutumnBranchRecord
+    }
+
+    private var key: Key?
+    private var player: StoryPlayer?
+
+    func player(for session: FocusSession, autumnRecord: AutumnBranchRecord) -> StoryPlayer {
+        let key = Key(story: session.story, duration: session.duration,
+                      seed: session.randomSeed, autumnRecord: autumnRecord)
+        if self.key == key, let player {
+            return player
+        }
+        let module: (any StoryModule)? = session.story == .autumnTree
+            ? AutumnTreeStoryModule(record: autumnRecord) : nil
+        let player = StoryPlayer(session: session, module: module)
+        self.key = key
+        self.player = player
+        return player
     }
 }
 
@@ -158,6 +186,7 @@ struct StorySceneLaunchView: View {
     @State private var isStarting = false
     @State private var isFinishing = false
     @State private var lifecycleError: String?
+    @State private var storyPlayerCache = StoryPlayerCache()
 
     init(
         story: Story,
@@ -200,7 +229,8 @@ struct StorySceneLaunchView: View {
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 let session = playbackSession
                 let transport = transportState(for: session, at: context.date)
-                let player = StoryPlayer(session: focusSession(for: session))
+                let focusSession = focusSession(for: session)
+                let player = storyPlayerCache.player(for: focusSession, autumnRecord: autumnRecord)
                 ZStack(alignment: .top) {
                     Group {
                         if story == .autumnTree {
@@ -208,7 +238,8 @@ struct StorySceneLaunchView: View {
                                 session: session,
                                 runtime: runtime,
                                 record: autumnRecord,
-                                reduceMotion: reduceMotion
+                                reduceMotion: reduceMotion,
+                                storyPlan: player.plan
                             )
                         } else {
                             StorySceneCatalog.scene(
@@ -222,7 +253,8 @@ struct StorySceneLaunchView: View {
                                     reduceMotion: reduceMotion,
                                     duration: session?.duration.timeInterval
                                         ?? duration.timeInterval,
-                                    randomSeed: session?.randomSeed ?? 42
+                                    randomSeed: session?.randomSeed ?? 42,
+                                    storyPlan: player.plan
                                 )
                             )
                         }
@@ -456,7 +488,8 @@ struct StorySceneLaunchView: View {
 
     private func focusSession(for session: PerformanceSession?) -> FocusSession {
         session?.focusSession(for: story)
-            ?? FocusSession(story: story, duration: .twentyFiveMinutes, startedAt: .now)
+            ?? FocusSession(story: story, duration: duration,
+                            startedAt: Date(timeIntervalSinceReferenceDate: 0), randomSeed: 42)
     }
 
     private func transportState(for session: PerformanceSession?, at date: Date) -> PerformanceState? {

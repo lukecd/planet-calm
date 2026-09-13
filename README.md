@@ -74,6 +74,11 @@ story plan created by a story-specific `StoryDirector`. Visual and future audio
 systems consume the same `StoryMoment` values rather than commanding one
 another. See `docs/architecture/generative-performance-system.md`.
 
+For the animation-first Ableton workflow, `scripts/export_story_score` writes a
+deterministic MIDI file, semantic cue sheet, and metadata for a selected story,
+duration, and seed. Autumn's MIDI remains intentionally empty until its animation
+choreography is refined; its current cue sheet is the traceable sound-design map.
+
 The approved outer palette, responsive splash rules, typography, paper
 material, and animation boundaries live in `docs/design/colors-and-ui.md`.
 Story direction lives in `docs/stories/`.

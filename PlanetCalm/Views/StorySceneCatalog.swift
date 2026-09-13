@@ -7,8 +7,21 @@ struct StorySceneRenderContext: Equatable {
     let elapsedTime: TimeInterval
     let performance: StoryPerformance
     let reduceMotion: Bool
-    var duration: TimeInterval = 120
-    var randomSeed: UInt64 = 42
+    let duration: TimeInterval
+    let randomSeed: UInt64
+    let storyPlan: StoryPlan?
+
+    init(progress: Double, elapsedTime: TimeInterval, performance: StoryPerformance,
+         reduceMotion: Bool, duration: TimeInterval = 120, randomSeed: UInt64 = 42,
+         storyPlan: StoryPlan? = nil) {
+        self.progress = progress
+        self.elapsedTime = elapsedTime
+        self.performance = performance
+        self.reduceMotion = reduceMotion
+        self.duration = duration
+        self.randomSeed = randomSeed
+        self.storyPlan = storyPlan
+    }
 }
 
 @MainActor

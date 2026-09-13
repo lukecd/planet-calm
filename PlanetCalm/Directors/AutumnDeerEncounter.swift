@@ -1,21 +1,21 @@
 import Foundation
 import simd
 
-struct AutumnDeerTuning: Codable, Equatable {
+struct AutumnDeerTuning: Codable, Equatable, Sendable {
   var size = 1.0
   var speed = 1.0
   var settlingSeconds = 8.0
   var restingPosition = 0.65
 }
 
-struct AutumnDeerStudy: Codable, Equatable {
+struct AutumnDeerStudy: Codable, Equatable, Sendable {
   var tuning = AutumnDeerTuning()
   var encounter: AutumnDeerEncounter?
 }
 
 /// One guaranteed StoryMoment. Stage percentages schedule the entrance; the
 /// articulation is measured in real seconds and samples the existing transport.
-struct AutumnDeerEncounter: Codable, Equatable {
+struct AutumnDeerEncounter: Codable, Equatable, Sendable {
   let startTime: Double
   let tuning: AutumnDeerTuning
   var walkDuration: Double { 18 / min(1.3, max(0.7, tuning.speed)) }

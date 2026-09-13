@@ -13,7 +13,7 @@ struct AutumnBranchTuning: Codable, Equatable, Sendable {
     static let standard = Self()
 }
 
-struct AutumnBranchRecord: Codable, Equatable {
+struct AutumnBranchRecord: Codable, Equatable, Sendable {
     /// Persist knobs, never the performance or its manually triggered events.
     var settingsOnly: Self {
         var settings = self
@@ -30,7 +30,7 @@ struct AutumnBranchRecord: Codable, Equatable {
 }
 
 /// Seeded spatial description of one shared StoryMoment, not a second scheduler.
-struct AutumnWindPassage: Equatable {
+struct AutumnWindPassage: Equatable, Sendable {
     let origin: SIMD2<Double>
     let direction: SIMD2<Double>
     let travelSpeed: Double
@@ -73,7 +73,7 @@ struct AutumnWindPassage: Equatable {
 }
 
 /// Story percentages place events. Physical motion always runs in seconds.
-struct AutumnBranchPlan: Equatable {
+struct AutumnBranchPlan: Equatable, Sendable {
     let duration: Double
     let seed: UInt64
     let tuning: AutumnBranchTuning

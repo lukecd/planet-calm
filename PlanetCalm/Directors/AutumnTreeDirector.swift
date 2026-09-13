@@ -1,13 +1,21 @@
 import Foundation
 
 struct AutumnTreeDirector: StoryDirector {
+    let record: AutumnBranchRecord
+
+    init(record: AutumnBranchRecord = .init()) {
+        self.record = record.settingsOnly
+    }
+
     func makePlan(for session: StorySessionContext) -> StoryPlan {
         let plan = AutumnBranchPlan(
             duration: session.duration, seed: session.randomSeed,
-            tuning: .standard, isFullTree: true)
+            tuning: record.tuning, manualGusts: record.manualGusts,
+            isFullTree: true, deerTuning: record.deer?.tuning ?? .init())
         return StoryPlan(
             moments: plan.gusts + plan.encounters.birds.map(\.moment)
-                + [plan.deerEnding.moment])
+                + plan.leafReleases + [plan.deerEnding.moment],
+            payload: plan)
     }
 
     func performance(at context: StoryContext, plan: StoryPlan) -> StoryPerformance {
@@ -72,9 +80,9 @@ extension StoryVisualFlagID {
 
 /// Creative policy on top of the shared random scheduler. Decisions are made once
 /// per session, never on render frames. Quiet is a real outcome, not a retry loop.
-struct AutumnEncounterSchedule: Equatable {
-    enum Kind: String { case breeze, bird, quiet }
-    struct Decision: Equatable {
+struct AutumnEncounterSchedule: Equatable, Sendable {
+    enum Kind: String, Sendable { case breeze, bird, quiet }
+    struct Decision: Equatable, Sendable {
         let time: Double
         let kind: Kind
     }

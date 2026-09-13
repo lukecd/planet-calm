@@ -4,7 +4,8 @@ struct StoryPlayer {
     let session: FocusSession
 
     private let director: any StoryDirector
-    private let plan: StoryPlan
+    let plan: StoryPlan
+    let audioScore: StoryAudioScore
 
     init(session: FocusSession, module: (any StoryModule)? = nil) {
         let resolvedModule = module ?? StoryCatalog.module(for: session.story)
@@ -13,12 +14,11 @@ struct StoryPlayer {
         let director = resolvedModule.makeDirector()
         self.session = session
         self.director = director
-        self.plan = director.makePlan(
-            for: StorySessionContext(
-                duration: session.duration.timeInterval,
-                randomSeed: session.randomSeed
-            )
-        )
+        let context = StorySessionContext(duration: session.duration.timeInterval,
+                                          randomSeed: session.randomSeed)
+        let plan = director.makePlan(for: context)
+        self.plan = plan
+        self.audioScore = resolvedModule.makeAudioScore(for: context, plan: plan)
     }
 
     func performance(at date: Date, reduceMotion: Bool) -> StoryPerformance {

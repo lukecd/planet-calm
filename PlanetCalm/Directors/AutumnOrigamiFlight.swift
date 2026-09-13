@@ -1,7 +1,7 @@
 import Foundation
 import simd
 
-struct AutumnBirdTuning: Codable, Equatable {
+struct AutumnBirdTuning: Codable, Equatable, Sendable {
     var speed = 1.0
     var wingbeat = 1.55
     var depth = 1.0
@@ -9,7 +9,7 @@ struct AutumnBirdTuning: Codable, Equatable {
     var perchSeconds = 6.0
 }
 
-struct AutumnBirdStudy: Codable, Equatable {
+struct AutumnBirdStudy: Codable, Equatable, Sendable {
     var tuning = AutumnBirdTuning()
     var flight: AutumnOrigamiFlight?
 }
@@ -62,7 +62,7 @@ struct AutumnBirdPose: Equatable {
 
 /// A finite automatic or development event on the existing transport. Each visit
 /// captures its tuning so live controls cannot teleport an airborne bird.
-struct AutumnOrigamiFlight: Codable, Equatable {
+struct AutumnOrigamiFlight: Codable, Equatable, Sendable {
     let startTime: Double
     let seed: UInt64
     let tuning: AutumnBirdTuning

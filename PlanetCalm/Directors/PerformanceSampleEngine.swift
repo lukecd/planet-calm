@@ -10,7 +10,7 @@ final class PerformanceSampleEngine {
     static let sampleRate = 48_000.0
     static let lookAhead = 0.25
     let engine = AVAudioEngine()
-    private(set) var events: [SplashSampleEvent]
+    private(set) var events: [StorySampleEvent]
     let duration: Double
     private let files: [String: AVAudioFile]
     private let ambientSeed: UInt64?
@@ -27,11 +27,14 @@ final class PerformanceSampleEngine {
         let player = AVAudioPlayerNode()
         let gain = AVAudioUnitEQ(numberOfBands: 1)
         let pitch: Float
-        let handpan: Bool
-        var event: SplashSampleEvent?
+        let processingRoute: StoryAudioProcessingRoute
+        var event: StorySampleEvent?
         var resumedAt = 0.0
         var isPad = false
-        init(pitch: Float, handpan: Bool) { self.pitch = pitch; self.handpan = handpan }
+        init(pitch: Float, processingRoute: StoryAudioProcessingRoute) {
+            self.pitch = pitch
+            self.processingRoute = processingRoute
+        }
     }
 
     convenience init(session: PerformanceSession, score: [PerformanceNoteEvent], resourceRoot: URL? = nil) throws {
@@ -39,10 +42,20 @@ final class PerformanceSampleEngine {
         for asset in PerformanceAudioAssetCatalog.all {
             loaded[asset.fileName] = try asset.audioFile(resourceRoot: resourceRoot)
         }
-        try self.init(duration: session.duration.timeInterval,
-                      events: SplashSamplePlan.events(session: session, score: score,
-                        durations: loaded.mapValues { Double($0.length) / $0.processingFormat.sampleRate }),
+        let plan = SplashSamplePlan.playablePlan(
+            session: session,
+            score: score,
+            durations: loaded.mapValues { Double($0.length) / $0.processingFormat.sampleRate })
+        try self.init(duration: plan.duration, events: plan.events,
                       files: loaded, ambientSeed: nil)
+    }
+
+    convenience init(plan: StoryPlayableAudioPlan, resourceRoot: URL? = nil) throws {
+        var loaded: [String: AVAudioFile] = [:]
+        for asset in plan.assets {
+            loaded[asset.fileName] = try asset.audioFile(resourceRoot: resourceRoot)
+        }
+        try self.init(duration: plan.duration, events: plan.events, files: loaded, ambientSeed: nil)
     }
 
     convenience init(ambientSeed: UInt64, resourceRoot: URL? = nil) throws {
@@ -53,7 +66,7 @@ final class PerformanceSampleEngine {
         try self.init(duration: .infinity, events: [], files: loaded, ambientSeed: ambientSeed)
     }
 
-    private init(duration: Double, events: [SplashSampleEvent],
+    private init(duration: Double, events: [StorySampleEvent],
                  files: [String: AVAudioFile], ambientSeed: UInt64?) throws {
         self.duration = duration
         self.events = events
@@ -82,8 +95,11 @@ final class PerformanceSampleEngine {
         // Ambient capacity is fixed from the bounded route budget. The finite
         // path continues to size itself from its complete score below.
         let capacity = ambientSeed == nil ? nil : [24, 6, 3, 6]
-        for (routeIndex, (pitch, handpan)) in [(Float(0), false), (Float(1200), false), (Float(-1200), false), (Float(0), true)].enumerated() {
-            let route = events.filter { $0.pitchCents == pitch && $0.usesHandpanEffects == handpan }
+        let routes: [(Float, StoryAudioProcessingRoute)] = [
+            (0, .dry), (1200, .dry), (-1200, .dry), (0, .melodicEcho)
+        ]
+        for (routeIndex, (pitch, processingRoute)) in routes.enumerated() {
+            let route = events.filter { $0.pitchCents == pitch && $0.processingRoute == processingRoute }
             var boundaries: [(Double, Int)] = []
             for event in route {
                 boundaries.append((event.start - Self.lookAhead, 1))
@@ -96,14 +112,14 @@ final class PerformanceSampleEngine {
             let routeCapacity = capacity?[routeIndex] ?? maximum
             guard voices.count + routeCapacity <= 48 else { throw Failure.tooManyVoices }
             for _ in 0..<routeCapacity {
-                let voice = Voice(pitch: pitch, handpan: handpan)
+                let voice = Voice(pitch: pitch, processingRoute: processingRoute)
                 voice.gain.bands.first?.filterType = .lowPass
                 voice.gain.bands.first?.frequency = 10_000
                 voice.gain.bands.first?.bandwidth = 1
                 voice.gain.bands.first?.bypass = true
                 engine.attach(voice.player)
                 engine.attach(voice.gain)
-                let destination = handpan ? handpanBus : engine.mainMixerNode
+                let destination = processingRoute == .melodicEcho ? handpanBus : engine.mainMixerNode
                 if pitch != 0 {
                     let shifter = AVAudioUnitTimePitch()
                     shifter.pitch = pitch
@@ -203,7 +219,8 @@ final class PerformanceSampleEngine {
             guard (anchorElapsed < 1 && elapsed < 1) || event.start >= elapsed - 0.05 || event.resumesAfterInterruption else { continue }
             guard let file = files[event.asset.fileName],
                   let voice = voices.first(where: {
-                      $0.event == nil && $0.pitch == event.pitchCents && $0.handpan == event.usesHandpanEffects
+                      $0.event == nil && $0.pitch == event.pitchCents
+                          && $0.processingRoute == event.processingRoute
                   }) else { throw Failure.tooManyVoices }
             let onset = max(event.start, elapsed)
             let offset = max(0, onset - event.start)
